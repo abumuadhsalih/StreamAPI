@@ -3,7 +3,7 @@ name = "stream-api"
 version = "0.1.0"
 description = "RealSense camera streaming and capture API"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = [
     "fastapi[standard]>=0.136.0",
     "opencv-python-headless>=4.13.0.92",
