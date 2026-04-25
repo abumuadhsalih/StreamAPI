@@ -9,7 +9,5 @@ dependencies = [
     "opencv-python-headless>=4.13.0.92",
     # PyPI only has x86_64 wheel; on ARM64 (Jetson) install via Intel APT repo — see README
     "pyrealsense2>=2.57.7.10387 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "pyserial>=3.5",
 ]
-
-[tool.uv]
-system-site-packages = true
