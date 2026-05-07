@@ -1,6 +1,7 @@
 import sys
 import json
 import time
+from typing import Literal
 import cv2
 import numpy as np
 import serial
@@ -8,6 +9,21 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, Response
 
 app = FastAPI(title="RealSense Stream API")
+
+# ---------------------------------------------------------------------------
+# Resolution presets
+# ---------------------------------------------------------------------------
+
+# Capture runs at the largest preset; smaller presets are downscaled per-request
+# so multiple clients can request different resolutions concurrently.
+RESOLUTIONS: dict[str, tuple[int, int]] = {
+    "sd": (640, 480),
+    "hd": (1280, 720),
+    "fhd": (1920, 1080),
+}
+CAPTURE_WIDTH, CAPTURE_HEIGHT = RESOLUTIONS["fhd"]
+Preset = Literal["sd", "hd", "fhd"]
+
 
 # ---------------------------------------------------------------------------
 # Camera — pyrealsense2 is Linux-only; stub on other platforms for local dev
@@ -18,9 +34,11 @@ if sys.platform == "linux":
 
     pipeline = rs.pipeline()
     config = rs.config()
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(
+        rs.stream.color, CAPTURE_WIDTH, CAPTURE_HEIGHT, rs.format.bgr8, 30
+    )
 
-    def get_color_frame():
+    def _grab_frame():
         frames = pipeline.wait_for_frames()
         frame = frames.get_color_frame()
         return np.asanyarray(frame.get_data()) if frame else None
@@ -34,19 +52,29 @@ if sys.platform == "linux":
         pipeline.stop()
 
 else:
-    def get_color_frame():
+    def _grab_frame():
         """Return a placeholder frame when no RealSense is available."""
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        frame = np.zeros((CAPTURE_HEIGHT, CAPTURE_WIDTH, 3), dtype=np.uint8)
         cv2.putText(
             frame,
             "RealSense not available (stub)",
-            (60, 240),
+            (60, CAPTURE_HEIGHT // 2),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            1.5,
             (255, 255, 255),
-            2,
+            3,
         )
         return frame
+
+
+def get_color_frame(width: int, height: int):
+    """Grab a frame and resize if smaller than capture resolution."""
+    image = _grab_frame()
+    if image is None:
+        return None
+    if (width, height) != (CAPTURE_WIDTH, CAPTURE_HEIGHT):
+        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+    return image
 
 
 # ---------------------------------------------------------------------------
@@ -82,13 +110,13 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# Camera generators
+# Generators
 # ---------------------------------------------------------------------------
 
-def generate_mjpeg():
-    """Yield MJPEG frames for the camera stream endpoint."""
+def generate_mjpeg(width: int, height: int):
+    """Yield MJPEG frames at the requested resolution."""
     while True:
-        image = get_color_frame()
+        image = get_color_frame(width, height)
         if image is None:
             continue
         _, jpeg = cv2.imencode(".jpg", image)
@@ -99,10 +127,6 @@ def generate_mjpeg():
             + b"\r\n"
         )
 
-
-# ---------------------------------------------------------------------------
-# Scale generator
-# ---------------------------------------------------------------------------
 
 def generate_scale_sse():
     """Yield SSE events with weight readings."""
@@ -117,16 +141,18 @@ def generate_scale_sse():
 # ---------------------------------------------------------------------------
 
 @app.get("/stream", summary="Live MJPEG color stream")
-def stream():
+def stream(preset: Preset = "fhd"):
+    width, height = RESOLUTIONS[preset]
     return StreamingResponse(
-        generate_mjpeg(),
+        generate_mjpeg(width, height),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
 @app.get("/capture", summary="Capture a single JPEG image")
-def capture():
-    image = get_color_frame()
+def capture(preset: Preset = "fhd"):
+    width, height = RESOLUTIONS[preset]
+    image = get_color_frame(width, height)
     if image is None:
         return Response(content="No frame available", status_code=503)
     _, jpeg = cv2.imencode(".jpg", image)
