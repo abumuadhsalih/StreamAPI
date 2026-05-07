@@ -98,6 +98,53 @@ The API will be accessible from any device on the same LAN:
 
 ---
 
+## Expose the API externally (Cloudflare Tunnel)
+
+Used during POC so the mobile app developer can hit the API from outside the LAN. **Temporary** — remove once the mobile app integrates with the production setup.
+
+> ⚠️ The API has no authentication. Only share the tunnel URL with trusted developers and tear it down when not actively in use.
+
+### 1. Install cloudflared on Jetson (ARM64)
+
+```bash
+curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb
+sudo dpkg -i cloudflared.deb
+rm cloudflared.deb
+```
+
+### 2. Start the API server (in one terminal)
+
+```bash
+uv run fastapi run main.py --host 0.0.0.0 --port 8000
+```
+
+### 3. Start the tunnel (in another terminal)
+
+```bash
+cloudflared tunnel --url http://localhost:8000
+```
+
+Cloudflare prints a public HTTPS URL like:
+```
+https://abc-random-words-1234.trycloudflare.com
+```
+
+Share that URL with the mobile app developer. Endpoints become:
+- `https://<tunnel-url>/scale/stream`
+- `https://<tunnel-url>/scale/capture`
+- `https://<tunnel-url>/stream?preset=hd`
+- `https://<tunnel-url>/capture?preset=fhd`
+- `https://<tunnel-url>/docs`
+
+### Notes
+
+- The URL changes every time you restart the tunnel. For a stable URL, set up a named tunnel with a Cloudflare account + domain.
+- For 1080p streaming over the public internet, prefer `?preset=hd` or `?preset=sd` to avoid bandwidth issues.
+- To run the tunnel persistently in the background, use a systemd service or `nohup cloudflared tunnel --url http://localhost:8000 &`.
+- To tear down: `Ctrl+C` the cloudflared process — the public URL stops resolving immediately.
+
+---
+
 ## Troubleshooting
 
 **`uv sync` fails with pyrealsense2 wheel error**

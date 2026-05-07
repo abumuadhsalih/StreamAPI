@@ -6,9 +6,20 @@ import cv2
 import numpy as np
 import serial
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 
 app = FastAPI(title="RealSense Stream API")
+
+# Open CORS for POC — mobile app + Cloudflare Tunnel access.
+# Lock down `allow_origins` to specific domains before any production use.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 # ---------------------------------------------------------------------------
 # Resolution presets
