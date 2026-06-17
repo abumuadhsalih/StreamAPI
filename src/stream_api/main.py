@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse, Response
 
 app = FastAPI(title="RealSense Stream API")
 
-# Open CORS for POC — mobile app + Cloudflare Tunnel access.
+# Open CORS for POC — LAN browser/mobile clients on arbitrary origins.
 # Lock down `allow_origins` to specific domains before any production use.
 app.add_middleware(
     CORSMiddleware,
@@ -189,3 +189,15 @@ def scale_capture():
     if not data["raw"]:
         return Response(content="No data from scale", status_code=503)
     return data
+
+
+def run():
+    """Entry point for the `stream-api` console script."""
+    import os
+    import uvicorn
+
+    uvicorn.run(
+        "stream_api.main:app",
+        host=os.environ.get("STREAM_API_HOST", "0.0.0.0"),
+        port=int(os.environ.get("STREAM_API_PORT", "8000")),
+    )

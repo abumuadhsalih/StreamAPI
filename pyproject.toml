@@ -11,3 +11,13 @@ dependencies = [
     "pyrealsense2>=2.57.7.10387 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "pyserial>=3.5",
 ]
+
+[project.scripts]
+stream-api = "stream_api.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stream_api"]

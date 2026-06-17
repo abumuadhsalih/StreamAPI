@@ -85,7 +85,7 @@ You should see `Devices found: 1` (or more). If it shows `0`, check the USB conn
 ### 8. Run the server
 
 ```bash
-uv run fastapi run main.py --host 0.0.0.0 --port 8000
+uv run stream-api
 ```
 
 The API will be accessible from any device on the same LAN:
@@ -98,50 +98,95 @@ The API will be accessible from any device on the same LAN:
 
 ---
 
-## Expose the API externally (Cloudflare Tunnel)
+## Run as a systemd service (auto-start on boot)
 
-Used during POC so the mobile app developer can hit the API from outside the LAN. **Temporary** — remove once the mobile app integrates with the production setup.
+Once the venv works, host the API as a managed daemon so you never SSH in to start it manually.
 
-> ⚠️ The API has no authentication. Only share the tunnel URL with trusted developers and tear it down when not actively in use.
-
-### 1. Install cloudflared on Jetson (ARM64)
+### 1. Build the wheel (on your dev machine)
 
 ```bash
-curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb
-sudo dpkg -i cloudflared.deb
-rm cloudflared.deb
+uv build
 ```
 
-### 2. Start the API server (in one terminal)
+This produces `dist/stream_api-0.1.0-py3-none-any.whl`.
+
+### 2. Copy the wheel to the Jetson
 
 ```bash
-uv run fastapi run main.py --host 0.0.0.0 --port 8000
+scp dist/stream_api-0.1.0-py3-none-any.whl <user>@<jetson-ip>:/tmp/
 ```
 
-### 3. Start the tunnel (in another terminal)
+(Or skip this and just `git pull && uv build` on the Jetson itself.)
+
+### 3. Install into a dedicated venv on the Jetson
 
 ```bash
-cloudflared tunnel --url http://localhost:8000
+sudo mkdir -p /opt/stream-api
+sudo chown $USER:$USER /opt/stream-api
+cd /opt/stream-api
+
+uv venv --system-site-packages          # needed for system pyrealsense2
+uv pip install /tmp/stream_api-0.1.0-py3-none-any.whl
 ```
 
-Cloudflare prints a public HTTPS URL like:
-```
-https://abc-random-words-1234.trycloudflare.com
+Verify:
+
+```bash
+.venv/bin/stream-api    # Ctrl+C after it logs "Uvicorn running on http://0.0.0.0:8000"
 ```
 
-Share that URL with the mobile app developer. Endpoints become:
-- `https://<tunnel-url>/scale/stream`
-- `https://<tunnel-url>/scale/capture`
-- `https://<tunnel-url>/stream?preset=hd`
-- `https://<tunnel-url>/capture?preset=fhd`
-- `https://<tunnel-url>/docs`
+### 4. Create the systemd unit
+
+```bash
+sudo tee /etc/systemd/system/stream-api.service > /dev/null <<'EOF'
+[Unit]
+Description=RealSense Stream API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<your-user>
+Group=plugdev
+WorkingDirectory=/opt/stream-api
+ExecStart=/opt/stream-api/.venv/bin/stream-api
+Environment=STREAM_API_HOST=0.0.0.0
+Environment=STREAM_API_PORT=8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+Replace `<your-user>` with the Linux user that owns the RealSense udev rule and the serial device (`plugdev` is the group from the udev step above).
+
+### 5. Enable and start
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now stream-api    # start now + on every boot
+sudo systemctl status stream-api          # confirm "active (running)"
+sudo journalctl -u stream-api -f          # tail live logs
+```
+
+### 6. Updating after a code change
+
+```bash
+# on dev machine
+uv build
+scp dist/stream_api-0.1.0-py3-none-any.whl <user>@<jetson-ip>:/tmp/
+
+# on Jetson
+uv pip install --reinstall /tmp/stream_api-0.1.0-py3-none-any.whl --python /opt/stream-api/.venv/bin/python
+sudo systemctl restart stream-api
+```
 
 ### Notes
 
-- The URL changes every time you restart the tunnel. For a stable URL, set up a named tunnel with a Cloudflare account + domain.
-- For 1080p streaming over the public internet, prefer `?preset=hd` or `?preset=sd` to avoid bandwidth issues.
-- To run the tunnel persistently in the background, use a systemd service or `nohup cloudflared tunnel --url http://localhost:8000 &`.
-- To tear down: `Ctrl+C` the cloudflared process — the public URL stops resolving immediately.
+- Keep `--workers 1` (the default). The RealSense pipeline and `/dev/ttyUSB0` are single-owner — a second worker will crash on startup trying to grab the same hardware.
+- `Restart=on-failure` brings the service back if the camera/scale throws. If it crash-loops, `journalctl -u stream-api -n 200` will show why.
 
 ---
 
@@ -171,5 +216,5 @@ sudo usermod -aG plugdev $USER
 
 **Port 8000 already in use**
 ```bash
-uv run fastapi run main.py --host 0.0.0.0 --port 8080
+STREAM_API_PORT=8080 uv run stream-api
 ```
