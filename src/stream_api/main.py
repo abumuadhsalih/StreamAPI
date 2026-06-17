@@ -1,13 +1,16 @@
 import sys
 import json
 import time
-from typing import Literal
+import logging
+from typing import Literal, Optional
 import cv2
 import numpy as np
 import serial
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, JSONResponse
+
+logger = logging.getLogger("stream_api")
 
 app = FastAPI(title="RealSense Stream API")
 
@@ -37,6 +40,28 @@ Preset = Literal["sd", "hd", "fhd"]
 
 
 # ---------------------------------------------------------------------------
+# Hardware status — surfaced via /health and used to short-circuit endpoints
+# ---------------------------------------------------------------------------
+
+camera_status: dict = {"ok": False, "error": "not yet started", "mode": "real"}
+scale_status: dict = {"ok": False, "error": "not yet opened", "mode": "real"}
+
+
+def _camera_failed(error: str) -> None:
+    if camera_status["ok"] or camera_status.get("error") != error:
+        logger.warning("camera failure: %s", error)
+    camera_status["ok"] = False
+    camera_status["error"] = error
+
+
+def _scale_failed(error: str) -> None:
+    if scale_status["ok"] or scale_status.get("error") != error:
+        logger.warning("scale failure: %s", error)
+    scale_status["ok"] = False
+    scale_status["error"] = error
+
+
+# ---------------------------------------------------------------------------
 # Camera — pyrealsense2 is Linux-only; stub on other platforms for local dev
 # ---------------------------------------------------------------------------
 
@@ -50,19 +75,36 @@ if sys.platform == "linux":
     )
 
     def _grab_frame():
-        frames = pipeline.wait_for_frames()
-        frame = frames.get_color_frame()
-        return np.asanyarray(frame.get_data()) if frame else None
+        if not camera_status["ok"]:
+            return None
+        try:
+            frames = pipeline.wait_for_frames()
+            frame = frames.get_color_frame()
+            return np.asanyarray(frame.get_data()) if frame else None
+        except Exception as e:
+            _camera_failed(str(e))
+            return None
 
     @app.on_event("startup")
-    def on_startup():
-        pipeline.start(config)
+    def _camera_startup():
+        try:
+            pipeline.start(config)
+            camera_status["ok"] = True
+            camera_status["error"] = None
+            logger.info("camera pipeline started")
+        except Exception as e:
+            _camera_failed(f"failed to start pipeline: {e}")
 
     @app.on_event("shutdown")
-    def on_shutdown():
-        pipeline.stop()
+    def _camera_shutdown():
+        try:
+            pipeline.stop()
+        except Exception:
+            pass
 
 else:
+    camera_status.update({"ok": True, "error": None, "mode": "stub"})
+
     def _grab_frame():
         """Return a placeholder frame when no RealSense is available."""
         frame = np.zeros((CAPTURE_HEIGHT, CAPTURE_WIDTH, 3), dtype=np.uint8)
@@ -96,22 +138,54 @@ SCALE_PORT = "/dev/ttyUSB0"
 SCALE_BAUD = 9600
 
 if sys.platform == "linux":
-    scale_serial = serial.Serial(
-        port=SCALE_PORT,
-        baudrate=SCALE_BAUD,
-        bytesize=8,
-        parity="N",
-        stopbits=1,
-        timeout=1,
-    )
+    scale_serial: Optional[serial.Serial] = None
+
+    def _open_scale() -> None:
+        global scale_serial
+        try:
+            scale_serial = serial.Serial(
+                port=SCALE_PORT,
+                baudrate=SCALE_BAUD,
+                bytesize=8,
+                parity="N",
+                stopbits=1,
+                timeout=1,
+            )
+            scale_status["ok"] = True
+            scale_status["error"] = None
+            logger.info("scale opened on %s", SCALE_PORT)
+        except Exception as e:
+            scale_serial = None
+            _scale_failed(f"failed to open {SCALE_PORT}: {e}")
+
+    @app.on_event("startup")
+    def _scale_startup():
+        _open_scale()
 
     def read_scale() -> dict:
-        """Read one line from the scale and return parsed data."""
-        line = scale_serial.readline().decode("utf-8", errors="ignore").strip()
-        return {"raw": line, "timestamp": time.time()}
+        """Read one line from the scale; reopens the port if it was lost."""
+        global scale_serial
+        if scale_serial is None:
+            _open_scale()
+        if scale_serial is None:
+            return {"raw": "", "timestamp": time.time()}
+        try:
+            line = scale_serial.readline().decode("utf-8", errors="ignore").strip()
+            scale_status["ok"] = True
+            scale_status["error"] = None
+            return {"raw": line, "timestamp": time.time()}
+        except Exception as e:
+            _scale_failed(str(e))
+            try:
+                scale_serial.close()
+            except Exception:
+                pass
+            scale_serial = None
+            return {"raw": "", "timestamp": time.time()}
 
 else:
     import random
+    scale_status.update({"ok": True, "error": None, "mode": "stub"})
 
     def read_scale() -> dict:
         """Return simulated weight data for local dev."""
@@ -125,10 +199,13 @@ else:
 # ---------------------------------------------------------------------------
 
 def generate_mjpeg(width: int, height: int):
-    """Yield MJPEG frames at the requested resolution."""
+    """Yield MJPEG frames; ends cleanly if the camera goes down."""
     while True:
         image = get_color_frame(width, height)
         if image is None:
+            if not camera_status["ok"]:
+                return
+            time.sleep(0.05)
             continue
         _, jpeg = cv2.imencode(".jpg", image)
         yield (
@@ -140,11 +217,24 @@ def generate_mjpeg(width: int, height: int):
 
 
 def generate_scale_sse():
-    """Yield SSE events with weight readings."""
+    """Yield SSE events; emits one error event and stops if the scale fails."""
     while True:
         data = read_scale()
+        if not scale_status["ok"]:
+            yield f"data: {json.dumps({'error': scale_status['error'], 'timestamp': time.time()})}\n\n"
+            return
         if data["raw"]:
             yield f"data: {json.dumps(data)}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
+@app.get("/health", summary="Hardware status for camera and scale")
+def health():
+    overall = "ok" if (camera_status["ok"] and scale_status["ok"]) else "degraded"
+    return {"status": overall, "camera": camera_status, "scale": scale_status}
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +243,11 @@ def generate_scale_sse():
 
 @app.get("/stream", summary="Live MJPEG color stream")
 def stream(preset: Preset = "fhd"):
+    if not camera_status["ok"]:
+        return JSONResponse(
+            content={"error": "camera not available", "detail": camera_status["error"]},
+            status_code=503,
+        )
     width, height = RESOLUTIONS[preset]
     return StreamingResponse(
         generate_mjpeg(width, height),
@@ -162,10 +257,18 @@ def stream(preset: Preset = "fhd"):
 
 @app.get("/capture", summary="Capture a single JPEG image")
 def capture(preset: Preset = "fhd"):
+    if not camera_status["ok"]:
+        return JSONResponse(
+            content={"error": "camera not available", "detail": camera_status["error"]},
+            status_code=503,
+        )
     width, height = RESOLUTIONS[preset]
     image = get_color_frame(width, height)
     if image is None:
-        return Response(content="No frame available", status_code=503)
+        return JSONResponse(
+            content={"error": "camera not available", "detail": camera_status["error"]},
+            status_code=503,
+        )
     _, jpeg = cv2.imencode(".jpg", image)
     return Response(content=jpeg.tobytes(), media_type="image/jpeg")
 
@@ -176,6 +279,11 @@ def capture(preset: Preset = "fhd"):
 
 @app.get("/scale/stream", summary="Live weight scale stream (SSE)")
 def scale_stream():
+    if not scale_status["ok"]:
+        return JSONResponse(
+            content={"error": "scale not available", "detail": scale_status["error"]},
+            status_code=503,
+        )
     return StreamingResponse(
         generate_scale_sse(),
         media_type="text/event-stream",
@@ -186,8 +294,13 @@ def scale_stream():
 @app.get("/scale/capture", summary="Read current weight from scale")
 def scale_capture():
     data = read_scale()
+    if not scale_status["ok"]:
+        return JSONResponse(
+            content={"error": "scale not available", "detail": scale_status["error"]},
+            status_code=503,
+        )
     if not data["raw"]:
-        return Response(content="No data from scale", status_code=503)
+        return JSONResponse(content={"error": "no data from scale"}, status_code=503)
     return data
 
 
