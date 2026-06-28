@@ -2,6 +2,7 @@ import sys
 import json
 import time
 import logging
+import threading
 from typing import Literal, Optional
 import cv2
 import numpy as np
@@ -139,6 +140,11 @@ SCALE_BAUD = 9600
 
 if sys.platform == "linux":
     scale_serial: Optional[serial.Serial] = None
+    # Serialize access to the shared serial handle so concurrent endpoints
+    # (e.g. /scale/stream loop + /scale/capture click) don't both call
+    # readline() on the same port and trip pyserial's
+    # "device reports readiness to read but returned no data" race.
+    _scale_lock = threading.Lock()
 
     def _open_scale() -> None:
         global scale_serial
@@ -165,23 +171,24 @@ if sys.platform == "linux":
     def read_scale() -> dict:
         """Read one line from the scale; reopens the port if it was lost."""
         global scale_serial
-        if scale_serial is None:
-            _open_scale()
-        if scale_serial is None:
-            return {"raw": "", "timestamp": time.time()}
-        try:
-            line = scale_serial.readline().decode("utf-8", errors="ignore").strip()
-            scale_status["ok"] = True
-            scale_status["error"] = None
-            return {"raw": line, "timestamp": time.time()}
-        except Exception as e:
-            _scale_failed(str(e))
+        with _scale_lock:
+            if scale_serial is None:
+                _open_scale()
+            if scale_serial is None:
+                return {"raw": "", "timestamp": time.time()}
             try:
-                scale_serial.close()
-            except Exception:
-                pass
-            scale_serial = None
-            return {"raw": "", "timestamp": time.time()}
+                line = scale_serial.readline().decode("utf-8", errors="ignore").strip()
+                scale_status["ok"] = True
+                scale_status["error"] = None
+                return {"raw": line, "timestamp": time.time()}
+            except Exception as e:
+                _scale_failed(str(e))
+                try:
+                    scale_serial.close()
+                except Exception:
+                    pass
+                scale_serial = None
+                return {"raw": "", "timestamp": time.time()}
 
 else:
     import random
