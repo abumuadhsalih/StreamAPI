@@ -276,7 +276,7 @@ def capture(preset: Preset = "fhd"):
             content={"error": "camera not available", "detail": camera_status["error"]},
             status_code=503,
         )
-    _, jpeg = cv2.imencode(".jpg", image)
+    _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 100])
     return Response(content=jpeg.tobytes(), media_type="image/jpeg")
 
 
