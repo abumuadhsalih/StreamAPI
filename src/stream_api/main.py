@@ -75,6 +75,15 @@ if sys.platform == "linux":
         rs.stream.color, CAPTURE_WIDTH, CAPTURE_HEIGHT, rs.format.bgr8, 30
     )
 
+    def _tune_color_sensor() -> None:
+        color_sensor = pipeline.get_active_profile().get_device().first_color_sensor()
+        color_sensor.set_option(rs.option.sharpness, 100)
+        color_sensor.set_option(rs.option.contrast, 60)
+        color_sensor.set_option(rs.option.gamma, 300)
+        color_sensor.set_option(rs.option.backlight_compensation, 1)
+        color_sensor.set_option(rs.option.power_line_frequency, 1)
+        color_sensor.set_option(rs.option.auto_exposure_priority, 0)
+
     def _grab_frame():
         if not camera_status["ok"]:
             return None
@@ -90,6 +99,7 @@ if sys.platform == "linux":
     def _camera_startup():
         try:
             pipeline.start(config)
+            _tune_color_sensor()
             camera_status["ok"] = True
             camera_status["error"] = None
             logger.info("camera pipeline started")
@@ -248,6 +258,16 @@ def health():
 # Camera endpoints
 # ---------------------------------------------------------------------------
 
+def enhance_for_text(image: np.ndarray) -> np.ndarray:
+    """CLAHE on LAB-L + unsharp mask — lifts small printed text on glared surfaces."""
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
+    out = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+    blurred = cv2.GaussianBlur(out, (0, 0), sigmaX=1.5)
+    return cv2.addWeighted(out, 1.5, blurred, -0.5, 0)
+
+
 @app.get("/stream", summary="Live MJPEG color stream")
 def stream(preset: Preset = "fhd"):
     if not camera_status["ok"]:
@@ -263,7 +283,7 @@ def stream(preset: Preset = "fhd"):
 
 
 @app.get("/capture", summary="Capture a single JPEG image")
-def capture(preset: Preset = "fhd"):
+def capture(preset: Preset = "fhd", enhance: bool = False):
     if not camera_status["ok"]:
         return JSONResponse(
             content={"error": "camera not available", "detail": camera_status["error"]},
@@ -276,6 +296,8 @@ def capture(preset: Preset = "fhd"):
             content={"error": "camera not available", "detail": camera_status["error"]},
             status_code=503,
         )
+    if enhance:
+        image = enhance_for_text(image)
     _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 100])
     return Response(content=jpeg.tobytes(), media_type="image/jpeg")
 
