@@ -75,6 +75,12 @@ if sys.platform == "linux":
         rs.stream.color, CAPTURE_WIDTH, CAPTURE_HEIGHT, rs.format.bgr8, 30
     )
 
+    # Serialize all pipeline access — pyrealsense2's pipeline is not thread-safe,
+    # and lazy restart from multiple concurrent requests must be single-flighted.
+    _camera_lock = threading.Lock()
+    _camera_last_retry = 0.0
+    _CAMERA_RETRY_COOLDOWN = 5.0  # seconds — avoid hammering USB after a disconnect
+
     def _tune_color_sensor() -> None:
         color_sensor = pipeline.get_active_profile().get_device().first_color_sensor()
         color_sensor.set_option(rs.option.sharpness, 100)
@@ -84,27 +90,48 @@ if sys.platform == "linux":
         color_sensor.set_option(rs.option.power_line_frequency, 1)
         color_sensor.set_option(rs.option.auto_exposure_priority, 0)
 
-    def _grab_frame():
-        if not camera_status["ok"]:
-            return None
+    def _start_pipeline() -> bool:
+        """(Re)start the RealSense pipeline. Caller must hold _camera_lock."""
+        global _camera_last_retry
+        _camera_last_retry = time.monotonic()
         try:
-            frames = pipeline.wait_for_frames()
-            frame = frames.get_color_frame()
-            return np.asanyarray(frame.get_data()) if frame else None
-        except Exception as e:
-            _camera_failed(str(e))
-            return None
-
-    @app.on_event("startup")
-    def _camera_startup():
+            pipeline.stop()
+        except Exception:
+            pass
         try:
             pipeline.start(config)
             _tune_color_sensor()
             camera_status["ok"] = True
             camera_status["error"] = None
             logger.info("camera pipeline started")
+            return True
         except Exception as e:
             _camera_failed(f"failed to start pipeline: {e}")
+            return False
+
+    def _grab_frame():
+        with _camera_lock:
+            if not camera_status["ok"]:
+                if time.monotonic() - _camera_last_retry < _CAMERA_RETRY_COOLDOWN:
+                    return None
+                if not _start_pipeline():
+                    return None
+            try:
+                frames = pipeline.wait_for_frames()
+                frame = frames.get_color_frame()
+                return np.asanyarray(frame.get_data()) if frame else None
+            except Exception as e:
+                _camera_failed(str(e))
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+                return None
+
+    @app.on_event("startup")
+    def _camera_startup():
+        with _camera_lock:
+            _start_pipeline()
 
     @app.on_event("shutdown")
     def _camera_shutdown():
@@ -270,12 +297,13 @@ def enhance_for_text(image: np.ndarray) -> np.ndarray:
 
 @app.get("/stream", summary="Live MJPEG color stream")
 def stream(preset: Preset = "fhd"):
-    if not camera_status["ok"]:
+    width, height = RESOLUTIONS[preset]
+    # Probe once to trigger a lazy pipeline restart if the camera has dropped.
+    if get_color_frame(width, height) is None:
         return JSONResponse(
             content={"error": "camera not available", "detail": camera_status["error"]},
             status_code=503,
         )
-    width, height = RESOLUTIONS[preset]
     return StreamingResponse(
         generate_mjpeg(width, height),
         media_type="multipart/x-mixed-replace; boundary=frame",
@@ -284,11 +312,6 @@ def stream(preset: Preset = "fhd"):
 
 @app.get("/capture", summary="Capture a single JPEG image")
 def capture(preset: Preset = "fhd", enhance: bool = False):
-    if not camera_status["ok"]:
-        return JSONResponse(
-            content={"error": "camera not available", "detail": camera_status["error"]},
-            status_code=503,
-        )
     width, height = RESOLUTIONS[preset]
     image = get_color_frame(width, height)
     if image is None:
