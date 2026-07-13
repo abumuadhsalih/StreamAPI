@@ -1,3 +1,4 @@
+import os
 import sys
 import json
 import time
@@ -172,8 +173,15 @@ def get_color_frame(width: int, height: int):
 # Scale — serial port on Linux; stub on other platforms for local dev
 # ---------------------------------------------------------------------------
 
-SCALE_PORT = "/dev/ttyUSB0"
-SCALE_BAUD = 9600
+# Prefer the kernel's /dev/serial/by-id/ symlink over /dev/ttyUSB0 — the
+# ttyUSBN number can shift after USB re-enumeration, but the by-id path
+# is stable across reboots and reconnects. Override via STREAM_API_SCALE_PORT
+# if the scale hardware changes.
+SCALE_PORT = os.environ.get(
+    "STREAM_API_SCALE_PORT",
+    "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B0000CHM-if00-port0",
+)
+SCALE_BAUD = int(os.environ.get("STREAM_API_SCALE_BAUD", "9600"))
 
 if sys.platform == "linux":
     scale_serial: Optional[serial.Serial] = None
@@ -358,7 +366,6 @@ def scale_capture():
 
 def run():
     """Entry point for the `stream-api` console script."""
-    import os
     import uvicorn
 
     uvicorn.run(
