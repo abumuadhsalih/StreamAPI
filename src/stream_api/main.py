@@ -82,6 +82,14 @@ if sys.platform == "linux":
     _camera_last_retry = 0.0
     _CAMERA_RETRY_COOLDOWN = 5.0  # seconds — avoid hammering USB after a disconnect
 
+    # Optional fixed-exposure / fixed-white-balance overrides. On auto, the
+    # camera reacts to specular glare in-frame (darkening the whole capture)
+    # and to fluorescent light spikes (green cast). For a fixed measurement
+    # rig, locking both to a value tuned to the room gives consistent captures.
+    # Leave unset to keep auto behavior.
+    _CAMERA_EXPOSURE = os.environ.get("STREAM_API_CAMERA_EXPOSURE")  # microseconds, e.g. "15000"
+    _CAMERA_WB = os.environ.get("STREAM_API_CAMERA_WB")              # Kelvin, e.g. "4600"
+
     def _tune_color_sensor() -> None:
         color_sensor = pipeline.get_active_profile().get_device().first_color_sensor()
         color_sensor.set_option(rs.option.sharpness, 100)
@@ -90,6 +98,14 @@ if sys.platform == "linux":
         color_sensor.set_option(rs.option.backlight_compensation, 1)
         color_sensor.set_option(rs.option.power_line_frequency, 1)
         color_sensor.set_option(rs.option.auto_exposure_priority, 0)
+        if _CAMERA_EXPOSURE:
+            color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+            color_sensor.set_option(rs.option.exposure, float(_CAMERA_EXPOSURE))
+            logger.info("camera exposure locked at %s us", _CAMERA_EXPOSURE)
+        if _CAMERA_WB:
+            color_sensor.set_option(rs.option.enable_auto_white_balance, 0)
+            color_sensor.set_option(rs.option.white_balance, float(_CAMERA_WB))
+            logger.info("camera white balance locked at %s K", _CAMERA_WB)
 
     def _start_pipeline() -> bool:
         """(Re)start the RealSense pipeline. Caller must hold _camera_lock."""
@@ -99,15 +115,43 @@ if sys.platform == "linux":
             pipeline.stop()
         except Exception:
             pass
+        # Enumerate first so we can distinguish "no camera on USB" (hardware
+        # unplugged / bad cable / wrong port) from "camera present but pipeline
+        # refused" (another process holds it, firmware wedged, USB 2.0 port).
+        try:
+            devices = rs.context().query_devices()
+        except Exception as e:
+            _camera_failed(f"failed to enumerate USB devices: {e}")
+            return False
+        if len(devices) == 0:
+            _camera_failed(
+                "no RealSense device detected on USB — check the cable, "
+                "try a different USB 3.0 port, or unplug/replug the camera"
+            )
+            return False
+        camera_status["device"] = {
+            "name": devices[0].get_info(rs.camera_info.name),
+            "serial": devices[0].get_info(rs.camera_info.serial_number),
+            "firmware": devices[0].get_info(rs.camera_info.firmware_version),
+        }
         try:
             pipeline.start(config)
             _tune_color_sensor()
             camera_status["ok"] = True
             camera_status["error"] = None
-            logger.info("camera pipeline started")
+            logger.info(
+                "camera pipeline started: %s serial=%s fw=%s",
+                camera_status["device"]["name"],
+                camera_status["device"]["serial"],
+                camera_status["device"]["firmware"],
+            )
             return True
         except Exception as e:
-            _camera_failed(f"failed to start pipeline: {e}")
+            _camera_failed(
+                f"pipeline start refused by device (camera detected but "
+                f"stream config was rejected — likely another process holds "
+                f"it, or the camera is on a USB 2.0 port): {e}"
+            )
             return False
 
     def _grab_frame():
