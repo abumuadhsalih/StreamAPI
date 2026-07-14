@@ -1131,6 +1131,7 @@ dependencies = [
     { name = "opencv-python-headless" },
     { name = "pyrealsense2", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "pyserial" },
+    { name = "python-dotenv" },
 ]
 
 [package.metadata]
@@ -1139,6 +1140,7 @@ requires-dist = [
     { name = "opencv-python-headless", specifier = ">=4.13.0.92" },
     { name = "pyrealsense2", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=2.57.7.10387" },
     { name = "pyserial", specifier = ">=3.5" },
+    { name = "python-dotenv", specifier = ">=1.2.2" },
 ]
 
 [[package]]

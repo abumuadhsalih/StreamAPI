@@ -5,12 +5,20 @@ import time
 import logging
 import threading
 from typing import Literal, Optional
+from dotenv import load_dotenv
 import cv2
 import numpy as np
 import serial
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, JSONResponse
+
+# Load .env from the process CWD. Under systemd this is WorkingDirectory
+# (/opt/stream-api on Jetson); in development it's the repo root when the
+# server is run from there. Real env vars (from systemd/shell) still win —
+# load_dotenv defaults to override=False, so setting the same key in the
+# systemd unit takes precedence over the .env file.
+load_dotenv()
 
 logger = logging.getLogger("stream_api")
 
