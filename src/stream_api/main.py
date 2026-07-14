@@ -98,22 +98,45 @@ if sys.platform == "linux":
     _CAMERA_EXPOSURE = os.environ.get("STREAM_API_CAMERA_EXPOSURE")  # microseconds, e.g. "15000"
     _CAMERA_WB = os.environ.get("STREAM_API_CAMERA_WB")              # Kelvin, e.g. "4600"
 
+    def _set_option(sensor, opt, value) -> bool:
+        """Set a sensor option; log range on rejection but never raise.
+        Prevents one bad value from killing the whole pipeline."""
+        try:
+            sensor.set_option(opt, float(value))
+            return True
+        except Exception as e:
+            try:
+                r = sensor.get_option_range(opt)
+                logger.warning(
+                    "camera option %s=%s rejected — valid range %s..%s step %s (%s)",
+                    opt, value, r.min, r.max, r.step, e,
+                )
+            except Exception:
+                logger.warning("camera option %s=%s rejected: %s", opt, value, e)
+            return False
+
     def _tune_color_sensor() -> None:
         color_sensor = pipeline.get_active_profile().get_device().first_color_sensor()
-        color_sensor.set_option(rs.option.sharpness, 100)
-        color_sensor.set_option(rs.option.contrast, 60)
-        color_sensor.set_option(rs.option.gamma, 300)
-        color_sensor.set_option(rs.option.backlight_compensation, 1)
-        color_sensor.set_option(rs.option.power_line_frequency, 1)
-        color_sensor.set_option(rs.option.auto_exposure_priority, 0)
+        _set_option(color_sensor, rs.option.sharpness, 100)
+        _set_option(color_sensor, rs.option.contrast, 60)
+        _set_option(color_sensor, rs.option.gamma, 300)
+        _set_option(color_sensor, rs.option.backlight_compensation, 1)
+        _set_option(color_sensor, rs.option.power_line_frequency, 1)
+        _set_option(color_sensor, rs.option.auto_exposure_priority, 0)
         if _CAMERA_EXPOSURE:
-            color_sensor.set_option(rs.option.enable_auto_exposure, 0)
-            color_sensor.set_option(rs.option.exposure, float(_CAMERA_EXPOSURE))
-            logger.info("camera exposure locked at %s us", _CAMERA_EXPOSURE)
+            if (_set_option(color_sensor, rs.option.enable_auto_exposure, 0)
+                    and _set_option(color_sensor, rs.option.exposure, _CAMERA_EXPOSURE)):
+                logger.info("camera exposure locked at %s", _CAMERA_EXPOSURE)
+            else:
+                # Restore auto if fixed-exposure attempt failed, so we don't
+                # leave the sensor half-configured (AE off, exposure unchanged).
+                _set_option(color_sensor, rs.option.enable_auto_exposure, 1)
         if _CAMERA_WB:
-            color_sensor.set_option(rs.option.enable_auto_white_balance, 0)
-            color_sensor.set_option(rs.option.white_balance, float(_CAMERA_WB))
-            logger.info("camera white balance locked at %s K", _CAMERA_WB)
+            if (_set_option(color_sensor, rs.option.enable_auto_white_balance, 0)
+                    and _set_option(color_sensor, rs.option.white_balance, _CAMERA_WB)):
+                logger.info("camera white balance locked at %s K", _CAMERA_WB)
+            else:
+                _set_option(color_sensor, rs.option.enable_auto_white_balance, 1)
 
     def _start_pipeline() -> bool:
         """(Re)start the RealSense pipeline. Caller must hold _camera_lock."""
