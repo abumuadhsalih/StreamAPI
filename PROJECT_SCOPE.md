@@ -18,6 +18,14 @@ An API server running on a Jetson Ubuntu VM to expose an Intel RealSense camera 
 |---|---|---|
 | `/stream` | GET | Live MJPEG stream of the RealSense RGB color feed |
 | `/capture` | GET | Trigger a snapshot and return the image in the response body |
+| `/scale/stream` | GET | Live weight stream (SSE) |
+| `/scale/capture` | GET | Read current weight |
+| `/health` | GET | Per-device status + last error |
+| `/system/stats` | GET | CPU / memory / disk / temperature / uptime |
+| `/camera/restart` | POST | Force a RealSense pipeline restart |
+| `/scale/reconnect` | POST | Force the scale serial port to reopen |
+| `/system/reboot` | POST | Reboot the Jetson (admin-token guarded) |
+| `/system/restart-service` | POST | Restart the stream-api service (admin-token guarded) |
 
 ## Stream Details
 

@@ -8,7 +8,30 @@ A FastAPI server that exposes an Intel RealSense camera over HTTP — enabling w
 |---|---|---|
 | GET | `/stream` | Live MJPEG color stream |
 | GET | `/capture` | Capture and return a single JPEG image |
+| GET | `/scale/stream` | Live weight stream (SSE) |
+| GET | `/scale/capture` | Read current weight |
+| GET | `/health` | Per-device status + last error |
+| GET | `/system/stats` | CPU / memory / disk / temperature / uptime |
+| POST | `/camera/restart` | Force a RealSense pipeline restart |
+| POST | `/scale/reconnect` | Force the scale serial port to reopen |
+| POST | `/system/reboot` | Reboot the Jetson — requires `?token=` (see below) |
+| POST | `/system/restart-service` | Restart the stream-api service — requires `?token=` |
 | GET | `/docs` | Interactive API documentation (Swagger UI) |
+
+### Admin token (destructive actions)
+
+`/system/reboot` and `/system/restart-service` are guarded by a shared secret,
+since the API is otherwise unauthenticated. Set `STREAM_API_ADMIN_TOKEN` in the
+environment (see the systemd unit below) and pass it as a query param:
+
+```bash
+curl -X POST "http://<jetson-ip>:8000/system/reboot?token=<your-secret>"
+```
+
+These endpoints **fail closed**: if `STREAM_API_ADMIN_TOKEN` is unset they return
+`503 admin token not configured` and cannot be triggered. A wrong/missing token
+returns `403`. Rebooting also needs a scoped `sudo` rule — see
+[Allow reboot / service restart](#allow-reboot--service-restart-scoped-sudo).
 
 ---
 
@@ -152,6 +175,10 @@ WorkingDirectory=/opt/stream-api
 ExecStart=/opt/stream-api/.venv/bin/stream-api
 Environment=STREAM_API_HOST=0.0.0.0
 Environment=STREAM_API_PORT=8000
+# Required to enable /system/reboot and /system/restart-service. Generate a
+# random value (e.g. `openssl rand -hex 16`). Without it those endpoints are
+# disabled (fail closed).
+Environment=STREAM_API_ADMIN_TOKEN=<random-secret>
 Restart=on-failure
 RestartSec=5
 
@@ -162,7 +189,29 @@ EOF
 
 Replace `<your-user>` with the Linux user that owns the RealSense udev rule and the serial device (`plugdev` is the group from the udev step above).
 
-### 5. Enable and start
+### 5. Allow reboot / service restart (scoped sudo)
+
+The service runs as an unprivileged user, so `/system/reboot` and
+`/system/restart-service` need a passwordless `sudo` rule limited to *only*
+those two commands. Confirm the `systemctl` path first, then add a sudoers
+drop-in:
+
+```bash
+command -v systemctl                       # usually /usr/bin/systemctl on Ubuntu
+sudo visudo -f /etc/sudoers.d/stream-api
+```
+
+Add (replace `<your-user>`; if the path above differs, set
+`STREAM_API_SYSTEMCTL` in the unit to match):
+
+```
+<your-user> ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /usr/bin/systemctl restart stream-api
+```
+
+`visudo` validates the syntax on save. Verify:
+`sudo -n /usr/bin/systemctl --version` should run without prompting for a password.
+
+### 6. Enable and start
 
 ```bash
 sudo systemctl daemon-reload
@@ -171,7 +220,7 @@ sudo systemctl status stream-api          # confirm "active (running)"
 sudo journalctl -u stream-api -f          # tail live logs
 ```
 
-### 6. Updating after a code change
+### 7. Updating after a code change
 
 ```bash
 # on dev machine
