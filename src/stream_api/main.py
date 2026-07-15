@@ -2,13 +2,17 @@ import os
 import sys
 import json
 import time
+import glob
+import hmac
 import logging
 import threading
+import subprocess
 from typing import Literal, Optional
 import cv2
 import numpy as np
 import serial
-from fastapi import FastAPI
+import psutil
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 
@@ -22,9 +26,36 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Admin token — the one guard on destructive actions (reboot / restart).
+# The rest of the API is unauthenticated (LAN-only POC), so these endpoints
+# fail closed: if STREAM_API_ADMIN_TOKEN is unset they are disabled entirely.
+# ---------------------------------------------------------------------------
+
+ADMIN_TOKEN = os.environ.get("STREAM_API_ADMIN_TOKEN", "")
+
+
+def require_admin_token(token: str = "") -> None:
+    """FastAPI dependency guarding destructive endpoints via `?token=`."""
+    if not ADMIN_TOKEN:
+        raise _AdminError(503, "admin token not configured")
+    if not hmac.compare_digest(token, ADMIN_TOKEN):
+        raise _AdminError(403, "invalid or missing admin token")
+
+
+class _AdminError(Exception):
+    def __init__(self, status_code: int, message: str) -> None:
+        self.status_code = status_code
+        self.message = message
+
+
+@app.exception_handler(_AdminError)
+def _admin_error_handler(request, exc: _AdminError):
+    return JSONResponse(content={"error": exc.message}, status_code=exc.status_code)
 
 # ---------------------------------------------------------------------------
 # Resolution presets
@@ -190,6 +221,14 @@ if sys.platform == "linux":
                     pass
                 return None
 
+    def restart_camera() -> dict:
+        """Force a pipeline stop+restart on demand, bypassing the cooldown."""
+        global _camera_last_retry
+        with _camera_lock:
+            _camera_last_retry = 0.0
+            _start_pipeline()
+        return camera_status
+
     @app.on_event("startup")
     def _camera_startup():
         with _camera_lock:
@@ -204,6 +243,10 @@ if sys.platform == "linux":
 
 else:
     camera_status.update({"ok": True, "error": None, "mode": "stub"})
+
+    def restart_camera() -> dict:
+        """No-op restart for local dev — returns the stub status."""
+        return camera_status
 
     def _grab_frame():
         """Return a placeholder frame when no RealSense is available."""
@@ -270,6 +313,19 @@ if sys.platform == "linux":
             scale_serial = None
             _scale_failed(f"failed to open {SCALE_PORT}: {e}")
 
+    def reconnect_scale() -> dict:
+        """Force-close and reopen the serial port on demand."""
+        global scale_serial
+        with _scale_lock:
+            if scale_serial is not None:
+                try:
+                    scale_serial.close()
+                except Exception:
+                    pass
+                scale_serial = None
+            _open_scale()
+        return scale_status
+
     @app.on_event("startup")
     def _scale_startup():
         _open_scale()
@@ -299,6 +355,10 @@ if sys.platform == "linux":
 else:
     import random
     scale_status.update({"ok": True, "error": None, "mode": "stub"})
+
+    def reconnect_scale() -> dict:
+        """No-op reconnect for local dev — returns the stub status."""
+        return scale_status
 
     def read_scale() -> dict:
         """Return simulated weight data for local dev."""
@@ -348,6 +408,97 @@ def generate_scale_sse():
 def health():
     overall = "ok" if (camera_status["ok"] and scale_status["ok"]) else "degraded"
     return {"status": overall, "camera": camera_status, "scale": scale_status}
+
+
+# ---------------------------------------------------------------------------
+# System control — reboot / service restart / stats
+# ---------------------------------------------------------------------------
+
+# Absolute path so the invocation matches the scoped sudoers NOPASSWD rule
+# (see README). Override if `command -v systemctl` differs on your Jetson.
+SYSTEMCTL = os.environ.get("STREAM_API_SYSTEMCTL", "/usr/bin/systemctl")
+
+
+def _run_detached_after_delay(cmd: list[str], delay: float = 1.0) -> None:
+    """Fire a privileged command from a daemon thread so the HTTP response is
+    flushed first. start_new_session detaches the child so restarting our own
+    unit doesn't kill the command mid-flight."""
+    def _worker() -> None:
+        time.sleep(delay)
+        try:
+            subprocess.Popen(cmd, start_new_session=True)
+        except Exception as e:
+            logger.error("failed to run %s: %s", cmd, e)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+@app.post(
+    "/system/reboot",
+    summary="Reboot the Jetson (requires admin token)",
+    dependencies=[Depends(require_admin_token)],
+)
+def system_reboot():
+    if sys.platform != "linux":
+        return {"status": "stub", "would_run": "systemctl reboot"}
+    logger.warning("reboot requested via API")
+    _run_detached_after_delay(["sudo", SYSTEMCTL, "reboot"])
+    return {"status": "rebooting"}
+
+
+@app.post(
+    "/system/restart-service",
+    summary="Restart the stream-api service (requires admin token)",
+    dependencies=[Depends(require_admin_token)],
+)
+def system_restart_service():
+    if sys.platform != "linux":
+        return {"status": "stub", "would_run": "systemctl restart stream-api"}
+    logger.warning("service restart requested via API")
+    _run_detached_after_delay(["sudo", SYSTEMCTL, "restart", "stream-api"])
+    return {"status": "restarting"}
+
+
+def _jetson_temperature_c() -> Optional[float]:
+    """Hottest thermal zone in °C, or None. Tegra exposes millidegrees at
+    /sys/class/thermal/thermal_zone*/temp; psutil.sensors_temperatures() is
+    unreliable there."""
+    if sys.platform != "linux":
+        return None
+    temps = []
+    for path in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+        try:
+            with open(path) as f:
+                temps.append(int(f.read().strip()) / 1000.0)
+        except Exception:
+            continue
+    return round(max(temps), 1) if temps else None
+
+
+@app.get("/system/stats", summary="CPU / memory / disk / temperature / uptime")
+def system_stats():
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+    try:
+        load = os.getloadavg()
+    except (OSError, AttributeError):
+        load = None
+    return {
+        "cpu_percent": psutil.cpu_percent(interval=0.1),
+        "memory": {
+            "total": mem.total,
+            "available": mem.available,
+            "percent": mem.percent,
+        },
+        "disk": {
+            "total": disk.total,
+            "used": disk.used,
+            "percent": disk.percent,
+        },
+        "temperature_c": _jetson_temperature_c(),
+        "uptime_seconds": round(time.time() - psutil.boot_time()),
+        "load_average": load,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +589,15 @@ def capture(
     return Response(content=jpeg.tobytes(), media_type="image/jpeg")
 
 
+@app.post("/camera/restart", summary="Force a RealSense pipeline restart")
+def camera_restart():
+    status = restart_camera()
+    return JSONResponse(
+        content={"camera": status},
+        status_code=200 if status["ok"] else 503,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Scale endpoints
 # ---------------------------------------------------------------------------
@@ -467,6 +627,15 @@ def scale_capture():
     if not data["raw"]:
         return JSONResponse(content={"error": "no data from scale"}, status_code=503)
     return data
+
+
+@app.post("/scale/reconnect", summary="Force the scale serial port to reopen")
+def scale_reconnect():
+    status = reconnect_scale()
+    return JSONResponse(
+        content={"scale": status},
+        status_code=200 if status["ok"] else 503,
+    )
 
 
 def run():
