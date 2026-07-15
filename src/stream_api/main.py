@@ -74,12 +74,13 @@ if sys.platform == "linux":
     # For on-site iteration without a redeploy, use ?exposure_us=<us> on /capture
     # (persists across requests until changed again; ?exposure_us=0 re-enables AE).
     # Typical manual values under bright glare: 1000-8000 microseconds.
-    CAMERA_EXPOSURE_US = 0  # 0 = auto-exposure on; >0 = manual (microseconds)
-    CAMERA_GAIN = 0         # 0 = don't override; typical range 16-248
-    # 0 = auto-WB on; >0 = locked Kelvin (typical 2800-6500). Lock at ~4600
-    # under fluorescent/LED overheads to kill the green colour cast the D435's
-    # auto-WB introduces when the scene is dominated by cool tube light.
-    CAMERA_WHITE_BALANCE = 4600
+    # Baseline tuned for smart-table: bright fluorescent/LED overheads + polished
+    # steel tray. Deliberately underexposed so highlight glare bands stay below
+    # 255 and tone-mapping (enhance=true) can recover detail underneath.
+    # Override live per-request via ?exposure_us=, ?white_balance= on /capture.
+    CAMERA_EXPOSURE_US = 3000    # 0 = auto-exposure; >0 = manual microseconds
+    CAMERA_GAIN = 64             # 0 = don't override; D435 range 16-248
+    CAMERA_WHITE_BALANCE = 5000  # 0 = auto-WB; >0 = locked Kelvin (2800-6500)
 
     pipeline = rs.pipeline()
     config = rs.config()
@@ -394,28 +395,35 @@ def capture(
     preset: Preset = "fhd",
     enhance: bool = False,
     exposure_us: int = -1,
+    gain: int = -1,
     white_balance: int = -1,
 ):
     """
-    exposure_us:     -1 = leave as-is, 0 = re-enable AE, >0 = manual microseconds
-    white_balance:   -1 = leave as-is, 0 = re-enable auto-WB, >0 = manual Kelvin (2800-6500)
-    Both overrides persist across requests until changed again.
+    exposure_us:    -1 = leave as-is, 0 = re-enable AE, >0 = manual microseconds
+    gain:           -1 = leave as-is, 0 = don't override, >0 = manual (16-248)
+    white_balance:  -1 = leave as-is, 0 = re-enable auto-WB, >0 = manual Kelvin (2800-6500)
+    All overrides persist across requests until changed again.
     """
     width, height = RESOLUTIONS[preset]
     if sys.platform == "linux" and camera_status["ok"] and (
-        exposure_us >= 0 or white_balance >= 0
+        exposure_us >= 0 or gain >= 0 or white_balance >= 0
     ):
         with _camera_lock:
             try:
                 color_sensor = pipeline.get_active_profile().get_device().first_color_sensor()
                 if exposure_us >= 0:
-                    _apply_exposure(color_sensor, exposure_us, CAMERA_GAIN)
+                    _apply_exposure(
+                        color_sensor, exposure_us,
+                        gain if gain >= 0 else CAMERA_GAIN,
+                    )
+                elif gain > 0:
+                    color_sensor.set_option(rs.option.gain, gain)
                 if white_balance >= 0:
                     _apply_white_balance(color_sensor, white_balance)
             except Exception as e:
                 logger.warning(
-                    "failed to apply overrides (exposure_us=%s white_balance=%s): %s",
-                    exposure_us, white_balance, e,
+                    "failed to apply overrides (exposure_us=%s gain=%s white_balance=%s): %s",
+                    exposure_us, gain, white_balance, e,
                 )
     image = get_color_frame(width, height)
     if image is None:
