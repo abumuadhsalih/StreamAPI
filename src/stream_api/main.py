@@ -76,6 +76,10 @@ if sys.platform == "linux":
     # Typical manual values under bright glare: 1000-8000 microseconds.
     CAMERA_EXPOSURE_US = 0  # 0 = auto-exposure on; >0 = manual (microseconds)
     CAMERA_GAIN = 0         # 0 = don't override; typical range 16-248
+    # 0 = auto-WB on; >0 = locked Kelvin (typical 2800-6500). Lock at ~4600
+    # under fluorescent/LED overheads to kill the green colour cast the D435's
+    # auto-WB introduces when the scene is dominated by cool tube light.
+    CAMERA_WHITE_BALANCE = 4600
 
     pipeline = rs.pipeline()
     config = rs.config()
@@ -99,6 +103,14 @@ if sys.platform == "linux":
         if gain > 0:
             color_sensor.set_option(rs.option.gain, gain)
 
+    def _apply_white_balance(color_sensor, kelvin: int) -> None:
+        """Lock WB to a manual Kelvin value if kelvin > 0; otherwise re-enable auto-WB."""
+        if kelvin <= 0:
+            color_sensor.set_option(rs.option.enable_auto_white_balance, 1)
+            return
+        color_sensor.set_option(rs.option.enable_auto_white_balance, 0)
+        color_sensor.set_option(rs.option.white_balance, kelvin)
+
     def _tune_color_sensor() -> None:
         color_sensor = pipeline.get_active_profile().get_device().first_color_sensor()
         color_sensor.set_option(rs.option.sharpness, 100)
@@ -108,6 +120,7 @@ if sys.platform == "linux":
         color_sensor.set_option(rs.option.power_line_frequency, 1)
         color_sensor.set_option(rs.option.auto_exposure_priority, 0)
         _apply_exposure(color_sensor, CAMERA_EXPOSURE_US, CAMERA_GAIN)
+        _apply_white_balance(color_sensor, CAMERA_WHITE_BALANCE)
 
     def _start_pipeline() -> bool:
         """(Re)start the RealSense pipeline. Caller must hold _camera_lock."""
@@ -377,21 +390,33 @@ def stream(preset: Preset = "fhd"):
 
 
 @app.get("/capture", summary="Capture a single JPEG image")
-def capture(preset: Preset = "fhd", enhance: bool = False, exposure_us: int = -1):
+def capture(
+    preset: Preset = "fhd",
+    enhance: bool = False,
+    exposure_us: int = -1,
+    white_balance: int = -1,
+):
     """
-    exposure_us:
-      -1 (default) → use whatever exposure is currently set
-       0           → re-enable auto-exposure
-      >0           → manual exposure in microseconds (persists across requests)
+    exposure_us:     -1 = leave as-is, 0 = re-enable AE, >0 = manual microseconds
+    white_balance:   -1 = leave as-is, 0 = re-enable auto-WB, >0 = manual Kelvin (2800-6500)
+    Both overrides persist across requests until changed again.
     """
     width, height = RESOLUTIONS[preset]
-    if sys.platform == "linux" and exposure_us >= 0 and camera_status["ok"]:
+    if sys.platform == "linux" and camera_status["ok"] and (
+        exposure_us >= 0 or white_balance >= 0
+    ):
         with _camera_lock:
             try:
                 color_sensor = pipeline.get_active_profile().get_device().first_color_sensor()
-                _apply_exposure(color_sensor, exposure_us, CAMERA_GAIN)
+                if exposure_us >= 0:
+                    _apply_exposure(color_sensor, exposure_us, CAMERA_GAIN)
+                if white_balance >= 0:
+                    _apply_white_balance(color_sensor, white_balance)
             except Exception as e:
-                logger.warning("failed to apply exposure_us=%s: %s", exposure_us, e)
+                logger.warning(
+                    "failed to apply overrides (exposure_us=%s white_balance=%s): %s",
+                    exposure_us, white_balance, e,
+                )
     image = get_color_frame(width, height)
     if image is None:
         return JSONResponse(
