@@ -74,13 +74,14 @@ if sys.platform == "linux":
     # For on-site iteration without a redeploy, use ?exposure_us=<us> on /capture
     # (persists across requests until changed again; ?exposure_us=0 re-enables AE).
     # Typical manual values under bright glare: 1000-8000 microseconds.
-    # Baseline tuned for smart-table: bright fluorescent/LED overheads + polished
-    # steel tray. Deliberately underexposed so highlight glare bands stay below
-    # 255 and tone-mapping (enhance=true) can recover detail underneath.
-    # Override live per-request via ?exposure_us=, ?white_balance= on /capture.
-    CAMERA_EXPOSURE_US = 3000    # 0 = auto-exposure; >0 = manual microseconds
-    CAMERA_GAIN = 64             # 0 = don't override; D435 range 16-248
-    CAMERA_WHITE_BALANCE = 5000  # 0 = auto-WB; >0 = locked Kelvin (2800-6500)
+    # On-site tuned values for the Dubai smart-table (bright overhead lights +
+    # polished steel tray). Verified on the Jetson to give a clean, readable
+    # capture without highlight blow-out or colour cast. Override per-request
+    # via ?exposure_us= / ?gain= / ?white_balance= on /capture if the scene
+    # changes; set any to 0 to hand that channel back to auto.
+    CAMERA_EXPOSURE_US = 80     # 0 = auto-exposure; >0 = manual microseconds
+    CAMERA_GAIN = 60            # 0 = don't override; D435 range 16-248
+    CAMERA_WHITE_BALANCE = 3600 # 0 = auto-WB; >0 = locked Kelvin (2800-6500)
 
     pipeline = rs.pipeline()
     config = rs.config()
