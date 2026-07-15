@@ -70,6 +70,13 @@ def _scale_failed(error: str) -> None:
 if sys.platform == "linux":
     import pyrealsense2 as rs
 
+    # Camera exposure tuning — edit these and redeploy to change the baseline.
+    # For on-site iteration without a redeploy, use ?exposure_us=<us> on /capture
+    # (persists across requests until changed again; ?exposure_us=0 re-enables AE).
+    # Typical manual values under bright glare: 1000-8000 microseconds.
+    CAMERA_EXPOSURE_US = 0  # 0 = auto-exposure on; >0 = manual (microseconds)
+    CAMERA_GAIN = 0         # 0 = don't override; typical range 16-248
+
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_stream(
@@ -82,6 +89,16 @@ if sys.platform == "linux":
     _camera_last_retry = 0.0
     _CAMERA_RETRY_COOLDOWN = 5.0  # seconds — avoid hammering USB after a disconnect
 
+    def _apply_exposure(color_sensor, exposure_us: int, gain: int) -> None:
+        """Switch to manual exposure if exposure_us > 0; otherwise leave AE on."""
+        if exposure_us <= 0:
+            color_sensor.set_option(rs.option.enable_auto_exposure, 1)
+            return
+        color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+        color_sensor.set_option(rs.option.exposure, exposure_us)
+        if gain > 0:
+            color_sensor.set_option(rs.option.gain, gain)
+
     def _tune_color_sensor() -> None:
         color_sensor = pipeline.get_active_profile().get_device().first_color_sensor()
         color_sensor.set_option(rs.option.sharpness, 100)
@@ -90,6 +107,7 @@ if sys.platform == "linux":
         color_sensor.set_option(rs.option.backlight_compensation, 1)
         color_sensor.set_option(rs.option.power_line_frequency, 1)
         color_sensor.set_option(rs.option.auto_exposure_priority, 0)
+        _apply_exposure(color_sensor, CAMERA_EXPOSURE_US, CAMERA_GAIN)
 
     def _start_pipeline() -> bool:
         """(Re)start the RealSense pipeline. Caller must hold _camera_lock."""
@@ -321,11 +339,23 @@ def health():
 # Camera endpoints
 # ---------------------------------------------------------------------------
 
+# Gamma 0.6 lift table — computed once, applied per capture via cv2.LUT (~0.1ms).
+# Pulls the deliberately-underexposed midtones back up to a viewable brightness.
+_GAMMA_LUT_060 = np.array(
+    [((i / 255.0) ** 0.6) * 255.0 for i in range(256)], dtype=np.uint8
+)
+
+
 def enhance_for_text(image: np.ndarray) -> np.ndarray:
-    """CLAHE on LAB-L + unsharp mask — lifts small printed text on glared surfaces."""
+    """LAB CLAHE + shadow gamma lift + unsharp — recovers text under glare/shadow."""
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
+    # Stronger local contrast — recovers detail in near-saturated bright bands
+    # (where a low-exposure capture leaves headroom to work with).
+    l = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
+    # Shadow lift — turns a dark low-exposure capture into a viewable image
+    # while the glare bands (now well below 255) reveal their hidden detail.
+    l = cv2.LUT(l, _GAMMA_LUT_060)
     out = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
     blurred = cv2.GaussianBlur(out, (0, 0), sigmaX=1.5)
     return cv2.addWeighted(out, 1.5, blurred, -0.5, 0)
@@ -347,8 +377,21 @@ def stream(preset: Preset = "fhd"):
 
 
 @app.get("/capture", summary="Capture a single JPEG image")
-def capture(preset: Preset = "fhd", enhance: bool = False):
+def capture(preset: Preset = "fhd", enhance: bool = False, exposure_us: int = -1):
+    """
+    exposure_us:
+      -1 (default) → use whatever exposure is currently set
+       0           → re-enable auto-exposure
+      >0           → manual exposure in microseconds (persists across requests)
+    """
     width, height = RESOLUTIONS[preset]
+    if sys.platform == "linux" and exposure_us >= 0 and camera_status["ok"]:
+        with _camera_lock:
+            try:
+                color_sensor = pipeline.get_active_profile().get_device().first_color_sensor()
+                _apply_exposure(color_sensor, exposure_us, CAMERA_GAIN)
+            except Exception as e:
+                logger.warning("failed to apply exposure_us=%s: %s", exposure_us, e)
     image = get_color_frame(width, height)
     if image is None:
         return JSONResponse(

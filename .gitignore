@@ -12,3 +12,12 @@ wheels/
 # Editor
 .idea/
 .vscode/
+
+# Local docs / team handoffs / notes — not part of the codebase
+CAMERA_CAPTURE_UPGRADE.*
+CAMERA_GLARE_FIX.*
+CAMERA_ISSUES.*
+KT.*
+CLAUDE.md
+DEPLOYMENT.md
+SCALE_ISSUE.md
