@@ -32,11 +32,12 @@ app.add_middleware(
 
 # ---------------------------------------------------------------------------
 # Admin token — the one guard on destructive actions (reboot / restart).
-# The rest of the API is unauthenticated (LAN-only POC), so these endpoints
-# fail closed: if STREAM_API_ADMIN_TOKEN is unset they are disabled entirely.
+# The rest of the API is unauthenticated (LAN-only POC). Hardcoded on purpose
+# for the POC; note it ships in the wheel and lives in git, so it is NOT a real
+# secret — change this value per-deployment and treat the API as LAN-only.
 # ---------------------------------------------------------------------------
 
-ADMIN_TOKEN = os.environ.get("STREAM_API_ADMIN_TOKEN", "")
+ADMIN_TOKEN = "jetson-reboot"
 
 
 def require_admin_token(token: str = "") -> None:
