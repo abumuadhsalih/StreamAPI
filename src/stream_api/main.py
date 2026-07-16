@@ -48,15 +48,31 @@ def require_admin_token(token: str = "") -> None:
         raise _AdminError(403, "invalid or missing admin token")
 
 
+def require_shutdown_confirm(confirm: str = "") -> None:
+    """Second guard on shutdown only. Unlike reboot, a powered-off Jetson cannot
+    be brought back over the network — someone has to press the button."""
+    if confirm != "yes":
+        raise _AdminError(
+            400,
+            "shutdown requires confirm=yes",
+            "The device cannot be powered on remotely. Physical access is "
+            "required to bring it back. Re-send with &confirm=yes if you are sure.",
+        )
+
+
 class _AdminError(Exception):
-    def __init__(self, status_code: int, message: str) -> None:
+    def __init__(self, status_code: int, message: str, detail: str = "") -> None:
         self.status_code = status_code
         self.message = message
+        self.detail = detail
 
 
 @app.exception_handler(_AdminError)
 def _admin_error_handler(request, exc: _AdminError):
-    return JSONResponse(content={"error": exc.message}, status_code=exc.status_code)
+    body = {"error": exc.message}
+    if exc.detail:
+        body["detail"] = exc.detail
+    return JSONResponse(content=body, status_code=exc.status_code)
 
 # ---------------------------------------------------------------------------
 # Resolution presets
@@ -210,17 +226,28 @@ if sys.platform == "linux":
                     return None
                 if not _start_pipeline():
                     return None
-            try:
-                frames = pipeline.wait_for_frames()
-                frame = frames.get_color_frame()
-                return np.asanyarray(frame.get_data()) if frame else None
-            except Exception as e:
-                _camera_failed(str(e))
+            # Two attempts per request — masks transient USB hiccups (idle
+            # autosuspend, brief re-enumeration, single stalled frame). On the
+            # first timeout we restart the pipeline in-line and try once more
+            # so the client sees a valid frame instead of a 503.
+            for attempt in (1, 2):
                 try:
-                    pipeline.stop()
-                except Exception:
-                    pass
-                return None
+                    frames = pipeline.wait_for_frames(timeout_ms=3000)
+                    frame = frames.get_color_frame()
+                    if frame:
+                        return np.asanyarray(frame.get_data())
+                except Exception as e:
+                    logger.info("frame grab attempt %d failed: %s", attempt, e)
+                    try:
+                        pipeline.stop()
+                    except Exception:
+                        pass
+                    if attempt == 2:
+                        _camera_failed(str(e))
+                        return None
+                    if not _start_pipeline():
+                        return None
+            return None
 
     def restart_camera() -> dict:
         """Force a pipeline stop+restart on demand, bypassing the cooldown."""
@@ -441,10 +468,42 @@ def _run_detached_after_delay(cmd: list[str], delay: float = 1.0) -> None:
 )
 def system_reboot():
     if sys.platform != "linux":
-        return {"status": "stub", "would_run": "systemctl reboot"}
+        return {
+            "status": "stub",
+            "message": "Reboot is a no-op on this non-Linux dev machine.",
+            "would_run": "systemctl reboot",
+        }
     logger.warning("reboot requested via API")
     _run_detached_after_delay(["sudo", SYSTEMCTL, "reboot"])
-    return {"status": "rebooting"}
+    return {
+        "status": "rebooting",
+        "message": "Reboot started. The device will be offline for about 30-60 "
+        "seconds, then come back online automatically. Poll /health until it "
+        "responds again.",
+        "estimated_downtime_seconds": 60,
+    }
+
+
+@app.post(
+    "/system/shutdown",
+    summary="Power off the Jetson (requires admin token + confirm=yes)",
+    dependencies=[Depends(require_admin_token), Depends(require_shutdown_confirm)],
+)
+def system_shutdown():
+    if sys.platform != "linux":
+        return {
+            "status": "stub",
+            "message": "Shutdown is a no-op on this non-Linux dev machine.",
+            "would_run": "systemctl poweroff",
+        }
+    logger.warning("shutdown requested via API — device will need a physical power-on")
+    _run_detached_after_delay(["sudo", SYSTEMCTL, "poweroff"])
+    return {
+        "status": "shutting down",
+        "message": "Shutdown started. The device powers off in a few seconds and "
+        "will NOT come back on its own — it needs a physical power-on.",
+        "recoverable_remotely": False,
+    }
 
 
 @app.post(
@@ -454,10 +513,19 @@ def system_reboot():
 )
 def system_restart_service():
     if sys.platform != "linux":
-        return {"status": "stub", "would_run": "systemctl restart stream-api"}
+        return {
+            "status": "stub",
+            "message": "Service restart is a no-op on this non-Linux dev machine.",
+            "would_run": "systemctl restart stream-api",
+        }
     logger.warning("service restart requested via API")
     _run_detached_after_delay(["sudo", SYSTEMCTL, "restart", "stream-api"])
-    return {"status": "restarting"}
+    return {
+        "status": "restarting",
+        "message": "Service restart started. The API will be reachable again in "
+        "a few seconds. Poll /health until it responds.",
+        "estimated_downtime_seconds": 10,
+    }
 
 
 def _jetson_temperature_c() -> Optional[float]:
