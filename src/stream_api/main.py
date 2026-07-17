@@ -4,6 +4,7 @@ import json
 import time
 import glob
 import hmac
+import asyncio
 import logging
 import threading
 import subprocess
@@ -95,6 +96,17 @@ Preset = Literal["sd", "hd", "fhd"]
 
 camera_status: dict = {"ok": False, "error": "not yet started", "mode": "real"}
 scale_status: dict = {"ok": False, "error": "not yet opened", "mode": "real"}
+# `ok` means "a fresh-enough reading is available to serve" and drives the 503;
+# `connected` is the live BLE link state and is informational. They differ on
+# purpose — a brief link drop keeps serving the cached reading (see
+# _BATTERY_STALE_AFTER). Keys are fixed at definition so only values ever
+# change, which is what makes reading these dicts lock-free under the GIL.
+battery_status: dict = {
+    "ok": False,
+    "error": "not yet connected",
+    "mode": "real",
+    "connected": False,
+}
 
 
 def _camera_failed(error: str) -> None:
@@ -109,6 +121,13 @@ def _scale_failed(error: str) -> None:
         logger.warning("scale failure: %s", error)
     scale_status["ok"] = False
     scale_status["error"] = error
+
+
+def _battery_failed(error: str) -> None:
+    if battery_status["ok"] or battery_status.get("error") != error:
+        logger.warning("battery failure: %s", error)
+    battery_status["ok"] = False
+    battery_status["error"] = error
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +415,379 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# Battery — JBD BMS protocol (pure byte handling, no transport)
+# ---------------------------------------------------------------------------
+
+# Frame layout: DD <register> <status> <length> <payload...> <checksum:2> 77
+_JBD_START = 0xDD
+_JBD_END = 0x77
+_JBD_BASIC_INFO_REGISTER = 0x03
+
+# Read the "basic information" register. The trailing FF FD is this frame's own
+# checksum (0x10000 - (0x03 + 0x00)); 77 terminates it.
+_JBD_BASIC_INFO_COMMAND = bytes.fromhex("DD A5 03 00 FF FD 77")
+
+BATTERY_NOTIFY_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
+BATTERY_WRITE_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"
+
+
+def _jbd_checksum_ok(frame: bytes) -> bool:
+    """Verify a JBD frame's checksum: 0x10000 minus the sum of every byte
+    between the register and the checksum itself, truncated to 16 bits and
+    stored big-endian."""
+    length = frame[3]
+    expected = (0x10000 - sum(frame[2:4 + length])) & 0xFFFF
+    return int.from_bytes(frame[4 + length:6 + length], "big") == expected
+
+
+def _extract_jbd_frame(buffer: bytearray) -> Optional[bytes]:
+    """Pull the first complete, checksum-valid frame off the front of `buffer`,
+    consuming the bytes it uses. Returns None while the frame is still arriving.
+
+    BLE delivers notifications in ~20-byte fragments, so frames arrive split.
+    Reassembling on the length byte alone is not safe: 0xDD occurs inside
+    payload data too, so a buffer that starts mid-frame reads a length from
+    arbitrary bytes and then decodes into plausible-but-wrong numbers. Nothing
+    here is trusted until the checksum agrees; on disagreement we drop a single
+    byte and rescan rather than stalling on a length we invented.
+    """
+    while True:
+        start = buffer.find(_JBD_START)
+        if start < 0:
+            buffer.clear()
+            return None
+        del buffer[:start]
+
+        if len(buffer) < 2:
+            return None
+        # We only ever ask for register 0x03, so anything else is a false
+        # header — reject it before trusting the length byte behind it.
+        if buffer[1] != _JBD_BASIC_INFO_REGISTER:
+            del buffer[:1]
+            continue
+
+        if len(buffer) < 4:
+            return None
+        frame_length = 4 + buffer[3] + 3
+        if len(buffer) < frame_length:
+            return None
+
+        frame = bytes(buffer[:frame_length])
+        if frame[-1] == _JBD_END and _jbd_checksum_ok(frame):
+            del buffer[:frame_length]
+            return frame
+
+        del buffer[:1]
+
+
+def decode_basic_info(frame: bytes) -> dict:
+    """Decode a JBD basic-information (register 0x03) response frame."""
+    if len(frame) < 7:
+        raise ValueError("frame is too short")
+    if frame[0] != _JBD_START or frame[1] != _JBD_BASIC_INFO_REGISTER:
+        raise ValueError("not a JBD basic-information frame")
+
+    status = frame[2]
+    if status != 0:
+        raise ValueError(f"BMS returned status 0x{status:02X}")
+
+    payload = frame[4:4 + frame[3]]
+    if len(payload) < 23:
+        raise ValueError("incomplete basic-information payload")
+
+    # Voltage is in 10 mV units, current in 10 mA (signed — negative is
+    # discharge), capacities in 10 mAh.
+    voltage = int.from_bytes(payload[0:2], "big") / 100.0
+    current = int.from_bytes(payload[2:4], "big", signed=True) / 100.0
+
+    temperatures = []
+    offset = 23
+    for _ in range(payload[22]):
+        if offset + 2 > len(payload):
+            break
+        # JBD reports temperature in 0.1 Kelvin.
+        raw = int.from_bytes(payload[offset:offset + 2], "big")
+        temperatures.append(round(raw / 10.0 - 273.15, 1))
+        offset += 2
+
+    # The shunt never settles at exactly zero, so treat a trickle as idle.
+    if abs(current) < 0.05:
+        state = "idle"
+    else:
+        state = "discharging" if current < 0 else "charging"
+
+    mosfet = payload[20]
+    return {
+        "soc": payload[19],
+        "voltage": voltage,
+        "current": current,
+        "state": state,
+        "remaining_capacity": int.from_bytes(payload[4:6], "big") / 100.0,
+        "full_capacity": int.from_bytes(payload[6:8], "big") / 100.0,
+        "cycles": int.from_bytes(payload[8:10], "big"),
+        "cell_count": payload[21],
+        "temperatures": temperatures,
+        "charge_mosfet": bool(mosfet & 0x01),
+        "discharge_mosfet": bool(mosfet & 0x02),
+        # Raw bitfield; 0 means no alarms. Bit-level decoding is out of scope.
+        "protection": int.from_bytes(payload[16:18], "big"),
+        # JBD packs the version as hex nibbles: 0x10 is version 1.0.
+        "software_version": f"{payload[18] >> 4}.{payload[18] & 0x0F}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Battery — BLE link on Linux; stub on other platforms for local dev
+# ---------------------------------------------------------------------------
+
+# The pack's BLE MAC. Override via STREAM_API_BATTERY_ADDRESS if the hardware is
+# swapped. BlueZ addresses by MAC; macOS/CoreBluetooth uses an opaque per-host
+# UUID instead, which is one more reason the non-Linux path is a stub.
+BATTERY_ADDRESS = os.environ.get(
+    "STREAM_API_BATTERY_ADDRESS",
+    "A5:C2:37:6E:94:70",
+)
+BATTERY_POLL_INTERVAL = float(os.environ.get("STREAM_API_BATTERY_POLL_INTERVAL", "2.0"))
+
+if sys.platform == "linux":
+    from bleak import BleakClient, BleakScanner
+
+    _battery_lock = threading.Lock()
+    _battery_last: Optional[dict] = None
+    _battery_last_mono: Optional[float] = None
+
+    _BATTERY_SCAN_TIMEOUT = 15.0
+    _BATTERY_CONNECT_TIMEOUT = 20.0
+    _BATTERY_READ_TIMEOUT = 5.0
+    _BATTERY_RETRY_COOLDOWN = 5.0
+    # A dropped notification is not worth tearing the link down — reconnecting
+    # costs seconds. Only give up once the pack has missed several in a row.
+    _BATTERY_MAX_MISSES = 3
+    # Keep serving the last good reading across a brief link drop rather than
+    # 503ing it. State of charge moves over minutes, and the Jetson's combo
+    # Wi-Fi/BT radio shares an antenna with the MJPEG stream this box exists to
+    # serve — so short BLE flaps are expected and are not worth blanking a
+    # perfectly good number over. Callers see the real age via `age_seconds`.
+    _BATTERY_STALE_AFTER = 60.0
+
+    # Failure reasons are constants on purpose: _battery_failed() dedups its
+    # logging on message equality, so a reason carrying varying text (D-Bus
+    # serials, addresses, elapsed times) would defeat the dedup and fill the
+    # journal every retry while the pack is merely switched off.
+    _BATTERY_ERR_NOT_FOUND = (
+        f"no BLE advertisement from {BATTERY_ADDRESS} — a JBD pack accepts one "
+        "client at a time and stops advertising while connected, so close any "
+        "phone app, run `bluetoothctl disconnect`, and check the pack is on"
+    )
+    _BATTERY_ERR_NO_REPLY = "the BMS did not answer the basic-info request"
+    _BATTERY_ERR_DROPPED = "the BLE link to the BMS dropped"
+    _BATTERY_ERR_STALE = "no fresh reading from the BMS"
+
+    def _battery_reason(e: Exception) -> str:
+        """Map an exception onto a stable message — see the constants above."""
+        logger.debug("battery BLE error", exc_info=e)
+        if isinstance(e, asyncio.TimeoutError):
+            return _BATTERY_ERR_NO_REPLY
+        return f"BLE error ({type(e).__name__})"
+
+    def _battery_age() -> Optional[float]:
+        """Seconds since the last good frame, or None if there has never been
+        one. Monotonic: a Jetson with no RTC steps its wall clock by years when
+        NTP first syncs, which is exactly when this would be consulted."""
+        with _battery_lock:
+            if _battery_last_mono is None:
+                return None
+            return time.monotonic() - _battery_last_mono
+
+    def _battery_store(reading: dict) -> None:
+        global _battery_last, _battery_last_mono
+        with _battery_lock:
+            _battery_last = reading
+            _battery_last_mono = time.monotonic()
+        if not battery_status["ok"]:
+            logger.info("battery reading recovered")
+        battery_status["ok"] = True
+        battery_status["error"] = None
+
+    def _battery_link_down(reason: str) -> None:
+        """Record that the BLE link is down. The last good reading keeps serving
+        until it goes stale, so `ok` only flips once we genuinely have nothing
+        worth returning."""
+        battery_status["connected"] = False
+        age = _battery_age()
+        if age is None or age > _BATTERY_STALE_AFTER:
+            _battery_failed(reason)
+
+    async def _battery_session() -> None:
+        """Resolve the pack, hold one connection, and poll until it breaks."""
+        # bleak advises resolving a BLEDevice rather than handing BleakClient a
+        # bare address (which makes it scan implicitly anyway). Doing it here
+        # also separates "pack isn't advertising" — normally a phone app holding
+        # the one connection it allows — from "connect refused".
+        device = await BleakScanner.find_device_by_address(
+            BATTERY_ADDRESS, timeout=_BATTERY_SCAN_TIMEOUT
+        )
+        if device is None:
+            _battery_link_down(_BATTERY_ERR_NOT_FOUND)
+            return
+
+        buffer = bytearray()
+        frames: list[bytes] = []
+        frame_ready = asyncio.Event()
+        dropped = asyncio.Event()
+
+        def _on_notify(_, data: bytearray) -> None:
+            # bleak runs this on the event-loop thread, so the buffer needs no
+            # lock and can never be observed half-updated.
+            buffer.extend(data)
+            frame = _extract_jbd_frame(buffer)
+            if frame is not None:
+                frames.append(frame)
+                frame_ready.set()
+
+        def _on_disconnect(_) -> None:
+            dropped.set()
+
+        async with BleakClient(
+            device,
+            timeout=_BATTERY_CONNECT_TIMEOUT,
+            disconnected_callback=_on_disconnect,
+        ) as client:
+            # Deliberately no stop_notify: bleak stops notifications on
+            # disconnect anyway, and calling it on an already-dropped link
+            # raises during the unwind and masks the real error.
+            await client.start_notify(BATTERY_NOTIFY_UUID, _on_notify)
+            battery_status["connected"] = True
+            logger.info("battery connected at %s", device.address)
+
+            misses = 0
+            while not dropped.is_set():
+                # Start each poll clean so a late frame from the previous
+                # exchange can't be mistaken for this request's answer.
+                buffer.clear()
+                frames.clear()
+                frame_ready.clear()
+                await client.write_gatt_char(
+                    BATTERY_WRITE_UUID,
+                    _JBD_BASIC_INFO_COMMAND,
+                    response=False,
+                )
+                try:
+                    await asyncio.wait_for(
+                        frame_ready.wait(), timeout=_BATTERY_READ_TIMEOUT
+                    )
+                    reading = decode_basic_info(frames[0])
+                except (asyncio.TimeoutError, ValueError) as e:
+                    misses += 1
+                    if misses >= _BATTERY_MAX_MISSES:
+                        raise
+                    logger.debug(
+                        "battery poll failed (%d/%d): %s",
+                        misses, _BATTERY_MAX_MISSES, e,
+                    )
+                else:
+                    misses = 0
+                    reading["timestamp"] = time.time()
+                    _battery_store(reading)
+                await asyncio.sleep(BATTERY_POLL_INTERVAL)
+
+        _battery_link_down(_BATTERY_ERR_DROPPED)
+
+    async def _battery_supervisor() -> None:
+        """Reconnect forever. Owns the only BLE connection in the process."""
+        while True:
+            try:
+                await _battery_session()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _battery_link_down(_battery_reason(e))
+            await asyncio.sleep(_BATTERY_RETRY_COOLDOWN)
+
+    def _battery_thread() -> None:
+        # bleak needs one long-lived event loop for all of its operations and
+        # asyncio.run() must only be called once, so the whole BLE lifecycle
+        # lives on this thread instead of being driven per-request.
+        #
+        # Two layers on purpose: the supervisor above handles the expected (pack
+        # out of range, link dropped, poll timeout) and keeps the same loop
+        # alive, which is what bleak requires. This outer loop is a backstop for
+        # asyncio.run() itself dying — without it the thread would exit silently,
+        # leaving the process up and healthy-looking with a permanently dead
+        # battery reader and nothing for systemd's Restart= to notice.
+        while True:
+            try:
+                asyncio.run(_battery_supervisor())
+            except Exception:
+                logger.exception("battery BLE loop crashed, restarting")
+                _battery_failed("battery BLE loop restarting after an error")
+            # Getting here at all is a bug — sleep so a permanent failure (no
+            # adapter, D-Bus refused) can't spin this thread at 100% CPU.
+            time.sleep(_BATTERY_RETRY_COOLDOWN)
+
+    @app.on_event("startup")
+    def _battery_startup():
+        # Started here rather than at import: lifespan runs post-fork, so a
+        # forked worker can't inherit a duplicated D-Bus socket and a dead loop.
+        threading.Thread(
+            target=_battery_thread,
+            name="battery-ble",
+            daemon=True,
+        ).start()
+
+    def read_battery() -> Optional[dict]:
+        """Return the newest usable BMS snapshot, or None if there isn't one.
+
+        Unlike the scale, this never touches the hardware: a BLE round trip
+        costs ~100-500 ms and a connect costs seconds, so the background poller
+        owns the link and this just reads its cache.
+        """
+        with _battery_lock:
+            if _battery_last is None:
+                return None
+            reading = dict(_battery_last)
+            age = time.monotonic() - _battery_last_mono
+        if age > _BATTERY_STALE_AFTER:
+            # Backstop: the supervisor normally trips this within a retry, but
+            # if the BLE thread died outright nothing else ever would.
+            _battery_failed(_BATTERY_ERR_STALE)
+            return None
+        reading["age_seconds"] = round(age, 2)
+        return reading
+
+else:
+    # `random` comes from the scale's stub branch above — same platform guard.
+    battery_status.update(
+        {"ok": True, "error": None, "mode": "stub", "connected": True}
+    )
+
+    def read_battery() -> Optional[dict]:
+        """Return a simulated pack for local dev. Drifts so that repeated calls
+        visibly move, the way a real one would."""
+        now = time.time()
+        # Sawtooth from 100% down to 41% over ~6 minutes.
+        soc = 100 - int(now / 6) % 60
+        current = -round(random.uniform(1.0, 3.0), 2)
+        return {
+            "soc": soc,
+            "voltage": round(48.0 + soc * 0.06, 2),
+            "current": current,
+            "state": "discharging",
+            "remaining_capacity": round(52.0 * soc / 100.0, 2),
+            "full_capacity": 52.0,
+            "cycles": 12,
+            "cell_count": 16,
+            "temperatures": [24.1, 25.3],
+            "charge_mosfet": True,
+            "discharge_mosfet": True,
+            "protection": 0,
+            "software_version": "1.0",
+            "timestamp": now,
+            "age_seconds": 0.0,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Generators
 # ---------------------------------------------------------------------------
 
@@ -432,10 +824,19 @@ def generate_scale_sse():
 # Health
 # ---------------------------------------------------------------------------
 
-@app.get("/health", summary="Hardware status for camera and scale")
+@app.get("/health", summary="Hardware status for camera, scale and battery")
 def health():
+    # The battery is reported but deliberately left out of `status`: BLE is
+    # markedly flakier than USB, and clients already alert on status != "ok".
+    # A dropped pack link should not paint the box red while the camera and
+    # scale are fine — read health.battery.ok if you care about it.
     overall = "ok" if (camera_status["ok"] and scale_status["ok"]) else "degraded"
-    return {"status": overall, "camera": camera_status, "scale": scale_status}
+    return {
+        "status": overall,
+        "camera": camera_status,
+        "scale": scale_status,
+        "battery": battery_status,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +1106,26 @@ def scale_reconnect():
         content={"scale": status},
         status_code=200 if status["ok"] else 503,
     )
+
+
+# ---------------------------------------------------------------------------
+# Battery endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/battery/capture", summary="Read current battery state from the BMS")
+def battery_capture():
+    data = read_battery()
+    if not battery_status["ok"]:
+        return JSONResponse(
+            content={
+                "error": "battery not available",
+                "detail": battery_status["error"],
+            },
+            status_code=503,
+        )
+    if data is None:
+        return JSONResponse(content={"error": "no data from battery"}, status_code=503)
+    return data
 
 
 def run():

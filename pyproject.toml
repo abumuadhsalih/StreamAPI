@@ -5,6 +5,12 @@ description = "RealSense camera streaming and capture API"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    # Linux-only because the BLE path is stubbed elsewhere: macOS/CoreBluetooth
+    # addresses devices by an opaque per-host UUID and can never resolve a MAC.
+    # The marker also keeps pyobjc off dev laptops. Unlike pyrealsense2 below,
+    # this needs NO platform_machine marker — bleak is pure Python and dbus-fast
+    # ships aarch64 wheels, so it installs on the Jetson without compiling.
+    "bleak>=3.0.2 ; sys_platform == 'linux'",
     "fastapi[standard]>=0.136.0",
     "opencv-python-headless>=4.13.0.92",
     # PyPI only has x86_64 wheel; on ARM64 (Jetson) install via Intel APT repo — see README

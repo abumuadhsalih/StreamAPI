@@ -2,13 +2,13 @@
 
 ## Overview
 
-An API server running on a Jetson Ubuntu VM to expose an Intel RealSense camera over HTTP — enabling web and mobile clients on the same LAN to stream live video and capture images without needing GUI access.
+An API server running on a Jetson Ubuntu VM to expose an Intel RealSense camera, a USB serial scale and the battery BMS over HTTP — enabling web and mobile clients on the same LAN to stream live video, capture images and read weight and battery state without needing GUI access.
 
 ## Architecture
 
-- **API server:** Runs directly on the Jetson Ubuntu VM (direct RealSense hardware access)
+- **API server:** Runs directly on the Jetson Ubuntu VM (direct hardware access)
 - **Stack:** Python + FastAPI
-- **SDK:** pyrealsense2
+- **SDKs:** pyrealsense2 (camera), pyserial (scale), bleak (battery BMS over BLE)
 - **Network:** Local network (LAN) only
 - **Clients:** Web browser frontend, mobile app
 
@@ -20,12 +20,14 @@ An API server running on a Jetson Ubuntu VM to expose an Intel RealSense camera 
 | `/capture` | GET | Trigger a snapshot and return the image in the response body |
 | `/scale/stream` | GET | Live weight stream (SSE) |
 | `/scale/capture` | GET | Read current weight |
+| `/battery/capture` | GET | Read current battery state from the BMS (SoC, voltage, current, temperatures) |
 | `/health` | GET | Per-device status + last error |
 | `/system/stats` | GET | CPU / memory / disk / temperature / uptime |
 | `/camera/restart` | POST | Force a RealSense pipeline restart |
 | `/scale/reconnect` | POST | Force the scale serial port to reopen |
 | `/system/reboot` | POST | Reboot the Jetson (admin-token guarded) |
 | `/system/restart-service` | POST | Restart the stream-api service (admin-token guarded) |
+| `/system/shutdown` | POST | Power the Jetson off (admin-token + `confirm=yes`; needs a physical power-on to return) |
 
 ## Stream Details
 
@@ -44,3 +46,6 @@ Items intentionally deferred — revisit if requirements evolve:
 - **Image format** — PNG option for lossless captures
 - **Cloud storage** — option to persist captured images to S3/GCS and return a URL
 - **WebRTC / WebSocket** — lower-latency streaming protocol if MJPEG proves insufficient
+- **Battery SSE stream** — `/battery/stream`; deliberately skipped, state of charge moves over minutes so polling `/battery/capture` is sufficient
+- **Battery reconnect endpoint** — `/battery/reconnect`; the BLE poll loop already reconnects on its own, so this would only shorten the retry cooldown
+- **Battery protection-bit decoding** — `protection` is returned as a raw bitfield (0 = no alarms) rather than a decoded list of alarm names
