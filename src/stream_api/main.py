@@ -17,6 +17,8 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 
+from .scale import parse_scale_line, resolve_scale_port, split_frames
+
 logger = logging.getLogger("stream_api")
 
 app = FastAPI(title="RealSense Stream API")
@@ -95,7 +97,16 @@ Preset = Literal["sd", "hd", "fhd"]
 # ---------------------------------------------------------------------------
 
 camera_status: dict = {"ok": False, "error": "not yet started", "mode": "real"}
-scale_status: dict = {"ok": False, "error": "not yet opened", "mode": "real"}
+# `port` is the device actually opened (discovery can pick it, so the configured
+# value is not always the answer) and `format` is the parser layer the last
+# frame matched — both are diagnostics for /health, neither drives the 503.
+scale_status: dict = {
+    "ok": False,
+    "error": "not yet opened",
+    "mode": "real",
+    "port": None,
+    "format": None,
+}
 # `ok` means "a fresh-enough reading is available to serve" and drives the 503;
 # `connected` is the live BLE link state and is informational. They differ on
 # purpose — a brief link drop keeps serving the cached reading (see
@@ -324,94 +335,232 @@ def get_color_frame(width: int, height: int):
 # Scale — serial port on Linux; stub on other platforms for local dev
 # ---------------------------------------------------------------------------
 
-# Prefer the kernel's /dev/serial/by-id/ symlink over /dev/ttyUSB0 — the
-# ttyUSBN number can shift after USB re-enumeration, but the by-id path
-# is stable across reboots and reconnects. Override via STREAM_API_SCALE_PORT
-# if the scale hardware changes.
-SCALE_PORT = os.environ.get(
-    "STREAM_API_SCALE_PORT",
-    "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B0000CHM-if00-port0",
-)
+# Unset by default: resolve_scale_port() discovers the adapter, preferring the
+# kernel's stable /dev/serial/by-id/ symlink over ttyUSBN (whose number shifts
+# after USB re-enumeration). Set STREAM_API_SCALE_PORT to pin one device when
+# more than one serial adapter is attached, e.g.
+#   /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B0000CHM-if00-port0
+SCALE_PORT = os.environ.get("STREAM_API_SCALE_PORT")
 SCALE_BAUD = int(os.environ.get("STREAM_API_SCALE_BAUD", "9600"))
+# SSE pacing. read_scale() is a cache lookup, so the generator needs its own
+# throttle — see generate_scale_sse().
+SCALE_STREAM_INTERVAL = float(
+    os.environ.get("STREAM_API_SCALE_STREAM_INTERVAL", "0.1")
+)
+# Emit an unchanged reading this often anyway, so a client can tell "the pan is
+# steady" from "the stream is wedged".
+SCALE_STREAM_HEARTBEAT = 1.0
 
 if sys.platform == "linux":
-    scale_serial: Optional[serial.Serial] = None
-    # Serialize access to the shared serial handle so concurrent endpoints
-    # (e.g. /scale/stream loop + /scale/capture click) don't both call
-    # readline() on the same port and trip pyserial's
-    # "device reports readiness to read but returned no data" race.
-    _scale_lock = threading.Lock()
+    # A background thread owns the serial handle and caches the newest decoded
+    # frame; endpoints only read that cache. This is the same shape as the
+    # battery block below, for the same reason, and it is not merely an
+    # optimisation:
+    #
+    # The DX11 indicator streams continuously. A readline() per request returns
+    # the *oldest unread* line sitting in the kernel's buffer, not the current
+    # weight — so a /scale/capture after a quiet minute answers with a
+    # minute-old weight that looks completely valid. Draining continuously and
+    # keeping only the newest frame is the only way the endpoint can be
+    # truthful about "now".
+    _scale_lock = threading.Lock()      # guards the cache, never the handle
+    _scale_last: Optional[dict] = None
+    _scale_last_mono: Optional[float] = None
+    # Set by /scale/reconnect; the reader picks it up and re-opens the port.
+    # The request thread must never close the handle out from under a read.
+    _scale_reopen = threading.Event()
 
-    def _open_scale() -> None:
-        global scale_serial
+    _SCALE_READ_TIMEOUT = 0.2       # also the reader's tick for staleness checks
+    _SCALE_RETRY_COOLDOWN = 2.0
+    # Short on purpose: with a continuous stream, a reading a few seconds old
+    # already means the wire went quiet. Contrast the battery's 60 s — state of
+    # charge moves over minutes, a weight moves the instant someone touches it.
+    _SCALE_STALE_AFTER = 3.0
+    _SCALE_RECONNECT_WAIT = 3.0
+
+    # Constant failure strings: _scale_failed() dedups its logging on message
+    # equality, so text carrying varying detail (timings, byte counts) would
+    # defeat the dedup and fill the journal while the indicator is merely off.
+    _SCALE_ERR_NO_PORT = (
+        "no USB serial adapter found — check the cable and that the indicator "
+        "is powered, or pin the device with STREAM_API_SCALE_PORT"
+    )
+    _SCALE_ERR_SILENT = "the serial port is open but the indicator is sending nothing"
+    _SCALE_ERR_STALE = "no fresh reading from the indicator"
+
+    def _scale_age() -> Optional[float]:
+        """Seconds since the last decoded frame, or None if there has never
+        been one. Monotonic — a Jetson with no RTC steps its wall clock by
+        years when NTP first syncs."""
+        with _scale_lock:
+            if _scale_last_mono is None:
+                return None
+            return time.monotonic() - _scale_last_mono
+
+    def _scale_store(reading: dict) -> None:
+        global _scale_last, _scale_last_mono
+        with _scale_lock:
+            _scale_last = reading
+            _scale_last_mono = time.monotonic()
+        if not scale_status["ok"]:
+            logger.info("scale reading recovered")
+        scale_status["ok"] = True
+        scale_status["error"] = None
+        scale_status["format"] = reading["format"]
+
+    def _scale_silent(reason: str) -> None:
+        """The port is open but nothing is arriving. Keep serving the last good
+        reading until it goes stale — a single dropped frame is not worth
+        blanking an otherwise-good weight over."""
+        age = _scale_age()
+        if age is None or age > _SCALE_STALE_AFTER:
+            _scale_failed(reason)
+
+    def _open_scale() -> Optional[serial.Serial]:
+        """Open the resolved port, or None (having recorded why)."""
+        port = resolve_scale_port(SCALE_PORT)
+        if port is None:
+            scale_status["port"] = None
+            _scale_failed(_SCALE_ERR_NO_PORT)
+            return None
         try:
-            scale_serial = serial.Serial(
-                port=SCALE_PORT,
+            handle = serial.Serial(
+                port=port,
                 baudrate=SCALE_BAUD,
                 bytesize=8,
                 parity="N",
                 stopbits=1,
-                timeout=1,
+                timeout=_SCALE_READ_TIMEOUT,
             )
-            scale_status["ok"] = True
-            scale_status["error"] = None
-            logger.info("scale opened on %s", SCALE_PORT)
         except Exception as e:
-            scale_serial = None
-            _scale_failed(f"failed to open {SCALE_PORT}: {e}")
+            scale_status["port"] = port
+            _scale_failed(f"failed to open {port}: {e}")
+            return None
+        # Anything buffered from before we opened is by definition stale.
+        handle.reset_input_buffer()
+        scale_status["port"] = port
+        logger.info("scale opened on %s at %d baud", port, SCALE_BAUD)
+        return handle
 
-    def reconnect_scale() -> dict:
-        """Force-close and reopen the serial port on demand."""
-        global scale_serial
-        with _scale_lock:
-            if scale_serial is not None:
-                try:
-                    scale_serial.close()
-                except Exception:
-                    pass
-                scale_serial = None
-            _open_scale()
-        return scale_status
+    def _scale_reader() -> None:
+        """Own the serial port, drain it forever, cache the newest frame."""
+        buffer = bytearray()
+        while True:
+            _scale_reopen.clear()
+            handle = None
+            try:
+                handle = _open_scale()
+                if handle is not None:
+                    buffer.clear()
+                    while not _scale_reopen.is_set():
+                        # read(1) blocks in the kernel until a byte lands or the
+                        # timeout expires, then in_waiting drains the rest of
+                        # the burst in one call. The shared script polls
+                        # in_waiting with a 1 ms sleep instead, which costs
+                        # ~1000 wakeups a second to do the same job.
+                        chunk = handle.read(1)
+                        if handle.in_waiting:
+                            chunk += handle.read(handle.in_waiting)
+                        if not chunk:
+                            _scale_silent(_SCALE_ERR_SILENT)
+                            continue
+                        buffer.extend(chunk)
+                        newest = None
+                        for text in split_frames(buffer):
+                            reading = parse_scale_line(text)
+                            if reading is not None:
+                                reading["raw"] = text
+                                newest = reading
+                        # Only the last frame of the burst is kept. Queueing the
+                        # intermediates is exactly what produced the staleness
+                        # this thread exists to fix.
+                        if newest is not None:
+                            newest["timestamp"] = time.time()
+                            _scale_store(newest)
+            except Exception as e:
+                _scale_failed(str(e))
+            finally:
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except Exception:
+                        pass
+            # A deliberate /scale/reconnect shouldn't have to wait out the
+            # failure cooldown.
+            if not _scale_reopen.is_set():
+                time.sleep(_SCALE_RETRY_COOLDOWN)
 
     @app.on_event("startup")
     def _scale_startup():
-        _open_scale()
+        # Started here rather than at import, for the same reason as the
+        # battery thread: lifespan runs post-fork.
+        threading.Thread(
+            target=_scale_reader,
+            name="scale-serial",
+            daemon=True,
+        ).start()
 
-    def read_scale() -> dict:
-        """Read one line from the scale; reopens the port if it was lost."""
-        global scale_serial
+    def reconnect_scale() -> dict:
+        """Ask the reader to drop and reopen the port, then wait briefly so the
+        response reflects the outcome rather than the state we started in."""
+        _scale_reopen.set()
+        deadline = time.monotonic() + _SCALE_RECONNECT_WAIT
+        # First for the reader to acknowledge (it clears the flag as it loops),
+        # then for a frame to arrive off the fresh handle.
+        while time.monotonic() < deadline and _scale_reopen.is_set():
+            time.sleep(0.05)
+        while time.monotonic() < deadline and not scale_status["ok"]:
+            time.sleep(0.05)
+        return scale_status
+
+    def read_scale() -> Optional[dict]:
+        """Return the newest usable reading, or None if there isn't one.
+
+        Never touches the serial handle — the reader thread owns it.
+        """
         with _scale_lock:
-            if scale_serial is None:
-                _open_scale()
-            if scale_serial is None:
-                return {"raw": "", "timestamp": time.time()}
-            try:
-                line = scale_serial.readline().decode("utf-8", errors="ignore").strip()
-                scale_status["ok"] = True
-                scale_status["error"] = None
-                return {"raw": line, "timestamp": time.time()}
-            except Exception as e:
-                _scale_failed(str(e))
-                try:
-                    scale_serial.close()
-                except Exception:
-                    pass
-                scale_serial = None
-                return {"raw": "", "timestamp": time.time()}
+            if _scale_last is None:
+                return None
+            reading = dict(_scale_last)
+            age = time.monotonic() - _scale_last_mono
+        if age > _SCALE_STALE_AFTER:
+            # Backstop: the reader normally trips this within a tick, but if the
+            # thread died outright nothing else ever would.
+            _scale_failed(_SCALE_ERR_STALE)
+            return None
+        reading["age_seconds"] = round(age, 3)
+        return reading
 
 else:
     import random
-    scale_status.update({"ok": True, "error": None, "mode": "stub"})
+    scale_status.update(
+        {"ok": True, "error": None, "mode": "stub", "port": "stub", "format": "dx11"}
+    )
 
     def reconnect_scale() -> dict:
         """No-op reconnect for local dev — returns the stub status."""
         return scale_status
 
-    def read_scale() -> dict:
-        """Return simulated weight data for local dev."""
-        time.sleep(0.5)
-        weight = round(random.uniform(0.0, 10.0), 3)
-        return {"raw": f"{weight} kg", "timestamp": time.time()}
+    def read_scale() -> Optional[dict]:
+        """Simulate the DX11: a load settles onto the pan over ~4 s, then sits
+        stable for ~4 s before the next one. The simulated frame is fed through
+        the real parser rather than hand-built, so dev exercises the production
+        decode path and cannot drift from it."""
+        now = time.time()
+        phase = now % 8.0
+        target = 2.0 + (int(now / 8.0) % 5)     # 2.0 - 6.0 kg
+        if phase < 4.0:
+            stable = False
+            weight = target * (phase / 4.0) + random.uniform(-0.05, 0.05)
+        else:
+            stable = True
+            weight = target
+        raw = f"{'S' if stable else 'U'}{weight:+09.2f}"
+        reading = parse_scale_line(raw)
+        reading["raw"] = raw
+        reading["timestamp"] = now
+        reading["age_seconds"] = 0.0
+        return reading
 
 
 # ---------------------------------------------------------------------------
@@ -810,14 +959,29 @@ def generate_mjpeg(width: int, height: int):
 
 
 def generate_scale_sse():
-    """Yield SSE events; emits one error event and stops if the scale fails."""
+    """Yield SSE events; emits one error event and stops if the scale fails.
+
+    Paced deliberately. read_scale() used to block on readline(), which was the
+    only thing throttling this loop; now that it is a cache lookup, an
+    unthrottled `while True` would spin a core flat out. Events go out when the
+    reading changes, plus a heartbeat so a steady pan is distinguishable from a
+    wedged stream.
+    """
+    last_raw = None
+    last_emit = 0.0
     while True:
         data = read_scale()
         if not scale_status["ok"]:
             yield f"data: {json.dumps({'error': scale_status['error'], 'timestamp': time.time()})}\n\n"
             return
-        if data["raw"]:
+        now = time.monotonic()
+        if data is not None and (
+            data["raw"] != last_raw or now - last_emit >= SCALE_STREAM_HEARTBEAT
+        ):
+            last_raw = data["raw"]
+            last_emit = now
             yield f"data: {json.dumps(data)}\n\n"
+        time.sleep(SCALE_STREAM_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -1088,13 +1252,14 @@ def scale_stream():
 
 @app.get("/scale/capture", summary="Read current weight from scale")
 def scale_capture():
+    # read_scale() first: it is what trips the staleness check that flips `ok`.
     data = read_scale()
     if not scale_status["ok"]:
         return JSONResponse(
             content={"error": "scale not available", "detail": scale_status["error"]},
             status_code=503,
         )
-    if not data["raw"]:
+    if data is None:
         return JSONResponse(content={"error": "no data from scale"}, status_code=503)
     return data
 
