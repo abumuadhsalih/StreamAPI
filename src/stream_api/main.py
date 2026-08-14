@@ -701,6 +701,14 @@ BATTERY_POLL_INTERVAL = float(os.environ.get("STREAM_API_BATTERY_POLL_INTERVAL",
 if sys.platform == "linux":
     from bleak import BleakClient, BleakScanner
 
+    # Talking to bluetoothd directly, below the level bleak exposes — see
+    # _battery_drop_stale_link(). dbus-fast is bleak's own transport, so this
+    # adds no new wheel to the Jetson, but it is declared explicitly in
+    # pyproject.toml rather than leaned on as a transitive dependency.
+    from dbus_fast.aio import MessageBus
+    from dbus_fast.constants import BusType, MessageType
+    from dbus_fast.message import Message
+
     _battery_lock = threading.Lock()
     _battery_last: Optional[dict] = None
     _battery_last_mono: Optional[float] = None
@@ -709,6 +717,10 @@ if sys.platform == "linux":
     _BATTERY_CONNECT_TIMEOUT = 20.0
     _BATTERY_READ_TIMEOUT = 5.0
     _BATTERY_RETRY_COOLDOWN = 5.0
+    # Bounds the whole D-Bus exchange in _battery_drop_stale_link(). It runs on
+    # the same event loop as the poller, so a wedged bluetoothd must not be able
+    # to park the battery thread indefinitely.
+    _BATTERY_DBUS_TIMEOUT = 5.0
     # A dropped notification is not worth tearing the link down — reconnecting
     # costs seconds. Only give up once the pack has missed several in a row.
     _BATTERY_MAX_MISSES = 3
@@ -726,7 +738,13 @@ if sys.platform == "linux":
     _BATTERY_ERR_NOT_FOUND = (
         f"no BLE advertisement from {BATTERY_ADDRESS} — a JBD pack accepts one "
         "client at a time and stops advertising while connected, so close any "
-        "phone app, run `bluetoothctl disconnect`, and check the pack is on"
+        "phone app holding it, and check the pack is powered on and in range"
+    )
+    # Distinct from _BATTERY_ERR_NOT_FOUND on purpose: this one is transient and
+    # self-clearing, so /health should not send anyone hunting for a phone app.
+    _BATTERY_ERR_STALE_LINK = (
+        "bluetoothd was holding a leftover connection to the pack — dropped it "
+        "so the pack advertises again, reconnecting"
     )
     _BATTERY_ERR_NO_REPLY = "the BMS did not answer the basic-info request"
     _BATTERY_ERR_DROPPED = "the BLE link to the BMS dropped"
@@ -767,6 +785,81 @@ if sys.platform == "linux":
         if age is None or age > _BATTERY_STALE_AFTER:
             _battery_failed(reason)
 
+    async def _battery_drop_stale_link() -> bool:
+        """Drop a connection bluetoothd is holding to the pack. True if it did.
+
+        This is the escape hatch from a trap the service sets for itself. The
+        BLE work runs on a daemon thread, so killing the process (`systemctl
+        restart`, a crash, SIGKILL) tears down bleak's D-Bus client without ever
+        disconnecting — and bluetoothd keeps the ACL open on its own behalf. The
+        pack, still connected, stops advertising. The scan above then cannot
+        find it *ever again*: `find_device_by_address()` matches on
+        advertisement callbacks, and so does `BleakClient(<address string>)`,
+        which scans internally whenever it wasn't handed a `BLEDevice`. Nothing
+        in bleak's API can attach to a link bluetoothd already owns, and
+        restarting the service does not clear a connection it does not hold, so
+        without this the box needs a human with `bluetoothctl disconnect`.
+
+        Dropping the link is what breaks the cycle: the pack resumes
+        advertising, and the supervisor's next retry connects the normal way.
+
+        Talks to org.bluez over raw D-Bus messages rather than proxy objects —
+        the same idiom bleak uses internally, and it skips an introspection
+        round trip. Every failure is swallowed: this runs only when we are
+        already reporting a fault, and a bluetoothd that will not answer is
+        indistinguishable in outcome from a pack that is simply switched off.
+        """
+
+        async def _run() -> bool:
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                reply = await bus.call(
+                    Message(
+                        destination="org.bluez",
+                        path="/",
+                        interface="org.freedesktop.DBus.ObjectManager",
+                        member="GetManagedObjects",
+                    )
+                )
+                if reply is None or reply.message_type != MessageType.METHOD_RETURN:
+                    return False
+
+                wanted = BATTERY_ADDRESS.upper()
+                for path, interfaces in reply.body[0].items():
+                    props = interfaces.get("org.bluez.Device1")
+                    if props is None:
+                        continue
+                    # Properties arrive as D-Bus variants; .value unwraps them.
+                    address = props.get("Address")
+                    if address is None or address.value.upper() != wanted:
+                        continue
+                    connected = props.get("Connected")
+                    if connected is None or not connected.value:
+                        # The pack is known to BlueZ but not connected, so the
+                        # scan miss is a genuine one — leave it to the caller.
+                        return False
+                    reply = await bus.call(
+                        Message(
+                            destination="org.bluez",
+                            path=path,
+                            interface="org.bluez.Device1",
+                            member="Disconnect",
+                        )
+                    )
+                    return (
+                        reply is not None
+                        and reply.message_type == MessageType.METHOD_RETURN
+                    )
+                return False
+            finally:
+                bus.disconnect()
+
+        try:
+            return await asyncio.wait_for(_run(), _BATTERY_DBUS_TIMEOUT)
+        except Exception as e:
+            logger.debug("could not clear a stale BlueZ link", exc_info=e)
+            return False
+
     async def _battery_session() -> None:
         """Resolve the pack, hold one connection, and poll until it breaks."""
         # bleak advises resolving a BLEDevice rather than handing BleakClient a
@@ -777,7 +870,20 @@ if sys.platform == "linux":
             BATTERY_ADDRESS, timeout=_BATTERY_SCAN_TIMEOUT
         )
         if device is None:
-            _battery_link_down(_BATTERY_ERR_NOT_FOUND)
+            # A miss is usually just a pack that is off or held by a phone, but
+            # it is also how a leftover bluetoothd connection presents — and
+            # that one never clears itself. Try to drop it before blaming the
+            # pack; the supervisor retries in _BATTERY_RETRY_COOLDOWN either
+            # way, and a disconnect the pack never saw costs one D-Bus call.
+            if await _battery_drop_stale_link():
+                logger.warning(
+                    "dropped a stale bluetoothd connection to %s — the pack "
+                    "should advertise again on the next retry",
+                    BATTERY_ADDRESS,
+                )
+                _battery_link_down(_BATTERY_ERR_STALE_LINK)
+            else:
+                _battery_link_down(_BATTERY_ERR_NOT_FOUND)
             return
 
         buffer = bytearray()

@@ -1224,6 +1224,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "bleak", marker = "sys_platform == 'linux'" },
+    { name = "dbus-fast", marker = "sys_platform == 'linux'" },
     { name = "fastapi", extra = ["standard"] },
     { name = "opencv-python-headless" },
     { name = "psutil" },
@@ -1234,6 +1235,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "bleak", marker = "sys_platform == 'linux'", specifier = ">=3.0.2" },
+    { name = "dbus-fast", marker = "sys_platform == 'linux'", specifier = ">=5.0.22" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.136.0" },
     { name = "opencv-python-headless", specifier = ">=4.13.0.92" },
     { name = "psutil", specifier = ">=7.2.2" },

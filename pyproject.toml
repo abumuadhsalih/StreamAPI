@@ -11,6 +11,10 @@ dependencies = [
     # this needs NO platform_machine marker — bleak is pure Python and dbus-fast
     # ships aarch64 wheels, so it installs on the Jetson without compiling.
     "bleak>=3.0.2 ; sys_platform == 'linux'",
+    # bleak's own D-Bus transport, so this pulls in nothing new. Declared
+    # anyway because main.py calls org.bluez directly to clear a stale BLE
+    # link — that is a use bleak makes no promise about keeping installed.
+    "dbus-fast>=5.0.22 ; sys_platform == 'linux'",
     "fastapi[standard]>=0.136.0",
     "opencv-python-headless>=4.13.0.92",
     # PyPI only has x86_64 wheel; on ARM64 (Jetson) install via Intel APT repo — see README
