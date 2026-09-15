@@ -1259,13 +1259,24 @@ def system_stats():
 # L-channel median of the central 80% of the frame is measured and the gamma is
 # chosen to land it on ENHANCE_TARGET_MEDIAN, clamped to [ENHANCE_GAMMA_MIN,
 # ENHANCE_GAMMA_MAX]: a dark frame gets the full lift, a frame that is already
-# bright enough gets none (gamma 1.0 = CLAHE + unsharp only). On the two real
-# captures: 10-Sep -> gamma 0.71 (median 124), 15-Sep -> gamma 1.0 (median 122).
-# The centre crop excludes the tray rim and any hands at the edge of frame so a
-# glove in shot doesn't swing the exposure of the whole picture.
-ENHANCE_TARGET_MEDIAN = 130
+# bright enough gets none (gamma 1.0 = CLAHE + unsharp only). The centre crop
+# excludes the tray rim and any hands at the edge of frame so a glove in shot
+# doesn't swing the exposure of the whole picture.
+#
+# Tuned for a "neutral" look on 15-Sep after the client called the first
+# adaptive output (target 130, CLAHE clip 3.0, unsharp 1.5) dark: heavy CLAHE
+# gives a gritty, high-contrast frame that reads as dark even at the same
+# median. Softer local contrast (clip 1.5), a lighter unsharp (1.3) and a
+# higher target (155) look natural without pushing the silver fish to white.
+# On the two real captures: 10-Sep dark -> gamma pinned at 0.6 (median 123),
+# 15-Sep 4:50am -> gamma 0.69 (median 146). Raising the sensor exposure is NOT
+# the lever for this: the raw already sits at median ~120 and more exposure
+# only widens the saturated glare bands.
+ENHANCE_TARGET_MEDIAN = 155
 ENHANCE_GAMMA_MIN = 0.6   # strongest lift — the original fixed value
 ENHANCE_GAMMA_MAX = 1.0   # no lift
+ENHANCE_CLAHE_CLIP = 1.5  # was 3.0 — lower = smoother, less grain on the steel
+ENHANCE_UNSHARP = 1.3     # was 1.5 — output = UNSHARP*img - (UNSHARP-1)*blur
 _ENHANCE_GAMMA_STEP = 0.02  # LUTs are cached per quantised gamma
 
 
@@ -1299,9 +1310,10 @@ def enhance_for_text(image: np.ndarray, stats: dict | None = None) -> np.ndarray
     """
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    # Stronger local contrast — recovers detail in near-saturated bright bands
-    # (where a low-exposure capture leaves headroom to work with).
-    l = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
+    # Local contrast — recovers detail in near-saturated bright bands (where a
+    # low-exposure capture leaves headroom to work with). Kept gentle: see
+    # ENHANCE_CLAHE_CLIP.
+    l = cv2.createCLAHE(clipLimit=ENHANCE_CLAHE_CLIP, tileGridSize=(8, 8)).apply(l)
     # Shadow lift, only as much as this frame needs (see ENHANCE_* above).
     gamma, median = _choose_lift_gamma(l)
     if stats is not None:
@@ -1311,7 +1323,7 @@ def enhance_for_text(image: np.ndarray, stats: dict | None = None) -> np.ndarray
         l = cv2.LUT(l, _gamma_lut(gamma))
     out = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
     blurred = cv2.GaussianBlur(out, (0, 0), sigmaX=1.5)
-    return cv2.addWeighted(out, 1.5, blurred, -0.5, 0)
+    return cv2.addWeighted(out, ENHANCE_UNSHARP, blurred, -(ENHANCE_UNSHARP - 1.0), 0)
 
 
 @app.get("/stream", summary="Live MJPEG color stream")
