@@ -1279,28 +1279,6 @@ ENHANCE_CLAHE_CLIP = 1.5  # was 3.0 — lower = smoother, less grain on the stee
 ENHANCE_UNSHARP = 1.3     # was 1.5 — output = UNSHARP*img - (UNSHARP-1)*blur
 _ENHANCE_GAMMA_STEP = 0.02  # LUTs are cached per quantised gamma
 
-# Vignette — client request (15-Sep) after approving the neutral look: "a little
-# bit dark around the edges and the first and last row". A smooth multiplicative
-# falloff on L: 1.0 inside ENHANCE_VIGNETTE_START of the way from centre to edge,
-# then ramping (squared) to 1-ENHANCE_VIGNETTE at the frame edge. The radius is
-# normalised per axis so the top/bottom edges reach the full darkening, not only
-# the corners — the fixtures' glare is brightest at the short ends of the tray
-# and that is where the first/last rows of fish sit. Applied after the gamma
-# lift and before the unsharp so the median-based lift is not skewed by it.
-# Per-request override: /capture?vignette=0..1 (0 disables, -1 = this default).
-ENHANCE_VIGNETTE = 0.35
-ENHANCE_VIGNETTE_START = 0.4
-
-
-@functools.lru_cache(maxsize=8)
-def _vignette_mask(h: int, w: int, strength: float) -> np.ndarray:
-    y = (np.arange(h, dtype=np.float32) - (h - 1) / 2) / ((h - 1) / 2)
-    x = (np.arange(w, dtype=np.float32) - (w - 1) / 2) / ((w - 1) / 2)
-    xx, yy = np.meshgrid(x, y)
-    r = np.minimum(np.sqrt(xx * xx + yy * yy), 1.0)  # 0 centre, 1 at edge midpoints and beyond
-    t = np.clip((r - ENHANCE_VIGNETTE_START) / (1.0 - ENHANCE_VIGNETTE_START), 0.0, 1.0)
-    return (1.0 - strength * t * t).astype(np.float32)
-
 
 @functools.lru_cache(maxsize=32)
 def _gamma_lut(gamma: float) -> np.ndarray:
@@ -1324,18 +1302,12 @@ def _choose_lift_gamma(l: np.ndarray) -> tuple[float, int]:
     return round(gamma, 2), median
 
 
-def enhance_for_text(
-    image: np.ndarray, stats: dict | None = None, vignette: float | None = None
-) -> np.ndarray:
-    """LAB CLAHE + adaptive shadow gamma lift + vignette + unsharp — default /capture post-processing.
+def enhance_for_text(image: np.ndarray, stats: dict | None = None) -> np.ndarray:
+    """LAB CLAHE + adaptive shadow gamma lift + unsharp — default /capture post-processing.
 
     If `stats` is given it is filled with the chosen `gamma` and the measured
-    `median` so /capture can report them in response headers. `vignette` is the
-    edge-darkening strength (0 disables); None uses ENHANCE_VIGNETTE.
+    `median` so /capture can report them in response headers.
     """
-    if vignette is None:
-        vignette = ENHANCE_VIGNETTE
-    vignette = min(max(float(vignette), 0.0), 1.0)
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     # Local contrast — recovers detail in near-saturated bright bands (where a
@@ -1349,11 +1321,6 @@ def enhance_for_text(
         stats["median"] = median
     if gamma < ENHANCE_GAMMA_MAX:
         l = cv2.LUT(l, _gamma_lut(gamma))
-    if vignette > 0:
-        mask = _vignette_mask(l.shape[0], l.shape[1], vignette)
-        l = np.clip(l.astype(np.float32) * mask, 0, 255).astype(np.uint8)
-    if stats is not None:
-        stats["vignette"] = vignette
     out = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
     blurred = cv2.GaussianBlur(out, (0, 0), sigmaX=1.5)
     return cv2.addWeighted(out, ENHANCE_UNSHARP, blurred, -(ENHANCE_UNSHARP - 1.0), 0)
@@ -1378,20 +1345,16 @@ def stream(preset: Preset = "fhd"):
 def capture(
     preset: Preset = "fhd",
     enhance: bool = True,
-    vignette: float = -1,
     exposure_us: int = -1,
     gain: int = -1,
     white_balance: int = -1,
 ):
     """
-    enhance:        default true — CLAHE + adaptive gamma lift + vignette for
-                    the deliberately dark 80 µs frame (the AI client fetches
-                    bare /capture, so the default must be the AI-ready image).
-                    The lift chosen is reported in X-Enhance-Gamma /
-                    X-Enhance-Median, the vignette in X-Enhance-Vignette.
+    enhance:        default true — CLAHE + adaptive gamma lift for the
+                    deliberately dark 80 µs frame (the AI client fetches bare
+                    /capture, so the default must be the AI-ready image). The
+                    lift chosen is reported in X-Enhance-Gamma / X-Enhance-Median.
                     Pass ?enhance=false for the raw sensor frame (tuning / A-B).
-    vignette:       -1 = default (ENHANCE_VIGNETTE), 0 = off, 0..1 = edge
-                    darkening strength. Per-request only, nothing persists.
     exposure_us:    -1 = leave as-is, 0 = re-enable AE, >0 = manual microseconds
     gain:           -1 = leave as-is, 0 = don't override, >0 = manual (16-248)
     white_balance:  -1 = leave as-is, 0 = re-enable auto-WB, >0 = manual Kelvin (2800-6500)
@@ -1427,11 +1390,10 @@ def capture(
     headers: dict[str, str] = {}
     if enhance:
         stats: dict = {}
-        image = enhance_for_text(image, stats, None if vignette < 0 else vignette)
+        image = enhance_for_text(image, stats)
         # Surface what the adaptive lift did so an on-site A/B needs no guesswork.
         headers["X-Enhance-Gamma"] = str(stats["gamma"])
         headers["X-Enhance-Median"] = str(stats["median"])
-        headers["X-Enhance-Vignette"] = str(stats["vignette"])
     _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 100])
     return Response(content=jpeg.tobytes(), media_type="image/jpeg", headers=headers)
 
