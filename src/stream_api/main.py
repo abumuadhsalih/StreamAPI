@@ -4,7 +4,9 @@ import json
 import time
 import glob
 import hmac
+import math
 import asyncio
+import functools
 import logging
 import threading
 import subprocess
@@ -1245,29 +1247,68 @@ def system_stats():
 # Camera endpoints
 # ---------------------------------------------------------------------------
 
-# Gamma 0.6 lift table — computed once, applied per capture via cv2.LUT (~0.1ms).
-# Pulls the deliberately-underexposed midtones back up to a viewable brightness.
 # enhance_for_text() runs on every /capture by default: the sensor is held at a
 # short 80 µs exposure to keep the tray's glare bands recoverable, so the raw
-# frame is dark on purpose (worst at 4-6am with no ambient light). Measured on a
-# client 4-6am capture it lifts the tray median 74 -> 136 with saturated pixels
-# 3.1% -> 4.1%, whereas a 4x exposure would reach the same median at 24%
-# saturation. The raw frame is only useful for tuning — request ?enhance=false.
-_GAMMA_LUT_060 = np.array(
-    [((i / 255.0) ** 0.6) * 255.0 for i in range(256)], dtype=np.uint8
-)
+# frame is dark on purpose (worst at 4-6am with no ambient light). The raw frame
+# is only useful for tuning — request ?enhance=false.
+#
+# The shadow lift is ADAPTIVE. A fixed gamma-0.6 lift was right for the client's
+# dark 10-Sep capture (tray median 74 -> 136) but on a brighter 4:40am frame a
+# week later (raw median 117) the same lift pushed the silver fish in the right
+# column up to a washed-out ~160-190 with no gradation left. So after CLAHE the
+# L-channel median of the central 80% of the frame is measured and the gamma is
+# chosen to land it on ENHANCE_TARGET_MEDIAN, clamped to [ENHANCE_GAMMA_MIN,
+# ENHANCE_GAMMA_MAX]: a dark frame gets the full lift, a frame that is already
+# bright enough gets none (gamma 1.0 = CLAHE + unsharp only). On the two real
+# captures: 10-Sep -> gamma 0.71 (median 124), 15-Sep -> gamma 1.0 (median 122).
+# The centre crop excludes the tray rim and any hands at the edge of frame so a
+# glove in shot doesn't swing the exposure of the whole picture.
+ENHANCE_TARGET_MEDIAN = 130
+ENHANCE_GAMMA_MIN = 0.6   # strongest lift — the original fixed value
+ENHANCE_GAMMA_MAX = 1.0   # no lift
+_ENHANCE_GAMMA_STEP = 0.02  # LUTs are cached per quantised gamma
 
 
-def enhance_for_text(image: np.ndarray) -> np.ndarray:
-    """LAB CLAHE + shadow gamma lift + unsharp — default /capture post-processing."""
+@functools.lru_cache(maxsize=32)
+def _gamma_lut(gamma: float) -> np.ndarray:
+    return np.array(
+        [((i / 255.0) ** gamma) * 255.0 for i in range(256)], dtype=np.uint8
+    )
+
+
+def _choose_lift_gamma(l: np.ndarray) -> tuple[float, int]:
+    """Pick the gamma that lands the centre-crop median on the target. Returns (gamma, median)."""
+    h, w = l.shape[:2]
+    centre = l[int(h * 0.1):int(h * 0.9), int(w * 0.1):int(w * 0.9)]
+    median = int(np.median(centre)) if centre.size else 0
+    if median <= 0:
+        return ENHANCE_GAMMA_MIN, median
+    if median >= ENHANCE_TARGET_MEDIAN:
+        return ENHANCE_GAMMA_MAX, median
+    gamma = math.log(ENHANCE_TARGET_MEDIAN / 255.0) / math.log(median / 255.0)
+    gamma = min(max(gamma, ENHANCE_GAMMA_MIN), ENHANCE_GAMMA_MAX)
+    gamma = round(gamma / _ENHANCE_GAMMA_STEP) * _ENHANCE_GAMMA_STEP
+    return round(gamma, 2), median
+
+
+def enhance_for_text(image: np.ndarray, stats: dict | None = None) -> np.ndarray:
+    """LAB CLAHE + adaptive shadow gamma lift + unsharp — default /capture post-processing.
+
+    If `stats` is given it is filled with the chosen `gamma` and the measured
+    `median` so /capture can report them in response headers.
+    """
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     # Stronger local contrast — recovers detail in near-saturated bright bands
     # (where a low-exposure capture leaves headroom to work with).
     l = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
-    # Shadow lift — turns a dark low-exposure capture into a viewable image
-    # while the glare bands (now well below 255) reveal their hidden detail.
-    l = cv2.LUT(l, _GAMMA_LUT_060)
+    # Shadow lift, only as much as this frame needs (see ENHANCE_* above).
+    gamma, median = _choose_lift_gamma(l)
+    if stats is not None:
+        stats["gamma"] = gamma
+        stats["median"] = median
+    if gamma < ENHANCE_GAMMA_MAX:
+        l = cv2.LUT(l, _gamma_lut(gamma))
     out = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
     blurred = cv2.GaussianBlur(out, (0, 0), sigmaX=1.5)
     return cv2.addWeighted(out, 1.5, blurred, -0.5, 0)
@@ -1297,10 +1338,11 @@ def capture(
     white_balance: int = -1,
 ):
     """
-    enhance:        default true — CLAHE + gamma lift for the deliberately dark
-                    80 µs frame (the AI client fetches bare /capture, so the
-                    default must be the AI-ready image). Pass ?enhance=false
-                    for the raw sensor frame (on-site exposure tuning / A-B).
+    enhance:        default true — CLAHE + adaptive gamma lift for the
+                    deliberately dark 80 µs frame (the AI client fetches bare
+                    /capture, so the default must be the AI-ready image). The
+                    lift chosen is reported in X-Enhance-Gamma / X-Enhance-Median.
+                    Pass ?enhance=false for the raw sensor frame (tuning / A-B).
     exposure_us:    -1 = leave as-is, 0 = re-enable AE, >0 = manual microseconds
     gain:           -1 = leave as-is, 0 = don't override, >0 = manual (16-248)
     white_balance:  -1 = leave as-is, 0 = re-enable auto-WB, >0 = manual Kelvin (2800-6500)
@@ -1333,10 +1375,15 @@ def capture(
             content={"error": "camera not available", "detail": camera_status["error"]},
             status_code=503,
         )
+    headers: dict[str, str] = {}
     if enhance:
-        image = enhance_for_text(image)
+        stats: dict = {}
+        image = enhance_for_text(image, stats)
+        # Surface what the adaptive lift did so an on-site A/B needs no guesswork.
+        headers["X-Enhance-Gamma"] = str(stats["gamma"])
+        headers["X-Enhance-Median"] = str(stats["median"])
     _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 100])
-    return Response(content=jpeg.tobytes(), media_type="image/jpeg")
+    return Response(content=jpeg.tobytes(), media_type="image/jpeg", headers=headers)
 
 
 @app.post("/camera/restart", summary="Force a RealSense pipeline restart")
