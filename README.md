@@ -7,7 +7,7 @@ A FastAPI server that exposes an Intel RealSense camera, a USB serial scale and 
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/stream` | Live MJPEG color stream |
-| GET | `/capture` | Capture and return a single JPEG image |
+| GET | `/capture` | Capture and return a single JPEG image (enhanced by default; `?enhance=false` for the raw sensor frame) |
 | GET | `/scale/stream` | Live weight stream (SSE) |
 | GET | `/scale/capture` | Read current weight |
 | GET | `/battery/capture` | Read current battery state from the BMS |
@@ -122,7 +122,7 @@ uv run stream-api
 The API will be accessible from any device on the same LAN:
 
 - Stream: `http://<jetson-ip>:8000/stream`
-- Capture: `http://<jetson-ip>:8000/capture`
+- Capture: `http://<jetson-ip>:8000/capture` (raw sensor frame: `http://<jetson-ip>:8000/capture?enhance=false`)
 - Docs: `http://<jetson-ip>:8000/docs`
 
 > To find the Jetson's IP: `hostname -I | awk '{print $1}'`

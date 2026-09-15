@@ -1247,13 +1247,19 @@ def system_stats():
 
 # Gamma 0.6 lift table — computed once, applied per capture via cv2.LUT (~0.1ms).
 # Pulls the deliberately-underexposed midtones back up to a viewable brightness.
+# enhance_for_text() runs on every /capture by default: the sensor is held at a
+# short 80 µs exposure to keep the tray's glare bands recoverable, so the raw
+# frame is dark on purpose (worst at 4-6am with no ambient light). Measured on a
+# client 4-6am capture it lifts the tray median 74 -> 136 with saturated pixels
+# 3.1% -> 4.1%, whereas a 4x exposure would reach the same median at 24%
+# saturation. The raw frame is only useful for tuning — request ?enhance=false.
 _GAMMA_LUT_060 = np.array(
     [((i / 255.0) ** 0.6) * 255.0 for i in range(256)], dtype=np.uint8
 )
 
 
 def enhance_for_text(image: np.ndarray) -> np.ndarray:
-    """LAB CLAHE + shadow gamma lift + unsharp — recovers text under glare/shadow."""
+    """LAB CLAHE + shadow gamma lift + unsharp — default /capture post-processing."""
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     # Stronger local contrast — recovers detail in near-saturated bright bands
@@ -1285,12 +1291,16 @@ def stream(preset: Preset = "fhd"):
 @app.get("/capture", summary="Capture a single JPEG image")
 def capture(
     preset: Preset = "fhd",
-    enhance: bool = False,
+    enhance: bool = True,
     exposure_us: int = -1,
     gain: int = -1,
     white_balance: int = -1,
 ):
     """
+    enhance:        default true — CLAHE + gamma lift for the deliberately dark
+                    80 µs frame (the AI client fetches bare /capture, so the
+                    default must be the AI-ready image). Pass ?enhance=false
+                    for the raw sensor frame (on-site exposure tuning / A-B).
     exposure_us:    -1 = leave as-is, 0 = re-enable AE, >0 = manual microseconds
     gain:           -1 = leave as-is, 0 = don't override, >0 = manual (16-248)
     white_balance:  -1 = leave as-is, 0 = re-enable auto-WB, >0 = manual Kelvin (2800-6500)
