@@ -1267,12 +1267,17 @@ def system_stats():
 # adaptive output (target 130, CLAHE clip 3.0, unsharp 1.5) dark: heavy CLAHE
 # gives a gritty, high-contrast frame that reads as dark even at the same
 # median. Softer local contrast (clip 1.5), a lighter unsharp (1.3) and a
-# higher target (155) look natural without pushing the silver fish to white.
-# On the two real captures: 10-Sep dark -> gamma pinned at 0.6 (median 123),
-# 15-Sep 4:50am -> gamma 0.69 (median 146). Raising the sensor exposure is NOT
-# the lever for this: the raw already sits at median ~120 and more exposure
-# only widens the saturated glare bands.
-ENHANCE_TARGET_MEDIAN = 155
+# higher target look natural without pushing the silver fish to white.
+# Raising the sensor exposure is NOT the lever for this: the raw already sits
+# at median ~120-135 and more exposure only widens the saturated glare bands.
+#
+# Target lowered 155 -> 140 on 17-Sep: the client preferred the raw frame
+# (tray median 135) over the lifted one (146) and asked for "a little bit
+# dark". At 140 a normally lit frame gets almost no lift (135 -> 131) while a
+# dark 4-6am frame like the 10-Sep original (77) is still rescued to 123 —
+# the alternative, raw by default, would have put that 77 back in front of
+# the AI with nobody there to add ?enhance=true.
+ENHANCE_TARGET_MEDIAN = 140
 ENHANCE_GAMMA_MIN = 0.6   # strongest lift — the original fixed value
 ENHANCE_GAMMA_MAX = 1.0   # no lift
 ENHANCE_CLAHE_CLIP = 1.5  # was 3.0 — lower = smoother, less grain on the steel
