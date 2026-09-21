@@ -23,18 +23,18 @@ warn() { echo "  ${YEL}WARN${NC} $*"; }
 hdr()  { echo; echo "${BOLD}== $* ==${NC}"; }
 
 # ---------------------------------------------------------------------------
-hdr "1. Camera — RealSense on the USB bus"
-if lsusb | grep -qi 'Intel'; then
-    pass "Intel RealSense detected on USB:"
-    lsusb | grep -i 'Intel' | sed 's/^/       /'
-    # RealSense needs USB 3.0 (5000M). Flag if it enumerated at USB 2.0 speed.
+hdr "1. Camera — ZED 2i on the USB bus"
+if lsusb | grep -qiE '2b03|stereolabs'; then
+    pass "Stereolabs ZED detected on USB:"
+    lsusb | grep -iE '2b03|stereolabs' | sed 's/^/       /'
+    # The ZED needs USB 3.0 (5000M) for HD1080. Flag if it enumerated at USB 2.0 speed.
     if command -v lsusb >/dev/null && lsusb -t 2>/dev/null | grep -qi '5000M'; then
         pass "A device is linked at USB 3.0 (5000M) speed"
     else
         warn "No 5000M (USB 3.0) link seen — camera may be on a USB 2.0 port; streaming can fail"
     fi
 else
-    fail "No Intel RealSense on the USB bus — camera is physically disconnected or off the bus"
+    fail "No Stereolabs ZED on the USB bus — camera is physically disconnected or off the bus"
     echo "       -> reseat the camera into a blue USB 3.0 port, or reboot to re-enumerate"
 fi
 
@@ -70,7 +70,7 @@ fi
 # ---------------------------------------------------------------------------
 hdr "4. Recent USB kernel messages (disconnects / resets)"
 if command -v dmesg >/dev/null; then
-    LINES="$(dmesg 2>/dev/null | grep -iE 'usb|ftdi|uvc|realsense|reset|disconnect' | tail -15)"
+    LINES="$(dmesg 2>/dev/null | grep -iE 'usb|ftdi|uvc|zed|stereolabs|reset|disconnect' | tail -15)"
     if [ -n "$LINES" ]; then
         echo "$LINES" | sed 's/^/       /'
     else

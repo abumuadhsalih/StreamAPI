@@ -1,13 +1,13 @@
-# RealSense Stream API
+# ZED Stream API
 
-A FastAPI server that exposes an Intel RealSense camera, a USB serial scale and the battery BMS over HTTP — enabling web and mobile clients on the same LAN to stream live video, capture images and read weight and battery state without needing GUI access.
+A FastAPI server that exposes a Stereolabs ZED 2i camera (RGB), a USB serial scale and the battery BMS over HTTP — enabling web and mobile clients on the same LAN to stream live video, capture images and read weight and battery state without needing GUI access.
 
 ## Endpoints
 
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/stream` | Live MJPEG color stream |
-| GET | `/capture` | Capture and return a single JPEG image (enhanced by default; `?enhance=false` for the raw sensor frame) |
+| GET | `/capture` | Capture and return a single JPEG image (raw auto-exposed frame; `?enhance=true` for CLAHE + shadow lift) |
 | GET | `/scale/stream` | Live weight stream (SSE) |
 | GET | `/scale/capture` | Read current weight |
 | GET | `/battery/capture` | Read current battery state from the BMS |
@@ -18,9 +18,9 @@ See `/docs` for the full list, including the `POST` recovery and system-control 
 
 ---
 
-## Setup on Jetson Ubuntu VM
+## Setup on Jetson
 
-> **Note:** Jetson uses ARM64 (`aarch64`). `pyrealsense2` is not available on PyPI for ARM64, so it must be installed separately via Intel's APT repository before running `uv sync`.
+> **Note:** The camera SDK (`pyzed`) is not on PyPI and needs CUDA, so it comes from the ZED SDK installer rather than `uv sync`. The Jetson must run JetPack natively (CUDA at `/usr/local/cuda`); the SDK will not start without a GPU, even for RGB-only capture.
 
 ### 1. Install system dependencies
 
@@ -29,32 +29,31 @@ sudo apt update
 sudo apt install -y git libssl-dev libusb-1.0-0-dev libgtk-3-dev python3-dev pkg-config
 ```
 
-### 2. Install pyrealsense2 via Intel APT repository (ARM64)
+### 2. Install the ZED SDK (matches the Jetson's JetPack / L4T release)
 
 ```bash
-# Register Intel's key and repository
-sudo mkdir -p /etc/apt/keyrings
-curl -sSf https://librealsense.intel.com/Debian/librealsense.pgp \
-  | sudo tee /etc/apt/keyrings/librealsense.pgp > /dev/null
+# Confirm the L4T release and that CUDA is present — the SDK build must match L4T
+cat /etc/nv_tegra_release
+ls /usr/local/cuda
 
-echo "deb [signed-by=/etc/apt/keyrings/librealsense.pgp] \
-  https://librealsense.intel.com/Debian/apt-repo $(lsb_release -cs) main" \
-  | sudo tee /etc/apt/sources.list.d/librealsense.list
-
-sudo apt update
-sudo apt install -y librealsense2-utils librealsense2-python3
+# Download the "ZED SDK for JetPack <your version>" installer from
+# https://www.stereolabs.com/developers/release and run it
+chmod +x ZED_SDK_Tegra_L4T*.run
+./ZED_SDK_Tegra_L4T*.run
 ```
 
-This installs pyrealsense2 as a system package at `/usr/lib/python3/dist-packages/pyrealsense2`.
+The installer lands in `/usr/local/zed/` (tools in `/usr/local/zed/tools/`, udev rule at `/etc/udev/rules.d/99-slabs.rules`). Accept the default when it asks about the Python API, or install it into the venv in step 7 — either works, but the venv route is what step 7 shows.
 
-### 3. Configure RealSense udev rules
+On first `open()` the SDK downloads the camera's factory calibration file into `/usr/local/zed/settings/SN<serial>.conf`. That needs internet **once**; on a LAN-only Jetson run `/usr/local/zed/tools/ZED_Diagnostic` while online, or copy the file in by hand.
 
-This allows the RealSense device to be accessed without `sudo`.
+### 3. Camera permissions
+
+The SDK's udev rule opens the camera to all users, so no group is needed for the ZED itself. The scale's serial adapter still needs `plugdev` (or `dialout` — see `JETSON_SETUP.md`):
 
 ```bash
 sudo udevadm control --reload-rules && sudo udevadm trigger
-sudo usermod -aG plugdev $USER
-# Log out and back in, then replug the RealSense device
+sudo usermod -aG plugdev,video $USER
+# Log out and back in, then replug the camera
 ```
 
 ### 4. Enable Bluetooth for the battery BMS
@@ -98,20 +97,22 @@ cd StreamAPI
 
 ### 7. Create venv with system site-packages and sync
 
-Because `pyrealsense2` was installed system-wide (step 2), the venv needs access to system packages:
+The `pyzed` wheel is built against the system CUDA and NumPy, so the venv uses the system interpreter and sees system packages:
 
 ```bash
-uv venv --system-site-packages
+uv venv --python /usr/bin/python3 --system-site-packages
 uv sync
+# Install the Python API into the venv (downloads the wheel matching CUDA/L4T/Python)
+uv run python /usr/local/zed/get_python_api.py
 ```
 
-### 8. Verify RealSense camera is detected
+### 8. Verify the ZED camera is detected
 
 ```bash
-uv run python -c "import pyrealsense2 as rs; ctx = rs.context(); print(f'Devices found: {len(ctx.devices)}')"
+uv run python -c "import pyzed.sl as sl; d = sl.Camera.get_device_list(); print(f'Devices found: {len(d)}', [str(x.camera_state) for x in d])"
 ```
 
-You should see `Devices found: 1` (or more). If it shows `0`, check the USB connection and udev rules.
+You should see `Devices found: 1 ['AVAILABLE']`. `0` means USB/udev; `NOT_AVAILABLE` means another process (e.g. `ZED_Explorer`) holds the camera — a ZED accepts one client at a time.
 
 ### 9. Run the server
 
@@ -122,7 +123,7 @@ uv run stream-api
 The API will be accessible from any device on the same LAN:
 
 - Stream: `http://<jetson-ip>:8000/stream`
-- Capture: `http://<jetson-ip>:8000/capture` (raw sensor frame: `http://<jetson-ip>:8000/capture?enhance=false`)
+- Capture: `http://<jetson-ip>:8000/capture` (enhanced: `http://<jetson-ip>:8000/capture?enhance=true`)
 - Docs: `http://<jetson-ip>:8000/docs`
 
 > To find the Jetson's IP: `hostname -I | awk '{print $1}'`
@@ -137,27 +138,28 @@ For production hosting — service starts on Jetson boot, restarts on failure, l
 
 ## Troubleshooting
 
-**`uv sync` fails with pyrealsense2 wheel error**
-This means you skipped step 2. `pyrealsense2` has no ARM64 PyPI wheel — it must be installed via Intel's APT repo first, then `uv venv --system-site-packages` used.
-
-**`No module named 'pyrealsense2'` after uv sync**
-The venv was created without `--system-site-packages`. Recreate it:
+**`No module named 'pyzed'`**
+The Python API was not installed into this venv. Run `uv run python /usr/local/zed/get_python_api.py` (step 7). If the venv was created without `--system-site-packages` / the system interpreter, recreate it:
 ```bash
 rm -rf .venv
-uv venv --system-site-packages
+uv venv --python /usr/bin/python3 --system-site-packages
 uv sync
+uv run python /usr/local/zed/get_python_api.py
 ```
 
 **`Devices found: 0`**
-- Check USB cable is connected and RealSense is powered
+- Check the USB cable and that the camera is on a USB 3.0 port (`lsusb -t` shows `5000M`; the vendor id is `2b03`)
 - Re-run `sudo udevadm control --reload-rules && sudo udevadm trigger` and replug the device
-- Try `rs-enumerate-devices` to confirm the device is visible at the system level
+- Run `/usr/local/zed/tools/ZED_Diagnostic` to confirm the SDK sees the camera — then close it before starting the service
 
-**Permission denied on USB device**
-```bash
-sudo usermod -aG plugdev $USER
-# Log out and back in for the group change to take effect
-```
+**`/health` says the camera is held by another process**
+Close `ZED_Explorer` / `ZED_Diagnostic` (or any other SDK client); the ZED accepts one at a time. The service reconnects on its own.
+
+**`camera open refused ... CALIBRATION_FILE_NOT_AVAILABLE`**
+The Jetson had no internet the first time the camera was opened. Connect it once and `POST /camera/restart`, or copy `SN<serial>.conf` into `/usr/local/zed/settings/`.
+
+**`camera open refused ... NO_GPU_COMPATIBLE` / CUDA errors**
+The SDK build does not match the installed JetPack, or CUDA is missing. Compare `cat /etc/nv_tegra_release` with the SDK version you downloaded.
 
 **Port 8000 already in use**
 ```bash

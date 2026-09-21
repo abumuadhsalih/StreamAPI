@@ -23,7 +23,7 @@ from .scale import parse_scale_line, resolve_scale_port, split_frames
 
 logger = logging.getLogger("stream_api")
 
-app = FastAPI(title="RealSense Stream API")
+app = FastAPI(title="ZED Stream API")
 
 # Open CORS for POC — LAN browser/mobile clients on arbitrary origins.
 # Lock down `allow_origins` to specific domains before any production use.
@@ -144,160 +144,161 @@ def _battery_failed(error: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Camera — pyrealsense2 is Linux-only; stub on other platforms for local dev
+# Camera — pyzed (ZED SDK) needs CUDA and is Linux-only; stub elsewhere for dev
 # ---------------------------------------------------------------------------
 
 if sys.platform == "linux":
-    import pyrealsense2 as rs
+    import pyzed.sl as sl
 
-    # Camera exposure tuning — edit these and redeploy to change the baseline.
-    # For on-site iteration without a redeploy, use ?exposure_us=<us> on /capture
-    # (persists across requests until changed again; ?exposure_us=0 re-enables AE).
-    # Typical manual values under bright glare: 1000-8000 microseconds.
-    # On-site tuned values for the Dubai smart-table (bright overhead lights +
-    # polished steel tray). Verified on the Jetson to give a clean, readable
-    # capture without highlight blow-out or colour cast. Override per-request
-    # via ?exposure_us= / ?gain= / ?white_balance= on /capture if the scene
-    # changes; set any to 0 to hand that channel back to auto.
-    CAMERA_EXPOSURE_US = 80     # 0 = auto-exposure; >0 = manual microseconds
-    CAMERA_GAIN = 60            # 0 = don't override; D435 range 16-248
-    CAMERA_WHITE_BALANCE = 3600 # 0 = auto-WB; >0 = locked Kelvin (2800-6500)
+    # One shared sl.Camera for the process. Constructing it is cheap — the
+    # hardware and the CUDA context are only touched by open(). RGB only:
+    # DEPTH_MODE.NONE keeps the GPU idle (depth is deferred, PROJECT_SCOPE.md).
+    # The left view is the rectified reference image; the SDK hands it back
+    # as BGRA, converted to BGR in _grab_frame() so the rest of the file only
+    # ever sees a plain 3-channel frame.
+    #
+    # Exposure, gain and white balance are left to the camera's own ISP
+    # (AEC_AGC + WHITEBALANCE_AUTO). The D435 needed a hand-tuned 80 us manual
+    # exposure to survive the tray's glare; the ZED 2i's polarizer and ISP take
+    # that over, so there are no sensor constants and no per-request overrides.
+    _zed = sl.Camera()
+    _init = sl.InitParameters()
+    _init.camera_resolution = sl.RESOLUTION.HD1080
+    _init.camera_fps = 30
+    _init.depth_mode = sl.DEPTH_MODE.NONE
+    _init.sdk_verbose = 0
+    _runtime = sl.RuntimeParameters()
+    _left = sl.Mat()  # reused across grabs; get_data() aliases its memory
 
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_stream(
-        rs.stream.color, CAPTURE_WIDTH, CAPTURE_HEIGHT, rs.format.bgr8, 30
-    )
-
-    # Serialize all pipeline access — pyrealsense2's pipeline is not thread-safe,
-    # and lazy restart from multiple concurrent requests must be single-flighted.
+    # Serialize all camera access — sl.Camera grab/retrieve is not thread-safe,
+    # and lazy reopen from multiple concurrent requests must be single-flighted.
     _camera_lock = threading.Lock()
     _camera_last_retry = 0.0
     _CAMERA_RETRY_COOLDOWN = 5.0  # seconds — avoid hammering USB after a disconnect
 
-    def _apply_exposure(color_sensor, exposure_us: int, gain: int) -> None:
-        """Switch to manual exposure if exposure_us > 0; otherwise leave AE on."""
-        if exposure_us <= 0:
-            color_sensor.set_option(rs.option.enable_auto_exposure, 1)
-            return
-        color_sensor.set_option(rs.option.enable_auto_exposure, 0)
-        color_sensor.set_option(rs.option.exposure, exposure_us)
-        if gain > 0:
-            color_sensor.set_option(rs.option.gain, gain)
+    def _reset_isp_auto() -> None:
+        """Hand exposure/gain and white balance back to the camera's ISP.
 
-    def _apply_white_balance(color_sensor, kelvin: int) -> None:
-        """Lock WB to a manual Kelvin value if kelvin > 0; otherwise re-enable auto-WB."""
-        if kelvin <= 0:
-            color_sensor.set_option(rs.option.enable_auto_white_balance, 1)
-            return
-        color_sensor.set_option(rs.option.enable_auto_white_balance, 0)
-        color_sensor.set_option(rs.option.white_balance, kelvin)
+        ISP settings can persist on the device between opens (ZED_Explorer or
+        a diagnostic run may have left a manual value behind), so this is set
+        explicitly rather than trusting the SDK defaults.
+        """
+        _zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
+        _zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
 
-    def _tune_color_sensor() -> None:
-        color_sensor = pipeline.get_active_profile().get_device().first_color_sensor()
-        color_sensor.set_option(rs.option.sharpness, 100)
-        color_sensor.set_option(rs.option.contrast, 60)
-        color_sensor.set_option(rs.option.gamma, 300)
-        color_sensor.set_option(rs.option.backlight_compensation, 1)
-        color_sensor.set_option(rs.option.power_line_frequency, 1)
-        color_sensor.set_option(rs.option.auto_exposure_priority, 0)
-        _apply_exposure(color_sensor, CAMERA_EXPOSURE_US, CAMERA_GAIN)
-        _apply_white_balance(color_sensor, CAMERA_WHITE_BALANCE)
-
-    def _start_pipeline() -> bool:
-        """(Re)start the RealSense pipeline. Caller must hold _camera_lock."""
+    def _open_camera() -> bool:
+        """(Re)open the ZED. Caller must hold _camera_lock."""
         global _camera_last_retry
         _camera_last_retry = time.monotonic()
         try:
-            pipeline.stop()
+            _zed.close()
         except Exception:
             pass
         # Enumerate first so we can distinguish "no camera on USB" (hardware
-        # unplugged / bad cable / wrong port) from "camera present but pipeline
-        # refused" (another process holds it, firmware wedged, USB 2.0 port).
+        # unplugged / bad cable / wrong port) from "camera present but held by
+        # another process" — a ZED accepts one client at a time, so a
+        # ZED_Explorer left open on the desktop looks exactly like a fault.
         try:
-            devices = rs.context().query_devices()
+            devices = sl.Camera.get_device_list()
         except Exception as e:
             _camera_failed(f"failed to enumerate USB devices: {e}")
             return False
         if len(devices) == 0:
             _camera_failed(
-                "no RealSense device detected on USB — check the cable, "
+                "no ZED device detected on USB — check the cable, "
                 "try a different USB 3.0 port, or unplug/replug the camera"
             )
             return False
-        camera_status["device"] = {
-            "name": devices[0].get_info(rs.camera_info.name),
-            "serial": devices[0].get_info(rs.camera_info.serial_number),
-            "firmware": devices[0].get_info(rs.camera_info.firmware_version),
-        }
-        try:
-            pipeline.start(config)
-            _tune_color_sensor()
-            camera_status["ok"] = True
-            camera_status["error"] = None
-            logger.info(
-                "camera pipeline started: %s serial=%s fw=%s",
-                camera_status["device"]["name"],
-                camera_status["device"]["serial"],
-                camera_status["device"]["firmware"],
-            )
-            return True
-        except Exception as e:
+        device = devices[0]
+        if device.camera_state == sl.CAMERA_STATE.NOT_AVAILABLE:
             _camera_failed(
-                f"pipeline start refused by device (camera detected but "
-                f"stream config was rejected — likely another process holds "
-                f"it, or the camera is on a USB 2.0 port): {e}"
+                "ZED detected but held by another process (ZED_Explorer, "
+                "ZED_Diagnostic or another service) — close it and retry"
             )
             return False
+        err = _zed.open(_init)
+        if err != sl.ERROR_CODE.SUCCESS:
+            _camera_failed(
+                f"camera open refused (camera detected but the SDK could not "
+                f"start it — check CUDA, the calibration file and USB 3.0): {err}"
+            )
+            return False
+        try:
+            info = _zed.get_camera_information()
+            camera_status["device"] = {
+                "name": str(info.camera_model),
+                "serial": str(info.serial_number),
+                "firmware": str(info.camera_configuration.firmware_version),
+            }
+            _reset_isp_auto()
+        except Exception as e:
+            try:
+                _zed.close()
+            except Exception:
+                pass
+            _camera_failed(f"camera opened but initial setup failed: {e}")
+            return False
+        camera_status["ok"] = True
+        camera_status["error"] = None
+        logger.info(
+            "camera opened: %s serial=%s fw=%s",
+            camera_status["device"]["name"],
+            camera_status["device"]["serial"],
+            camera_status["device"]["firmware"],
+        )
+        return True
 
     def _grab_frame():
         with _camera_lock:
             if not camera_status["ok"]:
                 if time.monotonic() - _camera_last_retry < _CAMERA_RETRY_COOLDOWN:
                     return None
-                if not _start_pipeline():
+                if not _open_camera():
                     return None
             # Two attempts per request — masks transient USB hiccups (idle
             # autosuspend, brief re-enumeration, single stalled frame). On the
-            # first timeout we restart the pipeline in-line and try once more
-            # so the client sees a valid frame instead of a 503.
+            # first failure we reopen the camera in-line and try once more so
+            # the client sees a valid frame instead of a 503. grab() blocks for
+            # at most a frame period and reports USB loss as an error code
+            # (CAMERA_NOT_DETECTED / CAMERA_REBOOTING), so no timeout is needed.
             for attempt in (1, 2):
                 try:
-                    frames = pipeline.wait_for_frames(timeout_ms=3000)
-                    frame = frames.get_color_frame()
-                    if frame:
-                        return np.asanyarray(frame.get_data())
+                    err = _zed.grab(_runtime)
+                    if err == sl.ERROR_CODE.SUCCESS:
+                        _zed.retrieve_image(_left, sl.VIEW.LEFT)
+                        # cvtColor also copies out of the reused sl.Mat buffer.
+                        return cv2.cvtColor(_left.get_data(), cv2.COLOR_BGRA2BGR)
+                    raise RuntimeError(str(err))
                 except Exception as e:
                     logger.info("frame grab attempt %d failed: %s", attempt, e)
                     try:
-                        pipeline.stop()
+                        _zed.close()
                     except Exception:
                         pass
                     if attempt == 2:
                         _camera_failed(str(e))
                         return None
-                    if not _start_pipeline():
+                    if not _open_camera():
                         return None
             return None
 
     def restart_camera() -> dict:
-        """Force a pipeline stop+restart on demand, bypassing the cooldown."""
+        """Force a camera close+reopen on demand, bypassing the cooldown."""
         global _camera_last_retry
         with _camera_lock:
             _camera_last_retry = 0.0
-            _start_pipeline()
+            _open_camera()
         return camera_status
 
     @app.on_event("startup")
     def _camera_startup():
         with _camera_lock:
-            _start_pipeline()
+            _open_camera()
 
     @app.on_event("shutdown")
     def _camera_shutdown():
         try:
-            pipeline.stop()
+            _zed.close()
         except Exception:
             pass
 
@@ -309,11 +310,11 @@ else:
         return camera_status
 
     def _grab_frame():
-        """Return a placeholder frame when no RealSense is available."""
+        """Return a placeholder frame when no ZED is available."""
         frame = np.zeros((CAPTURE_HEIGHT, CAPTURE_WIDTH, 3), dtype=np.uint8)
         cv2.putText(
             frame,
-            "RealSense not available (stub)",
+            "ZED 2i not available (stub)",
             (60, CAPTURE_HEIGHT // 2),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.5,
@@ -1247,10 +1248,14 @@ def system_stats():
 # Camera endpoints
 # ---------------------------------------------------------------------------
 
-# enhance_for_text() runs on every /capture by default: the sensor is held at a
-# short 80 µs exposure to keep the tray's glare bands recoverable, so the raw
-# frame is dark on purpose (worst at 4-6am with no ambient light). The raw frame
-# is only useful for tuning — request ?enhance=false.
+# enhance_for_text() is opt-in (?enhance=true). It was the default while the
+# D435 was held at a short 80 µs manual exposure to keep the tray's glare bands
+# recoverable — the raw frame was dark on purpose, worst at 4-6am with no
+# ambient light, and the AI client fetches bare /capture. The ZED 2i runs its
+# own auto-exposure behind a polarizer, so the raw frame is now the AI input
+# and this stays as an A/B tool and a rescue for a dark scene. The constants
+# below and their history are kept as-is; nothing about the lift depends on
+# which sensor produced the frame.
 #
 # The shadow lift is ADAPTIVE. A fixed gamma-0.6 lift was right for the client's
 # dark 10-Sep capture (tray median 74 -> 136) but on a brighter 4:40am frame a
@@ -1274,9 +1279,9 @@ def system_stats():
 # Target lowered 155 -> 140 on 17-Sep: the client preferred the raw frame
 # (tray median 135) over the lifted one (146) and asked for "a little bit
 # dark". At 140 a normally lit frame gets almost no lift (135 -> 131) while a
-# dark 4-6am frame like the 10-Sep original (77) is still rescued to 123 —
-# the alternative, raw by default, would have put that 77 back in front of
-# the AI with nobody there to add ?enhance=true.
+# dark 4-6am frame like the 10-Sep original (77) is still rescued to 123.
+# (Raw-by-default was rejected at the time for exactly that frame; it became
+# the default only once the ZED's auto-exposure removed the dark raw frame.)
 ENHANCE_TARGET_MEDIAN = 140
 ENHANCE_GAMMA_MIN = 0.6   # strongest lift — the original fixed value
 ENHANCE_GAMMA_MAX = 1.0   # no lift
@@ -1334,7 +1339,7 @@ def enhance_for_text(image: np.ndarray, stats: dict | None = None) -> np.ndarray
 @app.get("/stream", summary="Live MJPEG color stream")
 def stream(preset: Preset = "fhd"):
     width, height = RESOLUTIONS[preset]
-    # Probe once to trigger a lazy pipeline restart if the camera has dropped.
+    # Probe once to trigger a lazy camera reopen if the camera has dropped.
     if get_color_frame(width, height) is None:
         return JSONResponse(
             content={"error": "camera not available", "detail": camera_status["error"]},
@@ -1347,45 +1352,15 @@ def stream(preset: Preset = "fhd"):
 
 
 @app.get("/capture", summary="Capture a single JPEG image")
-def capture(
-    preset: Preset = "fhd",
-    enhance: bool = True,
-    exposure_us: int = -1,
-    gain: int = -1,
-    white_balance: int = -1,
-):
+def capture(preset: Preset = "fhd", enhance: bool = False):
     """
-    enhance:        default true — CLAHE + adaptive gamma lift for the
-                    deliberately dark 80 µs frame (the AI client fetches bare
-                    /capture, so the default must be the AI-ready image). The
-                    lift chosen is reported in X-Enhance-Gamma / X-Enhance-Median.
-                    Pass ?enhance=false for the raw sensor frame (tuning / A-B).
-    exposure_us:    -1 = leave as-is, 0 = re-enable AE, >0 = manual microseconds
-    gain:           -1 = leave as-is, 0 = don't override, >0 = manual (16-248)
-    white_balance:  -1 = leave as-is, 0 = re-enable auto-WB, >0 = manual Kelvin (2800-6500)
-    All overrides persist across requests until changed again.
+    enhance:  default false — the ZED's ISP auto-exposes, so the raw frame is
+              the AI-ready image and bare /capture (what the AI client fetches)
+              returns it untouched. Pass ?enhance=true for CLAHE + adaptive
+              gamma lift + unsharp (A/B, or rescuing a dark scene); the lift
+              chosen is reported in X-Enhance-Gamma / X-Enhance-Median.
     """
     width, height = RESOLUTIONS[preset]
-    if sys.platform == "linux" and camera_status["ok"] and (
-        exposure_us >= 0 or gain >= 0 or white_balance >= 0
-    ):
-        with _camera_lock:
-            try:
-                color_sensor = pipeline.get_active_profile().get_device().first_color_sensor()
-                if exposure_us >= 0:
-                    _apply_exposure(
-                        color_sensor, exposure_us,
-                        gain if gain >= 0 else CAMERA_GAIN,
-                    )
-                elif gain > 0:
-                    color_sensor.set_option(rs.option.gain, gain)
-                if white_balance >= 0:
-                    _apply_white_balance(color_sensor, white_balance)
-            except Exception as e:
-                logger.warning(
-                    "failed to apply overrides (exposure_us=%s gain=%s white_balance=%s): %s",
-                    exposure_us, gain, white_balance, e,
-                )
     image = get_color_frame(width, height)
     if image is None:
         return JSONResponse(
@@ -1403,7 +1378,7 @@ def capture(
     return Response(content=jpeg.tobytes(), media_type="image/jpeg", headers=headers)
 
 
-@app.post("/camera/restart", summary="Force a RealSense pipeline restart")
+@app.post("/camera/restart", summary="Force a ZED camera close+reopen")
 def camera_restart():
     status = restart_camera()
     return JSONResponse(

@@ -1,10 +1,11 @@
 """DX11 weight-indicator protocol — pure parsing and port discovery, no I/O.
 
 Deliberately kept out of `main.py` so debug tooling (`dx11.py`) can import the
-exact parser the service runs: importing `stream_api.main` constructs an
-`rs.pipeline()` at module level, which would fight the live service for the
-camera. Nothing here opens a port or touches hardware, so importing this module
-is always safe and always cheap.
+exact parser the service runs: importing `stream_api.main` builds the camera
+objects at module level and registers the startup hook that opens the ZED —
+a ZED accepts one SDK client, so a tool that imports `main` fights the live
+service for the camera. Nothing here opens a port or touches hardware, so
+importing this module is always safe and always cheap.
 
 Wire format, confirmed against the indicator on the Jetson (9600 8N1)::
 

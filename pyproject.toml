@@ -1,15 +1,15 @@
 [project]
 name = "stream-api"
 version = "0.1.0"
-description = "RealSense camera streaming and capture API"
+description = "ZED 2i camera streaming and capture API"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     # Linux-only because the BLE path is stubbed elsewhere: macOS/CoreBluetooth
     # addresses devices by an opaque per-host UUID and can never resolve a MAC.
-    # The marker also keeps pyobjc off dev laptops. Unlike pyrealsense2 below,
-    # this needs NO platform_machine marker — bleak is pure Python and dbus-fast
-    # ships aarch64 wheels, so it installs on the Jetson without compiling.
+    # The marker also keeps pyobjc off dev laptops. bleak is pure Python and
+    # dbus-fast ships aarch64 wheels, so it installs on the Jetson without
+    # compiling.
     "bleak>=3.0.2 ; sys_platform == 'linux'",
     # bleak's own D-Bus transport, so this pulls in nothing new. Declared
     # anyway because main.py calls org.bluez directly to clear a stale BLE
@@ -17,9 +17,11 @@ dependencies = [
     "dbus-fast>=5.0.22 ; sys_platform == 'linux'",
     "fastapi[standard]>=0.136.0",
     "opencv-python-headless>=4.13.0.92",
-    # PyPI only has x86_64 wheel; on ARM64 (Jetson) install via Intel APT repo — see README
     "psutil>=7.2.2",
-    "pyrealsense2>=2.57.7.10387 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # The camera SDK (pyzed) is deliberately NOT listed: it is not on PyPI and
+    # needs CUDA. The ZED SDK installer's get_python_api.py drops a wheel built
+    # for the Jetson's CUDA/L4T/Python into whichever interpreter runs it — run
+    # it with the venv active (see README). On non-Linux the camera is stubbed.
     "pyserial>=3.5",
 ]
 

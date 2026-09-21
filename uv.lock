@@ -933,18 +933,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pyrealsense2"
-version = "2.57.7.10387"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/23/a2/c1e4f0b6e6b1a30b782136f439313737acc961a84bbea69577a2009e8c44/pyrealsense2-2.57.7.10387-cp310-cp310-manylinux1_x86_64.whl", hash = "sha256:890de972c3532e0876ae851ccd36d9a035e471b9c15eb122b8b583b494c46df0", size = 11614142, upload-time = "2026-03-25T11:35:48.631Z" },
-    { url = "https://files.pythonhosted.org/packages/4f/61/1d4db107c791c89b3b231d2050ff3667b6a72979bd5dfb7a9b2a2fa2dcb2/pyrealsense2-2.57.7.10387-cp311-cp311-manylinux1_x86_64.whl", hash = "sha256:3f95183e07b964c86794e508ec82c82700ae597acbf0751083f7a387a490eb1c", size = 11616809, upload-time = "2026-03-25T11:36:52.472Z" },
-    { url = "https://files.pythonhosted.org/packages/e5/3e/705c698ef95b83c753992bdaa8f2c212e49a0bfbf6258d52f05644603860/pyrealsense2-2.57.7.10387-cp312-cp312-manylinux1_x86_64.whl", hash = "sha256:d39102141af52a4dba13e7e76d520fdf4538985482ec29200cc9c1b0746aa1ff", size = 11615052, upload-time = "2026-03-25T11:37:47.218Z" },
-    { url = "https://files.pythonhosted.org/packages/e0/df/3060d064e6dd6bdbf6898973ff6c2401b3978b90d711cd9d96665af95e73/pyrealsense2-2.57.7.10387-cp313-cp313-manylinux1_x86_64.whl", hash = "sha256:b98878f5e2b581819d669c11b9262b7313b007b6e4d42bc36d1dad22ce08ba28", size = 11615127, upload-time = "2026-03-25T11:38:52.842Z" },
-    { url = "https://files.pythonhosted.org/packages/97/dd/e35d4235e8ba8d0ac153cbf448de5b1a5009904cb98a3a4f412d91f61e67/pyrealsense2-2.57.7.10387-cp314-cp314-manylinux1_x86_64.whl", hash = "sha256:03ffe7cdc41fe5f8ca04e5d0c57f6a0be829e1a16e50c98fc557f31a7fd71651", size = 12061527, upload-time = "2026-03-25T11:39:38.124Z" },
-]
-
-[[package]]
 name = "pyserial"
 version = "3.5"
 source = { registry = "https://pypi.org/simple" }
@@ -1228,7 +1216,6 @@ dependencies = [
     { name = "fastapi", extra = ["standard"] },
     { name = "opencv-python-headless" },
     { name = "psutil" },
-    { name = "pyrealsense2", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "pyserial" },
 ]
 
@@ -1239,7 +1226,6 @@ requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = ">=0.136.0" },
     { name = "opencv-python-headless", specifier = ">=4.13.0.92" },
     { name = "psutil", specifier = ">=7.2.2" },
-    { name = "pyrealsense2", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=2.57.7.10387" },
     { name = "pyserial", specifier = ">=3.5" },
 ]
 

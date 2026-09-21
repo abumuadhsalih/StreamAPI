@@ -1,14 +1,14 @@
-# Project Scope: RealSense Stream API
+# Project Scope: ZED Stream API
 
 ## Overview
 
-An API server running on a Jetson Ubuntu VM to expose an Intel RealSense camera, a USB serial scale and the battery BMS over HTTP — enabling web and mobile clients on the same LAN to stream live video, capture images and read weight and battery state without needing GUI access.
+An API server running on a Jetson to expose a Stereolabs ZED 2i camera (RGB), a USB serial scale and the battery BMS over HTTP — enabling web and mobile clients on the same LAN to stream live video, capture images and read weight and battery state without needing GUI access.
 
 ## Architecture
 
 - **API server:** Runs directly on the Jetson Ubuntu VM (direct hardware access)
 - **Stack:** Python + FastAPI
-- **SDKs:** pyrealsense2 (camera), pyserial (scale), bleak (battery BMS over BLE)
+- **SDKs:** pyzed / ZED SDK (camera), pyserial (scale), bleak (battery BMS over BLE)
 - **Network:** Local network (LAN) only
 - **Clients:** Web browser frontend, mobile app
 
@@ -16,14 +16,14 @@ An API server running on a Jetson Ubuntu VM to expose an Intel RealSense camera,
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/stream` | GET | Live MJPEG stream of the RealSense RGB color feed |
+| `/stream` | GET | Live MJPEG stream of the ZED's left RGB view |
 | `/capture` | GET | Trigger a snapshot and return the image in the response body |
 | `/scale/stream` | GET | Live weight stream (SSE) |
 | `/scale/capture` | GET | Read current weight |
 | `/battery/capture` | GET | Read current battery state from the BMS (SoC, voltage, current, temperatures) |
 | `/health` | GET | Per-device status + last error |
 | `/system/stats` | GET | CPU / memory / disk / temperature / uptime |
-| `/camera/restart` | POST | Force a RealSense pipeline restart |
+| `/camera/restart` | POST | Force a ZED camera close+reopen |
 | `/scale/reconnect` | POST | Force the scale serial port to reopen |
 | `/system/reboot` | POST | Reboot the Jetson (admin-token guarded) |
 | `/system/restart-service` | POST | Restart the stream-api service (admin-token guarded) |
@@ -40,7 +40,8 @@ An API server running on a Jetson Ubuntu VM to expose an Intel RealSense camera,
 Items intentionally deferred — revisit if requirements evolve:
 
 - **Authentication** — token or API key to restrict stream/capture access
-- **Depth stream** — expose RealSense depth or IR data as an additional endpoint
+- **Depth stream** — expose ZED depth / point cloud as an additional endpoint (the camera is opened with `DEPTH_MODE.NONE`; enabling depth costs GPU time on every grab)
+- **Manual exposure / gain / white balance** — removed with the ZED 2i. The camera's ISP runs auto exposure and auto white balance behind its polarizer; the D435-era `?exposure_us=` / `?gain=` / `?white_balance=` params are gone and should not come back as "tuning"
 - **Frame rate / resolution** — configurable via query params (e.g. `?fps=30&width=1280`)
 - **Concurrency** — explicit multi-client stream management
 - **Image format** — PNG option for lossless captures
