@@ -160,7 +160,32 @@ if sys.platform == "linux":
     # Exposure, gain and white balance are left to the camera's own ISP
     # (AEC_AGC + WHITEBALANCE_AUTO). The D435 needed a hand-tuned 80 us manual
     # exposure to survive the tray's glare; the ZED 2i's polarizer and ISP take
-    # that over, so there are no sensor constants and no per-request overrides.
+    # that over, so there are no manual sensor values and no per-request
+    # overrides.
+    #
+    # BRIGHTNESS is the one exception, and it is NOT manual exposure: it is an
+    # ISP output control (0-8, SDK default 4) that shifts the rendered image
+    # while auto-exposure keeps running. Lower it for a darker-looking frame.
+    #
+    # It does NOT recover blown highlights. The first on-site ZED capture
+    # (2026-09-22) measured fish at L median 128 with 0.3% clipping — well
+    # exposed — while two vertical glare bands, the overhead fixtures mirrored
+    # off the steel, sat at 12-17% clipped. Those pixels are saturated at the
+    # sensor; dimming the ISP output maps them down but the detail is already
+    # gone. Glare is fixed by moving/diffusing the light or changing the angle
+    # between lamp, tray and lens (a polarizer works best at ~50-60 deg off the
+    # surface, and the camera currently looks almost straight down). This
+    # constant is for the look of the frame, not for the bands.
+    #
+    # Env-backed so an on-site A/B is a unit edit + restart, not a rebuild.
+    CAMERA_BRIGHTNESS = int(os.environ.get("STREAM_API_CAMERA_BRIGHTNESS", "4"))
+    if not 0 <= CAMERA_BRIGHTNESS <= 8:
+        logger.warning(
+            "STREAM_API_CAMERA_BRIGHTNESS=%s out of range 0-8, clamping",
+            CAMERA_BRIGHTNESS,
+        )
+        CAMERA_BRIGHTNESS = max(0, min(8, CAMERA_BRIGHTNESS))
+
     _zed = sl.Camera()
     _init = sl.InitParameters()
     _init.camera_resolution = sl.RESOLUTION.HD1080
@@ -180,11 +205,14 @@ if sys.platform == "linux":
         """Hand exposure/gain and white balance back to the camera's ISP.
 
         ISP settings can persist on the device between opens (ZED_Explorer or
-        a diagnostic run may have left a manual value behind), so this is set
-        explicitly rather than trusting the SDK defaults.
+        a diagnostic run may have left a manual value behind), so these are set
+        explicitly rather than trusting the SDK defaults. Runs after every
+        open, so a self-heal restores the same imaging as a cold start.
         """
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
+        _zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, CAMERA_BRIGHTNESS)
+        camera_status["brightness"] = CAMERA_BRIGHTNESS
 
     def _open_camera() -> bool:
         """(Re)open the ZED. Caller must hold _camera_lock."""

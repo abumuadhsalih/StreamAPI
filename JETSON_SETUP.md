@@ -503,6 +503,7 @@ Set these as `Environment=` lines in `/etc/systemd/system/stream-api.service` (v
 | `STREAM_API_SCALE_BAUD` | `9600` | 8-N-1 |
 | `STREAM_API_SCALE_UNIT` | `kg` | The DX11 transmits **no unit**; this is the assumed one |
 | `STREAM_API_SCALE_STREAM_INTERVAL` | `0.1` | SSE pacing, 10 Hz |
+| `STREAM_API_CAMERA_BRIGHTNESS` | `4` | ZED ISP brightness, 0-8. Lower = darker frame with auto-exposure still running. Does **not** recover blown glare — see ZED_MIGRATION.md |
 | `STREAM_API_BATTERY_ADDRESS` | `A5:C2:37:6E:94:70` | Change here when a pack is swapped |
 | `STREAM_API_BATTERY_POLL_INTERVAL` | `2.0` | Seconds |
 | `STREAM_API_SYSTEMCTL` | `/usr/bin/systemctl` | Only if systemctl lives elsewhere |
