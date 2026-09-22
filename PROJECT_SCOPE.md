@@ -24,6 +24,7 @@ An API server running on a Jetson to expose a Stereolabs ZED 2i camera (RGB), a 
 | `/health` | GET | Per-device status + last error |
 | `/system/stats` | GET | CPU / memory / disk / temperature / uptime |
 | `/camera/restart` | POST | Force a ZED camera close+reopen |
+| `/camera/brightness` | POST | Set the ZED ISP brightness 0-8 live (on-site A/B; resets to the env default on service restart) |
 | `/scale/reconnect` | POST | Force the scale serial port to reopen |
 | `/system/reboot` | POST | Reboot the Jetson (admin-token guarded) |
 | `/system/restart-service` | POST | Restart the stream-api service (admin-token guarded) |

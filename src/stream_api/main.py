@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 import serial
 import psutil
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 
@@ -177,7 +177,8 @@ if sys.platform == "linux":
     # surface, and the camera currently looks almost straight down). This
     # constant is for the look of the frame, not for the bands.
     #
-    # Env-backed so an on-site A/B is a unit edit + restart, not a rebuild.
+    # Env-backed so an on-site A/B is a unit edit + restart, not a rebuild, and
+    # settable per-request via POST /camera/brightness so it is not even that.
     CAMERA_BRIGHTNESS = int(os.environ.get("STREAM_API_CAMERA_BRIGHTNESS", "4"))
     if not 0 <= CAMERA_BRIGHTNESS <= 8:
         logger.warning(
@@ -185,6 +186,15 @@ if sys.platform == "linux":
             CAMERA_BRIGHTNESS,
         )
         CAMERA_BRIGHTNESS = max(0, min(8, CAMERA_BRIGHTNESS))
+
+    # The value actually in force. POST /camera/brightness moves it; every
+    # _open_camera() re-applies it. That is the whole point of keeping it here
+    # rather than re-reading the constant: on the D435, a per-request override
+    # was wiped by the next pipeline restart, so a USB hiccup nobody noticed
+    # silently reverted a hand-tuned value mid-session. Here a self-heal keeps
+    # what you set; only a service restart returns to the env/constant, which
+    # is deliberate — nothing you poked in while testing leaks into production.
+    _camera_brightness = CAMERA_BRIGHTNESS
 
     _zed = sl.Camera()
     _init = sl.InitParameters()
@@ -211,8 +221,8 @@ if sys.platform == "linux":
         """
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
-        _zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, CAMERA_BRIGHTNESS)
-        camera_status["brightness"] = CAMERA_BRIGHTNESS
+        _zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, _camera_brightness)
+        camera_status["brightness"] = _camera_brightness
 
     def _open_camera() -> bool:
         """(Re)open the ZED. Caller must hold _camera_lock."""
@@ -318,6 +328,21 @@ if sys.platform == "linux":
             _open_camera()
         return camera_status
 
+    def set_camera_brightness(value: int) -> dict:
+        """Apply ISP brightness now and keep it across reopens. 0-8, caller validates."""
+        global _camera_brightness
+        with _camera_lock:
+            _camera_brightness = value
+            if camera_status["ok"]:
+                try:
+                    _zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, value)
+                except Exception as e:
+                    logger.warning("failed to set brightness=%s: %s", value, e)
+                    return camera_status
+            camera_status["brightness"] = value
+        logger.info("camera brightness set to %s", value)
+        return camera_status
+
     @app.on_event("startup")
     def _camera_startup():
         with _camera_lock:
@@ -335,6 +360,11 @@ else:
 
     def restart_camera() -> dict:
         """No-op restart for local dev — returns the stub status."""
+        return camera_status
+
+    def set_camera_brightness(value: int) -> dict:
+        """Record the requested brightness so the stub answers like the real thing."""
+        camera_status["brightness"] = value
         return camera_status
 
     def _grab_frame():
@@ -1409,6 +1439,27 @@ def capture(preset: Preset = "fhd", enhance: bool = False):
 @app.post("/camera/restart", summary="Force a ZED camera close+reopen")
 def camera_restart():
     status = restart_camera()
+    return JSONResponse(
+        content={"camera": status},
+        status_code=200 if status["ok"] else 503,
+    )
+
+
+@app.post("/camera/brightness", summary="Set the ZED ISP brightness (on-site A/B)")
+def camera_brightness(value: int = Query(..., ge=0, le=8)):
+    """
+    ISP output brightness, 0-8 (SDK default 4). Auto-exposure keeps running —
+    this is not manual exposure, it only shifts the rendered frame.
+
+    For tuning without a redeploy: POST a value, GET /capture, compare. The
+    value survives a self-heal reopen but NOT a service restart, which returns
+    to STREAM_API_CAMERA_BRIGHTNESS. Set that env var in the unit to keep one.
+
+    It cannot recover blown highlights — specular glare saturates at the
+    sensor, so lowering this dims the whole frame without bringing the bands
+    back. See ZED_MIGRATION.md.
+    """
+    status = set_camera_brightness(value)
     return JSONResponse(
         content={"camera": status},
         status_code=200 if status["ok"] else 503,

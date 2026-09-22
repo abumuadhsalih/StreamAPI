@@ -551,7 +551,7 @@ curl -s localhost:8000/health
 `GET` — `/stream` (MJPEG), `/capture` (JPEG, `?preset=sd|hd|fhd`, `?enhance=true|false` — default `false`; exposure/gain/WB are the camera's own auto modes),
 `/scale/stream` (SSE), `/scale/capture`, `/battery/capture`, `/health`, `/system/stats`,
 `/docs` (Swagger).
-`POST` — `/camera/restart`, `/scale/reconnect`, `/system/reboot`, `/system/shutdown`,
+`POST` — `/camera/restart`, `/camera/brightness?value=0-8`, `/scale/reconnect`, `/system/reboot`, `/system/shutdown`,
 `/system/restart-service`.
 
 ---

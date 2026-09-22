@@ -154,25 +154,29 @@ curl -s localhost:8000/health
 
 ## 7b. Optional: A/B the image brightness
 
-`STREAM_API_CAMERA_BRIGHTNESS` (0-8, default 4 = the SDK default) is the ZED's ISP
-output brightness. Auto-exposure keeps running; the rendered frame just sits lower.
-No rebuild needed — run the service by hand with the value you want:
+ISP output brightness is 0-8, default 4 (the SDK default). Auto-exposure keeps
+running; the rendered frame just sits lower. Sweep it **live over the API** — no
+restart, no rebuild, service stays up:
 
 ```bash
-sudo systemctl stop stream-api
-cd /opt/stream-api
-STREAM_API_CAMERA_BRIGHTNESS=3 .venv/bin/stream-api
-# in another shell
-curl -s -o /tmp/b3.jpg localhost:8000/capture
-curl -s localhost:8000/health | python3 -m json.tool   # camera.brightness echoes the value
+for b in 4 3 2 1; do
+  curl -s -X POST "http://<jetson-ip>:8000/camera/brightness?value=$b" > /dev/null
+  curl -s -o b$b.jpg "http://<jetson-ip>:8000/capture"
+done
 ```
 
-Repeat for 4 (baseline) and 2, `scp` the three files out and compare them side by side.
-To keep a value, add it to the unit and restart:
+Run that from the dev machine and the four files land next to you, already named.
+`/health` echoes the value in force as `camera.brightness`.
+
+The value survives a self-heal reopen (a USB hiccup will not silently revert it) but
+**not** a service restart, which returns to `STREAM_API_CAMERA_BRIGHTNESS`. That is
+deliberate: nothing you poked in while testing leaks into production. To keep the value
+you settled on, put it in the unit:
 
 ```bash
 sudo systemctl edit --full stream-api      # add: Environment=STREAM_API_CAMERA_BRIGHTNESS=3
 sudo systemctl daemon-reload && sudo systemctl restart stream-api
+curl -s http://<jetson-ip>:8000/health | python3 -m json.tool   # confirm camera.brightness
 ```
 
 **It will not clear the glare bands.** Measured on the first on-site capture
