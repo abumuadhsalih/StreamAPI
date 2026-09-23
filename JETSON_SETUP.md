@@ -503,6 +503,8 @@ Set these as `Environment=` lines in `/etc/systemd/system/stream-api.service` (v
 | `STREAM_API_SCALE_BAUD` | `9600` | 8-N-1 |
 | `STREAM_API_SCALE_UNIT` | `kg` | The DX11 transmits **no unit**; this is the assumed one |
 | `STREAM_API_SCALE_STREAM_INTERVAL` | `0.1` | SSE pacing, 10 Hz |
+| `STREAM_API_ENHANCE` | `1` | Whether a param-less `/capture` gets CLAHE + shadow lift. `0` turns it off for every client |
+| `STREAM_API_CAMERA_CONTRAST` | `4` | ZED ISP contrast, 0-8. Raise for punch in-camera, before de-glare |
 | `STREAM_API_DEGLARE_STRENGTH` | `100` | Software de-glare, 0-100. `0` disables it for every client. Tune live with `POST /camera/deglare` |
 | `STREAM_API_DEGLARE_SIGMA` | `60` | De-glare radius in full-frame px. Larger = gentler; below ~40 it haloes the fish |
 | `STREAM_API_CROP` | `248,118,1830,986` | `/capture` tray crop box in full-frame coords. Empty disables it. Re-measure after any camera move — see ZED_MIGRATION.md |
@@ -551,10 +553,10 @@ curl -s localhost:8000/health
 
 ### Endpoints
 
-`GET` — `/stream` (MJPEG), `/capture` (JPEG, `?preset=sd|hd|fhd`, `?enhance=true|false` — default `false`, `?crop=true|false` — default `true`, tray only, `?deglare=true|false` — default `true`; exposure/gain/WB are the camera's own auto modes),
+`GET` — `/stream` (MJPEG), `/capture` (JPEG, `?preset=sd|hd|fhd`, `?crop=true|false` — default `true`, tray only, `?deglare=true|false` — default `true`, `?enhance=` defaults to the server setting (ships on); exposure/gain/WB are the camera's own auto modes),
 `/scale/stream` (SSE), `/scale/capture`, `/battery/capture`, `/health`, `/system/stats`,
 `/docs` (Swagger).
-`POST` — `/camera/restart`, `/camera/brightness?value=0-8`, `/camera/deglare?strength=&sigma=`, `/scale/reconnect`, `/system/reboot`, `/system/shutdown`,
+`POST` — `/camera/restart`, `/camera/brightness?value=&contrast=`, `/camera/deglare?strength=&sigma=`, `/camera/enhance?value=`, `/scale/reconnect`, `/system/reboot`, `/system/shutdown`,
 `/system/restart-service`.
 
 ---

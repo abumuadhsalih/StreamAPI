@@ -246,6 +246,36 @@ It cannot restore the small hard specular spots — those pixels are genuinely c
 the sensor. Fixing those is still a lighting job: move or diffuse the fixture, or tilt
 the camera off straight-down so the polarizer actually works (~50-60° off the surface).
 
+## 7e. The enhance default
+
+De-glare evens out the illumination, and that is also what removes contrast — the
+corrected frame is right but flat (measured: L std 30-34, only 65-71% of the tonal
+range). `enhance_for_text()` puts the contrast back and is **on by default** for the
+same reason as crop and de-glare: the mobile app and the AI pipeline send no query
+params, so the default is the only image they get.
+
+```bash
+curl -s -D - -o enh.jpg  "http://<jetson-ip>:8000/capture" | grep -i x-enhance
+curl -s -o flat.jpg      "http://<jetson-ip>:8000/capture?enhance=false"
+
+curl -X POST "http://<jetson-ip>:8000/camera/enhance?value=false"   # off for everyone
+```
+
+`X-Enhance-Gamma` / `X-Enhance-Median` report the lift chosen. A median far from 140
+with gamma pinned at 0.6 or 1.0 means the enhancer has run out of range — that is a
+signal to look at the exposure or the de-glare strength, not to retune the enhancer.
+
+**The in-camera alternative**, worth trying before leaning on software: raise the ZED's
+own contrast, which adds punch in the ISP *before* the de-glare pass.
+
+```bash
+curl -X POST "http://<jetson-ip>:8000/camera/brightness?contrast=6"
+curl -s -o c6.jpg "http://<jetson-ip>:8000/capture?enhance=false"
+```
+
+Both reset on restart; keep one with `Environment=STREAM_API_ENHANCE=` /
+`STREAM_API_CAMERA_CONTRAST=` in the unit.
+
 ## 8. What to bring back
 
 - A raw `/capture` and an `?enhance=true` capture under the **real** lights, ideally one
@@ -265,7 +295,9 @@ Bare `/capture` — what their AI pipeline fetches — changed twice:
 - it returns the **raw** auto-exposed frame instead of the enhanced one, and
 - it is now **cropped to the tray** (1582×868 for the current box) instead of the full
   1920×1080 frame, and
-- the light-strip reflections are **flattened** by a de-glare pass.
+- the light-strip reflections are **flattened** by a de-glare pass, and
+- it is **enhanced** again (CLAHE + shadow lift), which had been switched off earlier in
+  the ZED migration and is back on because de-glare flattens the frame.
 
 All three are improvements for the model, but they change the image it receives.
 `?crop=false`, `?deglare=false` and `?enhance=true` restore the old behaviour piece by

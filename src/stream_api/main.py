@@ -135,6 +135,26 @@ CROP_BOX = _parse_crop(os.environ.get("STREAM_API_CROP", _CROP_DEFAULT))
 # De-glare strength/radius in force. Constants here beside CROP_BOX because
 # camera_status reports both; the filter itself lives with the other image
 # processing further down, next to enhance_for_text().
+# enhance_for_text() is back ON by default (2026-09-23). It was switched off
+# when the D435 left, because the ZED's auto-exposure produced a well-exposed
+# frame that needed no lift — correct at the time. The de-glare pass then
+# changed the premise: evening out the illumination is also what removes
+# contrast, so the de-glared frame is correct but flat. Measured across both
+# on-site captures, de-glare leaves L median 107-114 and std 30-34 using only
+# 65-71% of the tonal range; enhance brings them to median 139 and std 43-46
+# at 75-80% of the range, with clipping still under 0.7%.
+#
+# Same reasoning as deglare for the default: the mobile app sends no query
+# params and the AI pipeline fetches bare /capture, so an opt-in flag would
+# never be passed. ?enhance=false gives a raw A/B frame, and POST
+# /camera/enhance flips the server default live — that endpoint exists because
+# this default was previously a bare code constant, which meant a redeploy to
+# change the one thing the params-less clients actually receive.
+ENHANCE_DEFAULT = os.environ.get("STREAM_API_ENHANCE", "1").strip().lower() not in (
+    "0", "false", "no", "off", ""
+)
+_enhance = {"default": ENHANCE_DEFAULT}
+
 DEGLARE_SIGMA = int(os.environ.get("STREAM_API_DEGLARE_SIGMA", "60"))
 DEGLARE_STRENGTH = int(os.environ.get("STREAM_API_DEGLARE_STRENGTH", "100"))
 _deglare = {
@@ -156,6 +176,8 @@ camera_status: dict = {
     "crop": list(CROP_BOX) if CROP_BOX else None,
     # Software de-glare in force; "strength": 0 means every client gets raw.
     "deglare": _deglare,
+    # Whether a param-less /capture gets enhance_for_text().
+    "enhance": _enhance,
 }
 # `port` is the device actually opened (discovery can pick it, so the configured
 # value is not always the answer) and `format` is the parser layer the last
@@ -235,24 +257,30 @@ if sys.platform == "linux":
     # surface, and the camera currently looks almost straight down). This
     # constant is for the look of the frame, not for the bands.
     #
+    # CONTRAST is the in-camera answer to the flatness the de-glare pass leaves
+    # behind: raising it adds punch in the ISP, BEFORE the software correction,
+    # which is cleaner than putting contrast back afterwards. Both are 0-8 with
+    # an SDK default of 4, so the shipped defaults change nothing on their own.
+    #
     # Env-backed so an on-site A/B is a unit edit + restart, not a rebuild, and
-    # settable per-request via POST /camera/brightness so it is not even that.
-    CAMERA_BRIGHTNESS = int(os.environ.get("STREAM_API_CAMERA_BRIGHTNESS", "4"))
-    if not 0 <= CAMERA_BRIGHTNESS <= 8:
-        logger.warning(
-            "STREAM_API_CAMERA_BRIGHTNESS=%s out of range 0-8, clamping",
-            CAMERA_BRIGHTNESS,
-        )
-        CAMERA_BRIGHTNESS = max(0, min(8, CAMERA_BRIGHTNESS))
+    # settable live via POST /camera/brightness so it is not even that.
+    def _isp_env(name: str) -> int:
+        raw = int(os.environ.get(name, "4"))
+        if not 0 <= raw <= 8:
+            logger.warning("%s=%s out of range 0-8, clamping", name, raw)
+        return max(0, min(8, raw))
 
-    # The value actually in force. POST /camera/brightness moves it; every
-    # _open_camera() re-applies it. That is the whole point of keeping it here
-    # rather than re-reading the constant: on the D435, a per-request override
-    # was wiped by the next pipeline restart, so a USB hiccup nobody noticed
-    # silently reverted a hand-tuned value mid-session. Here a self-heal keeps
-    # what you set; only a service restart returns to the env/constant, which
-    # is deliberate — nothing you poked in while testing leaks into production.
-    _camera_brightness = CAMERA_BRIGHTNESS
+    CAMERA_BRIGHTNESS = _isp_env("STREAM_API_CAMERA_BRIGHTNESS")
+    CAMERA_CONTRAST = _isp_env("STREAM_API_CAMERA_CONTRAST")
+
+    # The values actually in force. POST /camera/brightness moves them; every
+    # _open_camera() re-applies them. That is the whole point of keeping them
+    # here rather than re-reading the constants: on the D435, a per-request
+    # override was wiped by the next pipeline restart, so a USB hiccup nobody
+    # noticed silently reverted a hand-tuned value mid-session. Here a self-heal
+    # keeps what you set; only a service restart returns to the env/constants,
+    # which is deliberate — nothing poked in while testing leaks into production.
+    _isp = {"brightness": CAMERA_BRIGHTNESS, "contrast": CAMERA_CONTRAST}
 
     _zed = sl.Camera()
     _init = sl.InitParameters()
@@ -279,8 +307,10 @@ if sys.platform == "linux":
         """
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
-        _zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, _camera_brightness)
-        camera_status["brightness"] = _camera_brightness
+        _zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, _isp["brightness"])
+        _zed.set_camera_settings(sl.VIDEO_SETTINGS.CONTRAST, _isp["contrast"])
+        camera_status["brightness"] = _isp["brightness"]
+        camera_status["contrast"] = _isp["contrast"]
 
     def _open_camera() -> bool:
         """(Re)open the ZED. Caller must hold _camera_lock."""
@@ -386,19 +416,31 @@ if sys.platform == "linux":
             _open_camera()
         return camera_status
 
-    def set_camera_brightness(value: int) -> dict:
-        """Apply ISP brightness now and keep it across reopens. 0-8, caller validates."""
-        global _camera_brightness
+    _ISP_SETTINGS = {
+        "brightness": "BRIGHTNESS",
+        "contrast": "CONTRAST",
+    }
+
+    def set_camera_isp(**values: Optional[int]) -> dict:
+        """Apply ISP values now and keep them across reopens. 0-8, caller validates.
+
+        Accepts any subset of _ISP_SETTINGS; None means "leave alone".
+        """
         with _camera_lock:
-            _camera_brightness = value
-            if camera_status["ok"]:
-                try:
-                    _zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, value)
-                except Exception as e:
-                    logger.warning("failed to set brightness=%s: %s", value, e)
-                    return camera_status
-            camera_status["brightness"] = value
-        logger.info("camera brightness set to %s", value)
+            for key, value in values.items():
+                if value is None:
+                    continue
+                _isp[key] = value
+                if camera_status["ok"]:
+                    try:
+                        _zed.set_camera_settings(
+                            getattr(sl.VIDEO_SETTINGS, _ISP_SETTINGS[key]), value
+                        )
+                    except Exception as e:
+                        logger.warning("failed to set %s=%s: %s", key, value, e)
+                        continue
+                camera_status[key] = value
+        logger.info("camera ISP now %s", _isp)
         return camera_status
 
     @app.on_event("startup")
@@ -420,9 +462,11 @@ else:
         """No-op restart for local dev — returns the stub status."""
         return camera_status
 
-    def set_camera_brightness(value: int) -> dict:
-        """Record the requested brightness so the stub answers like the real thing."""
-        camera_status["brightness"] = value
+    def set_camera_isp(**values: Optional[int]) -> dict:
+        """Record the requested ISP values so the stub answers like the real thing."""
+        for key, value in values.items():
+            if value is not None:
+                camera_status[key] = value
         return camera_status
 
     def _grab_frame():
@@ -1517,11 +1561,17 @@ def stream(preset: Preset = "fhd"):
 @app.get("/capture", summary="Capture a single JPEG image")
 def capture(
     preset: Preset = "fhd",
-    enhance: bool = False,
+    enhance: Optional[bool] = None,
     crop: bool = True,
     deglare: bool = True,
 ):
     """
+    enhance:  CLAHE + adaptive gamma lift + unsharp. Unset follows the server
+              default (POST /camera/enhance, STREAM_API_ENHANCE), which ships
+              ON because the de-glare pass evens out the illumination and so
+              flattens the frame. Pass ?enhance=false for a single flat A/B
+              frame. The lift chosen is reported in X-Enhance-Gamma /
+              X-Enhance-Median.
     deglare:  default true — flatten the specular bands the overhead lights
               throw across the tray. On by default because the mobile app and
               the AI pipeline send no query params, so the default is the only
@@ -1533,11 +1583,6 @@ def capture(
               clutter for the AI client, which fetches bare /capture. Pass
               ?crop=false for the full frame, which is what you want when
               re-aiming the camera or checking the box is still right.
-    enhance:  default false — the ZED's ISP auto-exposes, so the raw frame is
-              the AI-ready image and bare /capture returns it untouched. Pass
-              ?enhance=true for CLAHE + adaptive gamma lift + unsharp (A/B, or
-              rescuing a dark scene); the lift chosen is reported in
-              X-Enhance-Gamma / X-Enhance-Median.
     preset:   uncropped, this resizes to the preset's exact dimensions, as it
               always has. Cropped, it is applied as the preset's scale factor
               (fhd 1.0, hd 2/3, sd 1/3) so the tray keeps its aspect ratio and
@@ -1576,7 +1621,7 @@ def capture(
                                      if crop and CROP_BOX else image.shape[1] / CAPTURE_WIDTH)
         image = reduce_glare(image, max(2.0, sigma), _deglare["strength"] / 100.0)
         headers["X-Deglare"] = f"{_deglare['strength']},{_deglare['sigma']}"
-    if enhance:
+    if _enhance["default"] if enhance is None else enhance:
         stats: dict = {}
         image = enhance_for_text(image, stats)
         # Surface what the adaptive lift did so an on-site A/B needs no guesswork.
@@ -1593,6 +1638,20 @@ def camera_restart():
         content={"camera": status},
         status_code=200 if status["ok"] else 503,
     )
+
+
+@app.post("/camera/enhance", summary="Flip the /capture enhance default live")
+def camera_enhance(value: bool = Query(...)):
+    """
+    Sets what a param-less /capture returns — which is the only thing the
+    mobile app and the AI pipeline can receive, since neither sends query
+    params. ?enhance= on a single request still overrides it either way.
+
+    Resets to STREAM_API_ENHANCE on service restart.
+    """
+    _enhance["default"] = value
+    logger.info("capture enhance default set to %s", value)
+    return {"enhance": dict(_enhance)}
 
 
 @app.post("/camera/deglare", summary="Tune the de-glare pass live (on-site A/B)")
@@ -1620,21 +1679,29 @@ def camera_deglare(
     return {"deglare": dict(_deglare)}
 
 
-@app.post("/camera/brightness", summary="Set the ZED ISP brightness (on-site A/B)")
-def camera_brightness(value: int = Query(..., ge=0, le=8)):
+@app.post("/camera/brightness", summary="Set the ZED ISP brightness/contrast (on-site A/B)")
+def camera_brightness(
+    value: Optional[int] = Query(None, ge=0, le=8),
+    contrast: Optional[int] = Query(None, ge=0, le=8),
+):
     """
-    ISP output brightness, 0-8 (SDK default 4). Auto-exposure keeps running —
-    this is not manual exposure, it only shifts the rendered frame.
+    value:    ISP output brightness, 0-8 (SDK default 4).
+    contrast: ISP contrast, 0-8 (SDK default 4). Raising this is the in-camera
+              answer to the flatness the de-glare pass leaves behind — it adds
+              punch before the software correction rather than after it.
 
-    For tuning without a redeploy: POST a value, GET /capture, compare. The
-    value survives a self-heal reopen but NOT a service restart, which returns
-    to STREAM_API_CAMERA_BRIGHTNESS. Set that env var in the unit to keep one.
+    Neither is manual exposure; auto-exposure and auto-WB keep running. Omitted
+    values are left alone.
 
-    It cannot recover blown highlights — specular glare saturates at the
-    sensor, so lowering this dims the whole frame without bringing the bands
+    For tuning without a redeploy: POST a value, GET /capture, compare. Values
+    survive a self-heal reopen but NOT a service restart, which returns to
+    STREAM_API_CAMERA_BRIGHTNESS / _CONTRAST. Set those in the unit to keep one.
+
+    Brightness cannot recover blown highlights — specular glare saturates at
+    the sensor, so lowering it dims the whole frame without bringing the bands
     back. See ZED_MIGRATION.md.
     """
-    status = set_camera_brightness(value)
+    status = set_camera_isp(brightness=value, contrast=contrast)
     return JSONResponse(
         content={"camera": status},
         status_code=200 if status["ok"] else 503,
