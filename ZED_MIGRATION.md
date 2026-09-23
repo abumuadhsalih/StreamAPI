@@ -211,6 +211,41 @@ sudo systemctl daemon-reload && sudo systemctl restart stream-api
 
 `/stream` is never cropped, so use it in a browser while re-aiming the camera.
 
+## 7d. Tune the de-glare pass
+
+`/capture` flattens the light-strip reflections by default — **on by default because
+the mobile app and the AI pipeline send no query params**, so the default is the only
+image they can get. Tune it live from the Jetson, no restart:
+
+```bash
+# A/B against the raw frame
+curl -s -o raw.jpg     "http://<jetson-ip>:8000/capture?deglare=false"
+curl -s -o deglared.jpg "http://<jetson-ip>:8000/capture"
+
+# gentler correction, or a wider radius
+curl -s -X POST "http://<jetson-ip>:8000/camera/deglare?strength=60"
+curl -s -X POST "http://<jetson-ip>:8000/camera/deglare?strength=100&sigma=80"
+curl -s -X POST "http://<jetson-ip>:8000/camera/deglare?strength=0"     # off for everyone
+```
+
+`strength` 0-100 blends against the original; `sigma` is the illumination radius in
+full-frame pixels — larger is gentler, and **below about 40 the blur starts to see the
+fish themselves and leaves halos**. The `X-Deglare` header on every capture reports
+`strength,sigma`, and `/health` shows `camera.deglare`.
+
+To keep a setting, put it in the unit (values reset on service restart):
+
+```bash
+sudo systemctl edit --full stream-api
+#   Environment=STREAM_API_DEGLARE_STRENGTH=100
+#   Environment=STREAM_API_DEGLARE_SIGMA=60
+sudo systemctl daemon-reload && sudo systemctl restart stream-api
+```
+
+It cannot restore the small hard specular spots — those pixels are genuinely clipped at
+the sensor. Fixing those is still a lighting job: move or diffuse the fixture, or tilt
+the camera off straight-down so the polarizer actually works (~50-60° off the surface).
+
 ## 8. What to bring back
 
 - A raw `/capture` and an `?enhance=true` capture under the **real** lights, ideally one
@@ -220,6 +255,7 @@ sudo systemctl daemon-reload && sudo systemctl restart stream-api
   built-in lever is `AEC_AGC_ROI` (meter only on the tray region).
 - Whichever `STREAM_API_CAMERA_BRIGHTNESS` you settle on, and the captures that decided it.
 - The `STREAM_API_CROP` box if you had to re-measure it, plus a `?crop=false` full frame so the next person can re-derive it.
+- The `deglare` strength/sigma you settled on, with a `?deglare=false` frame alongside a default one.
 - The `nv_tegra_release` and `/usr/local/zed/version` strings, for JETSON_SETUP.md.
 
 ## 9. Tell the client
@@ -228,10 +264,12 @@ Bare `/capture` — what their AI pipeline fetches — changed twice:
 
 - it returns the **raw** auto-exposed frame instead of the enhanced one, and
 - it is now **cropped to the tray** (1582×868 for the current box) instead of the full
-  1920×1080 frame.
+  1920×1080 frame, and
+- the light-strip reflections are **flattened** by a de-glare pass.
 
-Both are improvements for the model, but they change the image it receives. `?crop=false`
-and `?enhance=true` restore the old behaviour piece by piece if they need to stage it.
+All three are improvements for the model, but they change the image it receives.
+`?crop=false`, `?deglare=false` and `?enhance=true` restore the old behaviour piece by
+piece if they need to stage it.
 
 ---
 

@@ -17,7 +17,7 @@ An API server running on a Jetson to expose a Stereolabs ZED 2i camera (RGB), a 
 | Endpoint | Method | Description |
 |---|---|---|
 | `/stream` | GET | Live MJPEG stream of the ZED's left RGB view |
-| `/capture` | GET | Trigger a snapshot and return the image in the response body, cropped to the tray (`?crop=false` for the full frame) |
+| `/capture` | GET | Trigger a snapshot and return the image in the response body, cropped to the tray and de-glared (`?crop=false` / `?deglare=false` for the raw frame) |
 | `/scale/stream` | GET | Live weight stream (SSE) |
 | `/scale/capture` | GET | Read current weight |
 | `/battery/capture` | GET | Read current battery state from the BMS (SoC, voltage, current, temperatures) |
@@ -25,6 +25,7 @@ An API server running on a Jetson to expose a Stereolabs ZED 2i camera (RGB), a 
 | `/system/stats` | GET | CPU / memory / disk / temperature / uptime |
 | `/camera/restart` | POST | Force a ZED camera close+reopen |
 | `/camera/brightness` | POST | Set the ZED ISP brightness 0-8 live (on-site A/B; resets to the env default on service restart) |
+| `/camera/deglare` | POST | Tune the de-glare pass live (`strength` 0-100, `sigma` 10-300); same reset-on-restart rule |
 | `/scale/reconnect` | POST | Force the scale serial port to reopen |
 | `/system/reboot` | POST | Reboot the Jetson (admin-token guarded) |
 | `/system/restart-service` | POST | Restart the stream-api service (admin-token guarded) |

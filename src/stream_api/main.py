@@ -132,6 +132,16 @@ def _parse_crop(spec: str):
 
 CROP_BOX = _parse_crop(os.environ.get("STREAM_API_CROP", _CROP_DEFAULT))
 
+# De-glare strength/radius in force. Constants here beside CROP_BOX because
+# camera_status reports both; the filter itself lives with the other image
+# processing further down, next to enhance_for_text().
+DEGLARE_SIGMA = int(os.environ.get("STREAM_API_DEGLARE_SIGMA", "60"))
+DEGLARE_STRENGTH = int(os.environ.get("STREAM_API_DEGLARE_STRENGTH", "100"))
+_deglare = {
+    "sigma": max(10, min(300, DEGLARE_SIGMA)),
+    "strength": max(0, min(100, DEGLARE_STRENGTH)),
+}
+
 
 # ---------------------------------------------------------------------------
 # Hardware status — surfaced via /health and used to short-circuit endpoints
@@ -144,6 +154,8 @@ camera_status: dict = {
     # The /capture crop box in full-frame coordinates, or null when disabled —
     # a stale box after the camera is moved is otherwise invisible.
     "crop": list(CROP_BOX) if CROP_BOX else None,
+    # Software de-glare in force; "strength": 0 means every client gets raw.
+    "deglare": _deglare,
 }
 # `port` is the device actually opened (discovery can pick it, so the configured
 # value is not always the answer) and `format` is the parser layer the last
@@ -1352,6 +1364,53 @@ def system_stats():
 # Camera endpoints
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# De-glare — on by default, because the clients that matter cannot ask for it
+# ---------------------------------------------------------------------------
+#
+# The overhead light strips mirror off the polished tray as bright vertical
+# bands. The camera's polarizer does not clear them at this geometry (a
+# polarizer works best at ~50-60 deg off the surface; the camera looks almost
+# straight down), so they arrive in the frame and drag auto-exposure down with
+# them — measured 2026-09-23, the clean tray sat at L median 86 while the worst
+# band sat at 222 with 37% of it above 250.
+#
+# They are recoverable because they are NOT hard-clipped: no pixel reached 255
+# in luminance and only ~20% of the worst band had even one channel maxed, so
+# the grid lines stay readable through the glare. A band is a smooth,
+# low-frequency brightness field laid over the tray, so estimating that field
+# with a large blur and dividing it out removes it while leaving the texture.
+# On that capture the worst band went 222 -> 156 with nothing left above 250,
+# and the clean tray came UP 86 -> 109 — the correction evens the illumination
+# rather than just darkening. Checked for halos around the fish: none at
+# sigma 60, which is well above fish-sized detail. The residual hard specular
+# spots are the genuinely clipped ~20% and no amount of processing returns
+# those; the fix for them is at the lamp, not here.
+#
+# DEFAULT ON, unlike enhance_for_text(). The mobile app sends no query params
+# and the AI pipeline fetches bare /capture, so anything those two need has to
+# be the default — an opt-in flag would simply never be passed. ?deglare=false
+# is there for an A/B, and POST /camera/deglare tunes it live from the Jetson
+# without a restart, same as the brightness endpoint.
+def reduce_glare(image: np.ndarray, sigma: float, strength: float) -> np.ndarray:
+    """Flatten the specular bands by dividing out a blurred illumination estimate.
+
+    `strength` is 0.0-1.0 and blends against the original, so a half-measure is
+    possible when a full correction looks too flat. Works on L only; the colour
+    channels are untouched, which is what keeps the fish looking like fish.
+    """
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    L = lab[:, :, 0].astype(np.float32)
+    illum = cv2.GaussianBlur(L, (0, 0), sigma)
+    # Renormalise to the scene's own median so the frame keeps its overall
+    # brightness instead of drifting with the size of the glare.
+    flat = L / np.maximum(illum, 1.0) * float(np.median(illum))
+    if strength < 1.0:
+        flat = L + strength * (flat - L)
+    lab[:, :, 0] = np.clip(flat, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
 # enhance_for_text() is opt-in (?enhance=true). It was the default while the
 # D435 was held at a short 80 µs manual exposure to keep the tray's glare bands
 # recoverable — the raw frame was dark on purpose, worst at 4-6am with no
@@ -1456,8 +1515,19 @@ def stream(preset: Preset = "fhd"):
 
 
 @app.get("/capture", summary="Capture a single JPEG image")
-def capture(preset: Preset = "fhd", enhance: bool = False, crop: bool = True):
+def capture(
+    preset: Preset = "fhd",
+    enhance: bool = False,
+    crop: bool = True,
+    deglare: bool = True,
+):
     """
+    deglare:  default true — flatten the specular bands the overhead lights
+              throw across the tray. On by default because the mobile app and
+              the AI pipeline send no query params, so the default is the only
+              image they can get. Tune or disable it live with
+              POST /camera/deglare; pass ?deglare=false for a single raw A/B
+              frame. Reported in X-Deglare.
     crop:     default true — cut to the inspection tray (CROP_BOX, reported in
               the X-Crop header and in /health). Everything outside the tray is
               clutter for the AI client, which fetches bare /capture. Pass
@@ -1497,6 +1567,15 @@ def capture(preset: Preset = "fhd", enhance: bool = False, crop: bool = True):
                 (max(1, round(image.shape[1] * scale)), max(1, round(image.shape[0] * scale))),
                 interpolation=cv2.INTER_AREA,
             )
+    if deglare and _deglare["strength"] > 0:
+        # After the geometry, so sigma scales with the preset and the correction
+        # looks the same whatever size was asked for. Before enhance, so the
+        # adaptive lift measures an already-even frame rather than one whose
+        # median is being dragged around by the glare.
+        sigma = _deglare["sigma"] * (image.shape[1] / (CROP_BOX[2] - CROP_BOX[0])
+                                     if crop and CROP_BOX else image.shape[1] / CAPTURE_WIDTH)
+        image = reduce_glare(image, max(2.0, sigma), _deglare["strength"] / 100.0)
+        headers["X-Deglare"] = f"{_deglare['strength']},{_deglare['sigma']}"
     if enhance:
         stats: dict = {}
         image = enhance_for_text(image, stats)
@@ -1514,6 +1593,31 @@ def camera_restart():
         content={"camera": status},
         status_code=200 if status["ok"] else 503,
     )
+
+
+@app.post("/camera/deglare", summary="Tune the de-glare pass live (on-site A/B)")
+def camera_deglare(
+    strength: Optional[int] = Query(None, ge=0, le=100),
+    sigma: Optional[int] = Query(None, ge=10, le=300),
+):
+    """
+    strength: 0-100. 0 disables de-glare for every client; 100 is a full
+              correction. Lower it if the flattened tray looks too even.
+    sigma:    radius of the illumination estimate, in full-frame pixels.
+              Larger = gentler and only touches the broadest bands; smaller =
+              stronger, but below ~40 it starts to see the fish themselves and
+              can leave halos. 60 is the measured default.
+
+    Omitted values are left alone. Survives nothing but the process — a service
+    restart returns to STREAM_API_DEGLARE_STRENGTH / _SIGMA, so set those in
+    the unit to keep a value.
+    """
+    if strength is not None:
+        _deglare["strength"] = strength
+    if sigma is not None:
+        _deglare["sigma"] = sigma
+    logger.info("deglare set to strength=%(strength)s sigma=%(sigma)s", _deglare)
+    return {"deglare": dict(_deglare)}
 
 
 @app.post("/camera/brightness", summary="Set the ZED ISP brightness (on-site A/B)")

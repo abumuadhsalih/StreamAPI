@@ -7,7 +7,7 @@ A FastAPI server that exposes a Stereolabs ZED 2i camera (RGB), a USB serial sca
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/stream` | Live MJPEG color stream |
-| GET | `/capture` | Capture and return a single JPEG image, cropped to the tray (`?crop=false` for the full frame, `?enhance=true` for CLAHE + shadow lift) |
+| GET | `/capture` | Capture and return a single JPEG image — cropped to the tray and de-glared (`?crop=false`, `?deglare=false`, `?enhance=true`) |
 | GET | `/scale/stream` | Live weight stream (SSE) — see `SCALE_API.md` |
 | GET | `/scale/capture` | Read current weight — see `SCALE_API.md` |
 | GET | `/battery/capture` | Read current battery state from the BMS |
