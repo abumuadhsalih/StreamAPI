@@ -7,9 +7,9 @@ A FastAPI server that exposes a Stereolabs ZED 2i camera (RGB), a USB serial sca
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/stream` | Live MJPEG color stream |
-| GET | `/capture` | Capture and return a single JPEG image (raw auto-exposed frame; `?enhance=true` for CLAHE + shadow lift) |
-| GET | `/scale/stream` | Live weight stream (SSE) |
-| GET | `/scale/capture` | Read current weight |
+| GET | `/capture` | Capture and return a single JPEG image, cropped to the tray (`?crop=false` for the full frame, `?enhance=true` for CLAHE + shadow lift) |
+| GET | `/scale/stream` | Live weight stream (SSE) — see `SCALE_API.md` |
+| GET | `/scale/capture` | Read current weight — see `SCALE_API.md` |
 | GET | `/battery/capture` | Read current battery state from the BMS |
 | GET | `/health` | Per-device status + last error |
 | GET | `/docs` | Interactive API documentation (Swagger UI) |
@@ -123,7 +123,7 @@ uv run stream-api
 The API will be accessible from any device on the same LAN:
 
 - Stream: `http://<jetson-ip>:8000/stream`
-- Capture: `http://<jetson-ip>:8000/capture` (enhanced: `http://<jetson-ip>:8000/capture?enhance=true`)
+- Capture: `http://<jetson-ip>:8000/capture` (full frame: `?crop=false`; enhanced: `?enhance=true`)
 - Docs: `http://<jetson-ip>:8000/docs`
 
 > To find the Jetson's IP: `hostname -I | awk '{print $1}'`

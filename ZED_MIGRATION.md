@@ -188,6 +188,29 @@ moving or diffusing the light fixture, or by changing the angle between lamp, tr
 lens (a polarizer works best at roughly 50-60° off the surface; the camera currently
 looks almost straight down). Use this setting for the look of the frame, nothing more.
 
+## 7c. Check the tray crop box
+
+`/capture` returns **only the tray** by default. The box is in full-frame coordinates,
+measured from a real capture on 2026-09-23, and it is **mount-specific** — if the camera
+has been nudged or re-hung since, the crop is wrong and nothing will shout about it.
+
+```bash
+curl -s -D - -o cropped.jpg "http://<jetson-ip>:8000/capture" | grep -i x-crop
+curl -s -o full.jpg "http://<jetson-ip>:8000/capture?crop=false"
+curl -s http://<jetson-ip>:8000/health | python3 -m json.tool   # camera.crop
+```
+
+Open both. `cropped.jpg` should be the tray and nothing else — no floor, no baskets, no
+feet — with no fish touching an edge. If it is off, re-measure against `full.jpg` and set
+the box in the unit (empty value disables cropping entirely):
+
+```bash
+sudo systemctl edit --full stream-api   # add: Environment=STREAM_API_CROP=248,118,1830,986
+sudo systemctl daemon-reload && sudo systemctl restart stream-api
+```
+
+`/stream` is never cropped, so use it in a browser while re-aiming the camera.
+
 ## 8. What to bring back
 
 - A raw `/capture` and an `?enhance=true` capture under the **real** lights, ideally one
@@ -196,12 +219,19 @@ looks almost straight down). Use this setting for the look of the frame, nothing
 - If the fish come out dark: do **not** reach for manual exposure — note it. The next
   built-in lever is `AEC_AGC_ROI` (meter only on the tray region).
 - Whichever `STREAM_API_CAMERA_BRIGHTNESS` you settle on, and the captures that decided it.
+- The `STREAM_API_CROP` box if you had to re-measure it, plus a `?crop=false` full frame so the next person can re-derive it.
 - The `nv_tegra_release` and `/usr/local/zed/version` strings, for JETSON_SETUP.md.
 
 ## 9. Tell the client
 
-Bare `/capture` — what their AI pipeline fetches — now returns the **raw** auto-exposed
-frame instead of the enhanced one. They should hear that before they see it in production.
+Bare `/capture` — what their AI pipeline fetches — changed twice:
+
+- it returns the **raw** auto-exposed frame instead of the enhanced one, and
+- it is now **cropped to the tray** (1582×868 for the current box) instead of the full
+  1920×1080 frame.
+
+Both are improvements for the model, but they change the image it receives. `?crop=false`
+and `?enhance=true` restore the old behaviour piece by piece if they need to stage it.
 
 ---
 

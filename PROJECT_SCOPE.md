@@ -17,7 +17,7 @@ An API server running on a Jetson to expose a Stereolabs ZED 2i camera (RGB), a 
 | Endpoint | Method | Description |
 |---|---|---|
 | `/stream` | GET | Live MJPEG stream of the ZED's left RGB view |
-| `/capture` | GET | Trigger a snapshot and return the image in the response body |
+| `/capture` | GET | Trigger a snapshot and return the image in the response body, cropped to the tray (`?crop=false` for the full frame) |
 | `/scale/stream` | GET | Live weight stream (SSE) |
 | `/scale/capture` | GET | Read current weight |
 | `/battery/capture` | GET | Read current battery state from the BMS (SoC, voltage, current, temperatures) |

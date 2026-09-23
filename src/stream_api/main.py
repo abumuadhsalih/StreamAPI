@@ -93,12 +93,58 @@ RESOLUTIONS: dict[str, tuple[int, int]] = {
 CAPTURE_WIDTH, CAPTURE_HEIGHT = RESOLUTIONS["fhd"]
 Preset = Literal["sd", "hd", "fhd"]
 
+# /capture crops to the inspection tray by default. The ZED's 110-deg FOV puts
+# a third to a half of every frame outside the tray — floor, fish baskets,
+# whoever is standing there — and the client's AI pipeline fetches bare
+# /capture, so that clutter was going straight to the model. Cropping also
+# roughly doubles the pixels-per-fish at the same output size.
+#
+# Box measured on the 2026-09-23 on-site capture by mapping the tray's steel
+# edges across the frame: the whole tray including its rim, with the worst-case
+# edge taken on each side, which clears the basket at the top and a foot at the
+# top right. It is in FULL-FRAME (1920x1080) coordinates.
+#
+# This is mount-specific — nudge the camera or change its height and the box is
+# wrong, silently. Hence STREAM_API_CROP (x1,y1,x2,y2, or empty to disable),
+# the X-Crop response header on every cropped capture, and camera.crop in
+# /health: three places to notice a stale box without guessing. /stream is
+# deliberately NOT cropped, so it stays the full-scene view you re-aim against.
+_CROP_DEFAULT = "248,118,1830,986"
+
+
+def _parse_crop(spec: str):
+    """Parse 'x1,y1,x2,y2' into a clamped box, or None if empty/invalid."""
+    spec = spec.strip()
+    if not spec:
+        return None
+    try:
+        x1, y1, x2, y2 = (int(v) for v in spec.split(","))
+    except ValueError:
+        logger.warning("STREAM_API_CROP=%r is not 'x1,y1,x2,y2' — crop disabled", spec)
+        return None
+    x1, x2 = max(0, min(x1, x2)), min(CAPTURE_WIDTH, max(x1, x2))
+    y1, y2 = max(0, min(y1, y2)), min(CAPTURE_HEIGHT, max(y1, y2))
+    if x2 - x1 < 16 or y2 - y1 < 16:
+        logger.warning("STREAM_API_CROP=%r is degenerate — crop disabled", spec)
+        return None
+    return (x1, y1, x2, y2)
+
+
+CROP_BOX = _parse_crop(os.environ.get("STREAM_API_CROP", _CROP_DEFAULT))
+
 
 # ---------------------------------------------------------------------------
 # Hardware status — surfaced via /health and used to short-circuit endpoints
 # ---------------------------------------------------------------------------
 
-camera_status: dict = {"ok": False, "error": "not yet started", "mode": "real"}
+camera_status: dict = {
+    "ok": False,
+    "error": "not yet started",
+    "mode": "real",
+    # The /capture crop box in full-frame coordinates, or null when disabled —
+    # a stale box after the camera is moved is otherwise invisible.
+    "crop": list(CROP_BOX) if CROP_BOX else None,
+}
 # `port` is the device actually opened (discovery can pick it, so the configured
 # value is not always the answer) and `format` is the parser layer the last
 # frame matched — both are diagnostics for /health, neither drives the 503.
@@ -373,7 +419,7 @@ else:
         cv2.putText(
             frame,
             "ZED 2i not available (stub)",
-            (60, CAPTURE_HEIGHT // 2),
+            (300, CAPTURE_HEIGHT // 2),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.5,
             (255, 255, 255),
@@ -1410,22 +1456,47 @@ def stream(preset: Preset = "fhd"):
 
 
 @app.get("/capture", summary="Capture a single JPEG image")
-def capture(preset: Preset = "fhd", enhance: bool = False):
+def capture(preset: Preset = "fhd", enhance: bool = False, crop: bool = True):
     """
+    crop:     default true — cut to the inspection tray (CROP_BOX, reported in
+              the X-Crop header and in /health). Everything outside the tray is
+              clutter for the AI client, which fetches bare /capture. Pass
+              ?crop=false for the full frame, which is what you want when
+              re-aiming the camera or checking the box is still right.
     enhance:  default false — the ZED's ISP auto-exposes, so the raw frame is
-              the AI-ready image and bare /capture (what the AI client fetches)
-              returns it untouched. Pass ?enhance=true for CLAHE + adaptive
-              gamma lift + unsharp (A/B, or rescuing a dark scene); the lift
-              chosen is reported in X-Enhance-Gamma / X-Enhance-Median.
+              the AI-ready image and bare /capture returns it untouched. Pass
+              ?enhance=true for CLAHE + adaptive gamma lift + unsharp (A/B, or
+              rescuing a dark scene); the lift chosen is reported in
+              X-Enhance-Gamma / X-Enhance-Median.
+    preset:   uncropped, this resizes to the preset's exact dimensions, as it
+              always has. Cropped, it is applied as the preset's scale factor
+              (fhd 1.0, hd 2/3, sd 1/3) so the tray keeps its aspect ratio and
+              the default fhd capture is never resampled at all.
     """
-    width, height = RESOLUTIONS[preset]
-    image = get_color_frame(width, height)
+    if crop and CROP_BOX:
+        # Crop from the full-resolution frame, then scale — cropping a frame
+        # that was already downscaled to the preset would throw away the
+        # resolution the crop exists to preserve.
+        image = get_color_frame(CAPTURE_WIDTH, CAPTURE_HEIGHT)
+    else:
+        image = get_color_frame(*RESOLUTIONS[preset])
     if image is None:
         return JSONResponse(
             content={"error": "camera not available", "detail": camera_status["error"]},
             status_code=503,
         )
     headers: dict[str, str] = {}
+    if crop and CROP_BOX:
+        x1, y1, x2, y2 = CROP_BOX
+        image = image[y1:y2, x1:x2]
+        headers["X-Crop"] = f"{x1},{y1},{x2},{y2}"
+        scale = RESOLUTIONS[preset][0] / CAPTURE_WIDTH
+        if scale != 1.0:
+            image = cv2.resize(
+                image,
+                (max(1, round(image.shape[1] * scale)), max(1, round(image.shape[0] * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
     if enhance:
         stats: dict = {}
         image = enhance_for_text(image, stats)
