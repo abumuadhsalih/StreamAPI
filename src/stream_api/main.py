@@ -112,20 +112,24 @@ Preset = Literal["sd", "hd", "fhd"]
 _CROP_DEFAULT = "248,118,1830,986"
 
 
-def _parse_crop(spec: str):
-    """Parse 'x1,y1,x2,y2' into a clamped box, or None if empty/invalid."""
+def _parse_crop(spec: str, name: str = "STREAM_API_CROP"):
+    """Parse 'x1,y1,x2,y2' into a clamped box, or None if empty/invalid.
+
+    `name` only labels the warning — the same parser serves the crop box, the
+    AEC metering box and the ?box= query param.
+    """
     spec = spec.strip()
     if not spec:
         return None
     try:
         x1, y1, x2, y2 = (int(v) for v in spec.split(","))
     except ValueError:
-        logger.warning("STREAM_API_CROP=%r is not 'x1,y1,x2,y2' — crop disabled", spec)
+        logger.warning("%s=%r is not 'x1,y1,x2,y2' — ignored", name, spec)
         return None
     x1, x2 = max(0, min(x1, x2)), min(CAPTURE_WIDTH, max(x1, x2))
     y1, y2 = max(0, min(y1, y2)), min(CAPTURE_HEIGHT, max(y1, y2))
     if x2 - x1 < 16 or y2 - y1 < 16:
-        logger.warning("STREAM_API_CROP=%r is degenerate — crop disabled", spec)
+        logger.warning("%s=%r is degenerate — ignored", name, spec)
         return None
     return (x1, y1, x2, y2)
 
@@ -162,6 +166,32 @@ _deglare = {
     "strength": max(0, min(100, DEGLARE_STRENGTH)),
 }
 
+# Auto-exposure metering region, in full-frame coordinates like CROP_BOX.
+#
+# OFF by default: the camera meters the whole frame, exactly as before this
+# existed, so deploying it changes nothing until it is switched on. On, the
+# ISP meters only the box — VIDEO_SETTINGS.AEC_AGC_ROI, the built-in lever for
+# the case where the glare bands outside the tray drag the exposure down for
+# the fish inside it (measured 2026-09-23: clean tray at L median 86 while the
+# worst band sat at 222). It is a trade, not a free win: more exposure on the
+# fish also pushes more of the bands into hard clipping, and clipped pixels are
+# the one thing de-glare cannot recover. Hence off by default plus a live
+# POST /camera/aec-roi, so it is A/B'd on-site under the real lights rather
+# than flipped blind from a desk. Not manual exposure — AEC/AGC keeps running,
+# it just looks at less of the frame.
+#
+# STREAM_API_AEC_ROI: empty = off, "tray" = follow CROP_BOX (so the two boxes
+# cannot drift apart when the camera is re-hung), or an explicit x1,y1,x2,y2.
+def _aec_roi_from_env():
+    spec = os.environ.get("STREAM_API_AEC_ROI", "").strip()
+    if spec.lower() == "tray":
+        return CROP_BOX
+    return _parse_crop(spec, "STREAM_API_AEC_ROI")
+
+
+AEC_ROI_DEFAULT = _aec_roi_from_env()
+_aec_roi = {"box": list(AEC_ROI_DEFAULT) if AEC_ROI_DEFAULT else None}
+
 
 # ---------------------------------------------------------------------------
 # Hardware status — surfaced via /health and used to short-circuit endpoints
@@ -178,6 +208,8 @@ camera_status: dict = {
     "deglare": _deglare,
     # Whether a param-less /capture gets enhance_for_text().
     "enhance": _enhance,
+    # Auto-exposure metering box in force, or null for full-frame metering.
+    "aec_roi": _aec_roi,
 }
 # `port` is the device actually opened (discovery can pick it, so the configured
 # value is not always the answer) and `format` is the parser layer the last
@@ -297,6 +329,34 @@ if sys.platform == "linux":
     _camera_last_retry = 0.0
     _CAMERA_RETRY_COOLDOWN = 5.0  # seconds — avoid hammering USB after a disconnect
 
+    def _apply_aec_roi() -> None:
+        """Push the metering box in _aec_roi to the camera, or clear it.
+
+        Called even when no box is set: nothing promises a reopen forgets the
+        ROI, so "off" actively resets to full-frame rather than trusting that
+        a box from a previous run or a ZED_Explorer session is gone. The box is
+        in full-frame pixels — the SDK takes it in the camera resolution, which
+        is HD1080, the same space CROP_BOX is measured in.
+        """
+        box = _aec_roi["box"]
+        try:
+            if box:
+                x1, y1, x2, y2 = box
+                err = _zed.set_camera_settings_roi(
+                    sl.VIDEO_SETTINGS.AEC_AGC_ROI,
+                    sl.Rect(x1, y1, x2 - x1, y2 - y1),
+                    sl.SIDE.BOTH,
+                )
+            else:
+                err = _zed.set_camera_settings_roi(
+                    sl.VIDEO_SETTINGS.AEC_AGC_ROI, sl.Rect(), sl.SIDE.BOTH, True
+                )
+        except Exception as e:
+            logger.warning("failed to set AEC ROI %s: %s", box, e)
+            return
+        if err is not None and err != sl.ERROR_CODE.SUCCESS:
+            logger.warning("camera refused AEC ROI %s: %s", box, err)
+
     def _reset_isp_auto() -> None:
         """Hand exposure/gain and white balance back to the camera's ISP.
 
@@ -306,6 +366,7 @@ if sys.platform == "linux":
         open, so a self-heal restores the same imaging as a cold start.
         """
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
+        _apply_aec_roi()
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, _isp["brightness"])
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.CONTRAST, _isp["contrast"])
@@ -443,6 +504,19 @@ if sys.platform == "linux":
         logger.info("camera ISP now %s", _isp)
         return camera_status
 
+    def set_camera_aec_roi(box) -> dict:
+        """Meter auto-exposure on `box` (x1,y1,x2,y2) or the full frame (None).
+
+        Applied now and kept across self-heal reopens, like the ISP values;
+        a service restart returns to STREAM_API_AEC_ROI.
+        """
+        with _camera_lock:
+            _aec_roi["box"] = list(box) if box else None
+            if camera_status["ok"]:
+                _apply_aec_roi()
+        logger.info("camera AEC ROI now %s", _aec_roi["box"] or "full frame")
+        return camera_status
+
     @app.on_event("startup")
     def _camera_startup():
         with _camera_lock:
@@ -467,6 +541,11 @@ else:
         for key, value in values.items():
             if value is not None:
                 camera_status[key] = value
+        return camera_status
+
+    def set_camera_aec_roi(box) -> dict:
+        """Record the metering box so the stub answers like the real thing."""
+        _aec_roi["box"] = list(box) if box else None
         return camera_status
 
     def _grab_frame():
@@ -1601,6 +1680,10 @@ def capture(
             status_code=503,
         )
     headers: dict[str, str] = {}
+    if _aec_roi["box"]:
+        # The frame itself was exposed differently — worth knowing when the
+        # saved A/B captures are compared later.
+        headers["X-Aec-Roi"] = ",".join(str(v) for v in _aec_roi["box"])
     if crop and CROP_BOX:
         x1, y1, x2, y2 = CROP_BOX
         image = image[y1:y2, x1:x2]
@@ -1702,6 +1785,51 @@ def camera_brightness(
     back. See ZED_MIGRATION.md.
     """
     status = set_camera_isp(brightness=value, contrast=contrast)
+    return JSONResponse(
+        content={"camera": status},
+        status_code=200 if status["ok"] else 503,
+    )
+
+
+@app.post("/camera/aec-roi", summary="Meter auto-exposure on the tray only (on-site A/B)")
+def camera_aec_roi(
+    value: bool = Query(...),
+    box: Optional[str] = Query(None),
+):
+    """
+    value: true  — auto-exposure meters only the tray (the /capture crop box,
+                   or ?box= if given) and ignores everything outside it.
+           false — back to full-frame metering, the camera's default.
+    box:   optional x1,y1,x2,y2 in full-frame (1920x1080) pixels, to meter a
+           region other than the crop box — e.g. just where the fish sit.
+
+    This is the ZED's built-in lever for the glare bands dragging the exposure
+    down: with the bands out of the metering region the fish come up. It is
+    not free — brighter fish means more of the bands hard-clip, and that is
+    the part de-glare cannot recover. So: POST true, GET /capture, POST false,
+    GET /capture again, and keep whichever the fish look better in. The
+    X-Aec-Roi header on each capture says which one you are looking at.
+
+    Not manual exposure — AEC/AGC keeps running, it just looks at less of the
+    frame. It changes the sensor, so /stream shifts too, not only /capture.
+
+    Survives a self-heal reopen but NOT a service restart, which returns to
+    STREAM_API_AEC_ROI ("" = off, "tray" = crop box, or x1,y1,x2,y2).
+    """
+    roi = None
+    if value:
+        roi = _parse_crop(box, "box") if box is not None else CROP_BOX
+        if roi is None:
+            return JSONResponse(
+                content={
+                    "error": "no metering box",
+                    "detail": "?box= is not a valid x1,y1,x2,y2"
+                    if box is not None
+                    else "the crop box is disabled (STREAM_API_CROP is empty) — pass ?box=x1,y1,x2,y2",
+                },
+                status_code=400,
+            )
+    status = set_camera_aec_roi(roi)
     return JSONResponse(
         content={"camera": status},
         status_code=200 if status["ok"] else 503,

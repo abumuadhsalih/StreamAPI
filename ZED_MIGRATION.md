@@ -276,13 +276,46 @@ curl -s -o c6.jpg "http://<jetson-ip>:8000/capture?enhance=false"
 Both reset on restart; keep one with `Environment=STREAM_API_ENHANCE=` /
 `STREAM_API_CAMERA_CONTRAST=` in the unit.
 
+## 7f. Auto-exposure metering on the tray (AEC ROI) — do this LAST
+
+Ships **off**, so nothing above is affected by it. The glare bands outside the tray
+drag the auto-exposure down for the whole frame (measured: clean tray L median 86
+while the worst band sat at 222). `AEC_AGC_ROI` is the ZED's built-in answer: meter
+only on the tray box and the bands stop counting. Not manual exposure — AEC/AGC keeps
+running, it just looks at less of the frame.
+
+It is a trade, which is why it is a switch and not a default: brighter fish also means
+more of the bands hard-clip, and clipped pixels are the one thing de-glare cannot
+recover. Decide it against the same lights, in the same minute:
+
+```bash
+curl -s -o roi_off.jpg "http://<jetson-ip>:8000/capture"
+curl -X POST "http://<jetson-ip>:8000/camera/aec-roi?value=true"     # meter on the crop box
+sleep 2                                                              # let AE settle
+curl -s -D - -o roi_on.jpg "http://<jetson-ip>:8000/capture" | grep -i x-aec-roi
+
+# meter on a smaller region (just where the fish sit), full-frame px
+curl -X POST "http://<jetson-ip>:8000/camera/aec-roi?value=true&box=400,250,1650,900"
+
+curl -X POST "http://<jetson-ip>:8000/camera/aec-roi?value=false"    # back to full frame
+```
+
+Compare `roi_off.jpg` and `roi_on.jpg` on the fish first, then on the bands. Keep it
+on only if the fish gained more than the bands lost. `/stream` shifts too — it is the
+sensor, not a filter — so the live view is a fair way to watch AE settle.
+
+It survives a self-heal reopen but not a restart; keep it with
+`Environment=STREAM_API_AEC_ROI=tray` (follows the crop box, so re-measuring one
+re-measures both) or an explicit `x1,y1,x2,y2`. `/health` reports it as `camera.aec_roi`.
+
 ## 8. What to bring back
 
 - A raw `/capture` and an `?enhance=true` capture under the **real** lights, ideally one
   at night. Look at the bright bands on the tray: still clipping to white, or textured
   now? That is the evidence for whether the polarizer solved the glare on its own.
-- If the fish come out dark: do **not** reach for manual exposure — note it. The next
-  built-in lever is `AEC_AGC_ROI` (meter only on the tray region).
+- If the fish come out dark: do **not** reach for manual exposure — try §7f (meter
+  auto-exposure on the tray) and bring back the on/off pair of captures.
+- Whether `STREAM_API_AEC_ROI` should be `tray` or stay off, and the pair that decided it.
 - Whichever `STREAM_API_CAMERA_BRIGHTNESS` you settle on, and the captures that decided it.
 - The `STREAM_API_CROP` box if you had to re-measure it, plus a `?crop=false` full frame so the next person can re-derive it.
 - The `deglare` strength/sigma you settled on, with a `?deglare=false` frame alongside a default one.

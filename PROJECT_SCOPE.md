@@ -27,6 +27,7 @@ An API server running on a Jetson to expose a Stereolabs ZED 2i camera (RGB), a 
 | `/camera/brightness` | POST | Set the ZED ISP brightness 0-8 live (on-site A/B; resets to the env default on service restart) |
 | `/camera/deglare` | POST | Tune the de-glare pass live (`strength` 0-100, `sigma` 10-300); same reset-on-restart rule |
 | `/camera/enhance` | POST | Flip the `/capture` enhance default live — the only image params-less clients can receive |
+| `/camera/aec-roi` | POST | Meter auto-exposure on the tray only (`value` bool, optional `box`); off by default, same reset-on-restart rule |
 | `/scale/reconnect` | POST | Force the scale serial port to reopen |
 | `/system/reboot` | POST | Reboot the Jetson (admin-token guarded) |
 | `/system/restart-service` | POST | Restart the stream-api service (admin-token guarded) |
