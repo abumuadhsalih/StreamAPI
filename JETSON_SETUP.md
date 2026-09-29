@@ -503,11 +503,11 @@ Set these as `Environment=` lines in `/etc/systemd/system/stream-api.service` (v
 | `STREAM_API_SCALE_BAUD` | `9600` | 8-N-1 |
 | `STREAM_API_SCALE_UNIT` | `kg` | The DX11 transmits **no unit**; this is the assumed one |
 | `STREAM_API_SCALE_STREAM_INTERVAL` | `0.1` | SSE pacing, 10 Hz |
-| `STREAM_API_ENHANCE` | `1` | Whether a param-less `/capture` gets CLAHE + shadow lift. `0` turns it off for every client |
+| `STREAM_API_ENHANCE` | `0` | Whether a param-less `/capture` gets CLAHE + shadow lift. `0` turns it off for every client |
 | `STREAM_API_CAMERA_CONTRAST` | `4` | ZED ISP contrast, 0-8. Raise for punch in-camera, before de-glare |
-| `STREAM_API_DEGLARE_STRENGTH` | `100` | Software de-glare, 0-100. `0` disables it for every client. Tune live with `POST /camera/deglare` |
+| `STREAM_API_DEGLARE_STRENGTH` | `0` | Software de-glare, 0-100. `0` disables it for every client. Tune live with `POST /camera/deglare` |
 | `STREAM_API_DEGLARE_SIGMA` | `60` | De-glare radius in full-frame px. Larger = gentler; below ~40 it haloes the fish |
-| `STREAM_API_CROP` | `248,118,1830,986` | `/capture` tray crop box in full-frame coords. Empty disables it. Re-measure after any camera move — see ZED_MIGRATION.md |
+| `STREAM_API_CROP` | *(empty = off)* | `/capture` tray crop box in full-frame coords. Empty disables it. Re-measure after any camera move — see ZED_MIGRATION.md |
 | `STREAM_API_AEC_ROI` | *(empty = off)* | Auto-exposure metering box. `tray` follows `STREAM_API_CROP`; or `x1,y1,x2,y2`. Off = the camera meters the whole frame. A/B it live with `POST /camera/aec-roi` before setting it here — see ZED_MIGRATION.md §7f |
 | `STREAM_API_CAMERA_BRIGHTNESS` | `4` | ZED ISP brightness, 0-8. Lower = darker frame with auto-exposure still running. Does **not** recover blown glare — see ZED_MIGRATION.md |
 | `STREAM_API_BATTERY_ADDRESS` | `A5:C2:37:6E:94:70` | Change here when a pack is swapped |

@@ -93,7 +93,17 @@ RESOLUTIONS: dict[str, tuple[int, int]] = {
 CAPTURE_WIDTH, CAPTURE_HEIGHT = RESOLUTIONS["fhd"]
 Preset = Literal["sd", "hd", "fhd"]
 
-# /capture crops to the inspection tray by default. The ZED's 110-deg FOV puts
+# THIS BRANCH (feature/camera-auto-only): every software pass ships OFF —
+# crop, de-glare and enhance — so a bare /capture is the camera's own
+# auto-exposed, auto-white-balanced frame and nothing else. The hardware team
+# is changing the mount, lights and tray surface, and each change must be
+# judged on the raw sensor output, not through processing that was tuned for
+# the previous setup (de-glare on a crumpled reflective sheet turned the whole
+# frame to grey noise). The endpoints and env vars all still work, so any pass
+# can be switched on live for a comparison; only the shipped defaults differ
+# from feature/zed-2i-camera.
+#
+# /capture can crop to the inspection tray. The ZED's 110-deg FOV puts
 # a third to a half of every frame outside the tray — floor, fish baskets,
 # whoever is standing there — and the client's AI pipeline fetches bare
 # /capture, so that clutter was going straight to the model. Cropping also
@@ -109,7 +119,10 @@ Preset = Literal["sd", "hd", "fhd"]
 # the X-Crop response header on every cropped capture, and camera.crop in
 # /health: three places to notice a stale box without guessing. /stream is
 # deliberately NOT cropped, so it stays the full-scene view you re-aim against.
-_CROP_DEFAULT = "248,118,1830,986"
+# Empty on this branch (see above). The box measured on the 2026-09-23 mount
+# was 248,118,1830,986; the mount has changed since, so it needs re-measuring
+# before it goes back into STREAM_API_CROP anyway.
+_CROP_DEFAULT = ""
 
 
 def _parse_crop(spec: str, name: str = "STREAM_API_CROP"):
@@ -154,13 +167,13 @@ CROP_BOX = _parse_crop(os.environ.get("STREAM_API_CROP", _CROP_DEFAULT))
 # /camera/enhance flips the server default live — that endpoint exists because
 # this default was previously a bare code constant, which meant a redeploy to
 # change the one thing the params-less clients actually receive.
-ENHANCE_DEFAULT = os.environ.get("STREAM_API_ENHANCE", "1").strip().lower() not in (
+ENHANCE_DEFAULT = os.environ.get("STREAM_API_ENHANCE", "0").strip().lower() not in (
     "0", "false", "no", "off", ""
 )
 _enhance = {"default": ENHANCE_DEFAULT}
 
 DEGLARE_SIGMA = int(os.environ.get("STREAM_API_DEGLARE_SIGMA", "60"))
-DEGLARE_STRENGTH = int(os.environ.get("STREAM_API_DEGLARE_STRENGTH", "100"))
+DEGLARE_STRENGTH = int(os.environ.get("STREAM_API_DEGLARE_STRENGTH", "0"))
 _deglare = {
     "sigma": max(10, min(300, DEGLARE_SIGMA)),
     "strength": max(0, min(100, DEGLARE_STRENGTH)),
