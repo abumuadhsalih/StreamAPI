@@ -211,6 +211,16 @@ sudo systemctl daemon-reload && sudo systemctl restart stream-api
 
 `/stream` is never cropped, so use it in a browser while re-aiming the camera.
 
+The box can be set live now — no unit edit while you are still moving things:
+
+```bash
+curl -s -o full.jpg "http://<jetson-ip>:8000/capture?crop=false"          # read corners off this
+curl -X POST "http://<jetson-ip>:8000/camera/crop?value=true&box=360,150,1750,960"
+curl -X POST "http://<jetson-ip>:8000/camera/crop?value=false"             # full frame again
+```
+
+Once it settles, keep it with `Environment=STREAM_API_CROP=`.
+
 ## 7d. Tune the de-glare pass
 
 `/capture` flattens the light-strip reflections by default — **on by default because

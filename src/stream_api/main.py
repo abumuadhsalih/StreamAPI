@@ -201,6 +201,12 @@ def _parse_crop(spec: str, name: str = "STREAM_API_CROP"):
 
 CROP_BOX = _parse_crop(os.environ.get("STREAM_API_CROP", _CROP_DEFAULT))
 
+# The box in force. POST /camera/crop moves it live — the hardware team is
+# re-laying the tray between captures, so a box that needs a unit edit and a
+# restart to change is a box nobody updates. Reference-frame coordinates,
+# like CROP_BOX; a service restart returns to STREAM_API_CROP.
+_crop = {"box": list(CROP_BOX) if CROP_BOX else None}
+
 # De-glare strength/radius in force. Constants here beside CROP_BOX because
 # camera_status reports both; the filter itself lives with the other image
 # processing further down, next to enhance_for_text().
@@ -250,7 +256,7 @@ _deglare = {
 def _aec_roi_from_env():
     spec = os.environ.get("STREAM_API_AEC_ROI", "").strip()
     if spec.lower() == "tray":
-        return CROP_BOX
+        return _crop["box"]
     return _parse_crop(spec, "STREAM_API_AEC_ROI")
 
 
@@ -268,7 +274,7 @@ camera_status: dict = {
     "mode": "real",
     # The /capture crop box in full-frame coordinates, or null when disabled —
     # a stale box after the camera is moved is otherwise invisible.
-    "crop": list(CROP_BOX) if CROP_BOX else None,
+    "crop": _crop,
     # Software de-glare in force; "strength": 0 means every client gets raw.
     "deglare": _deglare,
     # Whether a param-less /capture gets enhance_for_text().
@@ -1754,8 +1760,9 @@ def capture(
               image they can get. Tune or disable it live with
               POST /camera/deglare; pass ?deglare=false for a single raw A/B
               frame. Reported in X-Deglare.
-    crop:     default true — cut to the inspection tray (CROP_BOX, reported in
-              the X-Crop header and in /health). Everything outside the tray is
+    crop:     default true — cut to the inspection tray box, if one is set
+              (POST /camera/crop or STREAM_API_CROP; reported in the X-Crop
+              header and in /health). Everything outside the tray is
               clutter for the AI client, which fetches bare /capture. Pass
               ?crop=false for the full frame, which is what you want when
               re-aiming the camera or checking the box is still right.
@@ -1768,7 +1775,7 @@ def capture(
               X-Resolution.
     """
     native = (_camera_mode["width"], _camera_mode["height"])
-    box = _live_box(CROP_BOX) if crop else None
+    box = _live_box(_crop["box"]) if crop else None
     if box:
         # Crop from the full-resolution frame, then scale — cropping a frame
         # that was already downscaled to the preset would throw away the
@@ -1804,7 +1811,7 @@ def capture(
         # median is being dragged around by the glare.
         # Both ratios are against the 1080p reference, so sigma also follows
         # the pixel density of the sensor mode.
-        sigma = _deglare["sigma"] * (image.shape[1] / (CROP_BOX[2] - CROP_BOX[0])
+        sigma = _deglare["sigma"] * (image.shape[1] / (_crop["box"][2] - _crop["box"][0])
                                      if box else image.shape[1] / CAPTURE_WIDTH)
         image = reduce_glare(image, max(2.0, sigma), _deglare["strength"] / 100.0)
         headers["X-Deglare"] = f"{_deglare['strength']},{_deglare['sigma']}"
@@ -1946,7 +1953,7 @@ def camera_aec_roi(
     """
     roi = None
     if value:
-        roi = _parse_crop(box, "box") if box is not None else CROP_BOX
+        roi = _parse_crop(box, "box") if box is not None else _crop["box"]
         if roi is None:
             return JSONResponse(
                 content={
@@ -1962,6 +1969,41 @@ def camera_aec_roi(
         content={"camera": status},
         status_code=200 if status["ok"] else 503,
     )
+
+
+@app.post("/camera/crop", summary="Set or clear the /capture tray crop box live")
+def camera_crop(
+    value: bool = Query(...),
+    box: Optional[str] = Query(None),
+):
+    """
+    value: true  — crop every param-less /capture to `box` (required the first
+                   time; omitted afterwards keeps the current box).
+           false — full frame for everyone; the box is forgotten.
+    box:   x1,y1,x2,y2 in 1920x1080 pixels, read off a ?crop=false capture.
+           Scaled automatically if the camera is in 2K mode.
+
+    Pure software, nothing is sent to the camera, so it applies to the next
+    capture immediately. ?crop=false on a single request still overrides it.
+    Survives anything but a service restart, which returns to STREAM_API_CROP.
+    """
+    if value:
+        new = _parse_crop(box, "box") if box is not None else _crop["box"]
+        if new is None:
+            return JSONResponse(
+                content={
+                    "error": "no crop box",
+                    "detail": "?box= is not a valid x1,y1,x2,y2"
+                    if box is not None
+                    else "no box is set — pass ?box=x1,y1,x2,y2",
+                },
+                status_code=400,
+            )
+        _crop["box"] = list(new)
+    else:
+        _crop["box"] = None
+    logger.info("capture crop now %s", _crop["box"] or "off")
+    return {"crop": dict(_crop)}
 
 
 # ---------------------------------------------------------------------------
