@@ -89,9 +89,61 @@ RESOLUTIONS: dict[str, tuple[int, int]] = {
     "sd": (640, 480),
     "hd": (1280, 720),
     "fhd": (1920, 1080),
+    "2k": (2208, 1242),
 }
+Preset = Literal["sd", "hd", "fhd", "2k"]
+
+# The sensor mode the ZED is opened in. HD1080 @ 30 is the default; HD2K is
+# the same 110-deg field of view at 1.15x the pixel density and half the frame
+# rate (the SDK caps HD2K at 15 fps). POST /camera/resolution switches live —
+# it is a close+reopen, ~2 s, and /stream clients reconnect. A bare /capture
+# always returns the sensor's native size, so switching to 2K is what hands
+# the AI pipeline a 2208x1242 frame without the mobile app changing anything.
+CAMERA_MODES: dict[str, tuple[int, int, int]] = {
+    "fhd": (1920, 1080, 30),
+    "2k": (2208, 1242, 15),
+}
+CameraMode = Literal["fhd", "2k"]
+
+
+def _camera_mode_env() -> str:
+    raw = os.environ.get("STREAM_API_CAMERA_MODE", "fhd").strip().lower()
+    if raw not in CAMERA_MODES:
+        logger.warning("STREAM_API_CAMERA_MODE=%r unknown, using fhd", raw)
+        return "fhd"
+    return raw
+
+
+def _mode_dict(name: str) -> dict:
+    w, h, fps = CAMERA_MODES[name]
+    return {"name": name, "width": w, "height": h, "fps": fps}
+
+
+# The mode in force. Reported in /health, kept across self-heal reopens like
+# the ISP values; a service restart returns to STREAM_API_CAMERA_MODE.
+_camera_mode = _mode_dict(_camera_mode_env())
+
+# Reference frame for every box in this file. CROP_BOX and the AEC metering
+# box are measured in 1920x1080 coordinates whatever mode the camera runs in,
+# and scaled to the live sensor size at the point of use (_live_box), so a box
+# measured at fhd is still right after switching to 2K. Both modes share the
+# same field of view, which is what makes a pure scale correct.
 CAPTURE_WIDTH, CAPTURE_HEIGHT = RESOLUTIONS["fhd"]
-Preset = Literal["sd", "hd", "fhd"]
+
+
+def _live_box(box):
+    """Scale a reference-frame (x1,y1,x2,y2) box to the live sensor size."""
+    if not box:
+        return None
+    sx = _camera_mode["width"] / CAPTURE_WIDTH
+    sy = _camera_mode["height"] / CAPTURE_HEIGHT
+    x1, y1, x2, y2 = box
+    return (
+        max(0, round(x1 * sx)),
+        max(0, round(y1 * sy)),
+        min(_camera_mode["width"], round(x2 * sx)),
+        min(_camera_mode["height"], round(y2 * sy)),
+    )
 
 # THIS BRANCH (feature/camera-auto-only): every software pass ships OFF —
 # crop, de-glare and enhance — so a bare /capture is the camera's own
@@ -223,6 +275,8 @@ camera_status: dict = {
     "enhance": _enhance,
     # Auto-exposure metering box in force, or null for full-frame metering.
     "aec_roi": _aec_roi,
+    # Sensor mode the camera is running in (POST /camera/resolution).
+    "resolution": _camera_mode,
 }
 # `port` is the device actually opened (discovery can pick it, so the configured
 # value is not always the answer) and `format` is the parser layer the last
@@ -327,10 +381,12 @@ if sys.platform == "linux":
     # which is deliberate — nothing poked in while testing leaks into production.
     _isp = {"brightness": CAMERA_BRIGHTNESS, "contrast": CAMERA_CONTRAST}
 
+    _SL_RESOLUTION = {"fhd": sl.RESOLUTION.HD1080, "2k": sl.RESOLUTION.HD2K}
+
     _zed = sl.Camera()
     _init = sl.InitParameters()
-    _init.camera_resolution = sl.RESOLUTION.HD1080
-    _init.camera_fps = 30
+    _init.camera_resolution = _SL_RESOLUTION[_camera_mode["name"]]
+    _init.camera_fps = _camera_mode["fps"]
     _init.depth_mode = sl.DEPTH_MODE.NONE
     _init.sdk_verbose = 0
     _runtime = sl.RuntimeParameters()
@@ -347,11 +403,11 @@ if sys.platform == "linux":
 
         Called even when no box is set: nothing promises a reopen forgets the
         ROI, so "off" actively resets to full-frame rather than trusting that
-        a box from a previous run or a ZED_Explorer session is gone. The box is
-        in full-frame pixels — the SDK takes it in the camera resolution, which
-        is HD1080, the same space CROP_BOX is measured in.
+        a box from a previous run or a ZED_Explorer session is gone. The SDK
+        takes the box in the live sensor resolution, so the reference-frame
+        box is scaled through _live_box() first.
         """
-        box = _aec_roi["box"]
+        box = _live_box(_aec_roi["box"])
         try:
             if box:
                 x1, y1, x2, y2 = box
@@ -430,6 +486,16 @@ if sys.platform == "linux":
                 "serial": str(info.serial_number),
                 "firmware": str(info.camera_configuration.firmware_version),
             }
+            # Trust the SDK over our table: if it ever opens at a size other
+            # than the one asked for, every box scale in the file follows it.
+            res = info.camera_configuration.resolution
+            if (res.width, res.height) != (_camera_mode["width"], _camera_mode["height"]):
+                logger.warning(
+                    "camera opened at %dx%d, expected %dx%d for mode %s",
+                    res.width, res.height,
+                    _camera_mode["width"], _camera_mode["height"], _camera_mode["name"],
+                )
+                _camera_mode["width"], _camera_mode["height"] = int(res.width), int(res.height)
             _reset_isp_auto()
         except Exception as e:
             try:
@@ -441,10 +507,11 @@ if sys.platform == "linux":
         camera_status["ok"] = True
         camera_status["error"] = None
         logger.info(
-            "camera opened: %s serial=%s fw=%s",
+            "camera opened: %s serial=%s fw=%s %dx%d@%d",
             camera_status["device"]["name"],
             camera_status["device"]["serial"],
             camera_status["device"]["firmware"],
+            _camera_mode["width"], _camera_mode["height"], _camera_mode["fps"],
         )
         return True
 
@@ -530,6 +597,18 @@ if sys.platform == "linux":
         logger.info("camera AEC ROI now %s", _aec_roi["box"] or "full frame")
         return camera_status
 
+    def set_camera_mode(name: str) -> dict:
+        """Reopen the ZED in another sensor mode. Caller validates the name."""
+        global _camera_last_retry
+        with _camera_lock:
+            _camera_mode.update(_mode_dict(name))
+            _init.camera_resolution = _SL_RESOLUTION[name]
+            _init.camera_fps = _camera_mode["fps"]
+            _camera_last_retry = 0.0
+            _open_camera()
+        logger.info("camera mode now %s", _camera_mode)
+        return camera_status
+
     @app.on_event("startup")
     def _camera_startup():
         with _camera_lock:
@@ -561,13 +640,18 @@ else:
         _aec_roi["box"] = list(box) if box else None
         return camera_status
 
+    def set_camera_mode(name: str) -> dict:
+        """Record the mode so the stub frame comes back at the right size."""
+        _camera_mode.update(_mode_dict(name))
+        return camera_status
+
     def _grab_frame():
         """Return a placeholder frame when no ZED is available."""
-        frame = np.zeros((CAPTURE_HEIGHT, CAPTURE_WIDTH, 3), dtype=np.uint8)
+        frame = np.zeros((_camera_mode["height"], _camera_mode["width"], 3), dtype=np.uint8)
         cv2.putText(
             frame,
             "ZED 2i not available (stub)",
-            (300, CAPTURE_HEIGHT // 2),
+            (300, _camera_mode["height"] // 2),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.5,
             (255, 255, 255),
@@ -581,7 +665,7 @@ def get_color_frame(width: int, height: int):
     image = _grab_frame()
     if image is None:
         return None
-    if (width, height) != (CAPTURE_WIDTH, CAPTURE_HEIGHT):
+    if (width, height) != (image.shape[1], image.shape[0]):
         image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
     return image
 
@@ -1652,7 +1736,7 @@ def stream(preset: Preset = "fhd"):
 
 @app.get("/capture", summary="Capture a single JPEG image")
 def capture(
-    preset: Preset = "fhd",
+    preset: Optional[Preset] = None,
     enhance: Optional[bool] = None,
     crop: bool = True,
     deglare: bool = True,
@@ -1675,18 +1759,23 @@ def capture(
               clutter for the AI client, which fetches bare /capture. Pass
               ?crop=false for the full frame, which is what you want when
               re-aiming the camera or checking the box is still right.
-    preset:   uncropped, this resizes to the preset's exact dimensions, as it
-              always has. Cropped, it is applied as the preset's scale factor
-              (fhd 1.0, hd 2/3, sd 1/3) so the tray keeps its aspect ratio and
-              the default fhd capture is never resampled at all.
+    preset:   unset, the frame comes back at the sensor's native size for the
+              mode in force (1920x1080, or 2208x1242 after POST
+              /camera/resolution?value=2k) and is never resampled. Uncropped,
+              a preset resizes to its exact dimensions, as it always has.
+              Cropped, it is applied as a scale factor against the native
+              width so the tray keeps its aspect ratio. Reported in
+              X-Resolution.
     """
-    if crop and CROP_BOX:
+    native = (_camera_mode["width"], _camera_mode["height"])
+    box = _live_box(CROP_BOX) if crop else None
+    if box:
         # Crop from the full-resolution frame, then scale — cropping a frame
         # that was already downscaled to the preset would throw away the
         # resolution the crop exists to preserve.
-        image = get_color_frame(CAPTURE_WIDTH, CAPTURE_HEIGHT)
+        image = get_color_frame(*native)
     else:
-        image = get_color_frame(*RESOLUTIONS[preset])
+        image = get_color_frame(*(RESOLUTIONS[preset] if preset else native))
     if image is None:
         return JSONResponse(
             content={"error": "camera not available", "detail": camera_status["error"]},
@@ -1697,11 +1786,11 @@ def capture(
         # The frame itself was exposed differently — worth knowing when the
         # saved A/B captures are compared later.
         headers["X-Aec-Roi"] = ",".join(str(v) for v in _aec_roi["box"])
-    if crop and CROP_BOX:
-        x1, y1, x2, y2 = CROP_BOX
+    if box:
+        x1, y1, x2, y2 = box
         image = image[y1:y2, x1:x2]
         headers["X-Crop"] = f"{x1},{y1},{x2},{y2}"
-        scale = RESOLUTIONS[preset][0] / CAPTURE_WIDTH
+        scale = RESOLUTIONS[preset][0] / native[0] if preset else 1.0
         if scale != 1.0:
             image = cv2.resize(
                 image,
@@ -1713,8 +1802,10 @@ def capture(
         # looks the same whatever size was asked for. Before enhance, so the
         # adaptive lift measures an already-even frame rather than one whose
         # median is being dragged around by the glare.
+        # Both ratios are against the 1080p reference, so sigma also follows
+        # the pixel density of the sensor mode.
         sigma = _deglare["sigma"] * (image.shape[1] / (CROP_BOX[2] - CROP_BOX[0])
-                                     if crop and CROP_BOX else image.shape[1] / CAPTURE_WIDTH)
+                                     if box else image.shape[1] / CAPTURE_WIDTH)
         image = reduce_glare(image, max(2.0, sigma), _deglare["strength"] / 100.0)
         headers["X-Deglare"] = f"{_deglare['strength']},{_deglare['sigma']}"
     if _enhance["default"] if enhance is None else enhance:
@@ -1723,6 +1814,7 @@ def capture(
         # Surface what the adaptive lift did so an on-site A/B needs no guesswork.
         headers["X-Enhance-Gamma"] = str(stats["gamma"])
         headers["X-Enhance-Median"] = str(stats["median"])
+    headers["X-Resolution"] = f"{image.shape[1]}x{image.shape[0]}"
     _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 100])
     return Response(content=jpeg.tobytes(), media_type="image/jpeg", headers=headers)
 
@@ -1730,6 +1822,29 @@ def capture(
 @app.post("/camera/restart", summary="Force a ZED camera close+reopen")
 def camera_restart():
     status = restart_camera()
+    return JSONResponse(
+        content={"camera": status},
+        status_code=200 if status["ok"] else 503,
+    )
+
+
+@app.post("/camera/resolution", summary="Switch the sensor mode live (fhd 1080p@30 / 2k @15)")
+def camera_resolution(value: CameraMode = Query(...)):
+    """
+    value: fhd — 1920x1080 at 30 fps, the default.
+           2k  — 2208x1242 at 15 fps. Same field of view, 1.15x the pixels
+                 per fish, half the frame rate.
+
+    Closes and reopens the camera (~2 s); /stream clients drop and reconnect.
+    A bare /capture returns the native size of the mode in force, so this is
+    how the AI pipeline gets a 2K frame without the mobile app changing
+    anything. Crop and AEC boxes are kept in 1080p coordinates and scaled, so
+    nothing measured needs re-entering.
+
+    Survives a self-heal reopen but NOT a service restart, which returns to
+    STREAM_API_CAMERA_MODE.
+    """
+    status = set_camera_mode(value)
     return JSONResponse(
         content={"camera": status},
         status_code=200 if status["ok"] else 503,

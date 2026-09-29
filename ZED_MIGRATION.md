@@ -308,6 +308,25 @@ It survives a self-heal reopen but not a restart; keep it with
 `Environment=STREAM_API_AEC_ROI=tray` (follows the crop box, so re-measuring one
 re-measures both) or an explicit `x1,y1,x2,y2`. `/health` reports it as `camera.aec_roi`.
 
+## 7g. 2K sensor mode
+
+Same 110-deg field of view, 1.15x the pixels per fish, half the frame rate (15 fps).
+Resolution was not the bottleneck in the mobile-vs-ours comparison, so this is a
+"prove it" switch, not a fix. Bare `/capture` returns the native size of the mode in
+force, so the AI pipeline gets 2208x1242 without the mobile app changing anything.
+
+```bash
+curl -X POST "http://<jetson-ip>:8000/camera/resolution?value=2k"     # ~2 s reopen
+curl -s -D - -o cap_2k.jpg  "http://<jetson-ip>:8000/capture" | grep -i x-resolution
+curl -X POST "http://<jetson-ip>:8000/camera/resolution?value=fhd"
+curl -s -D - -o cap_fhd.jpg "http://<jetson-ip>:8000/capture" | grep -i x-resolution
+```
+
+Crop and AEC boxes stay in 1080p coordinates and are scaled to the live mode, so
+nothing needs re-entering. Check `?crop=false` at both modes shows the same scene
+edge to edge — that is the same-FOV assumption the scaling relies on. Keep it with
+`Environment=STREAM_API_CAMERA_MODE=2k`; `/health` reports it as `camera.resolution`.
+
 ## 8. What to bring back
 
 - A raw `/capture` and an `?enhance=true` capture under the **real** lights, ideally one
