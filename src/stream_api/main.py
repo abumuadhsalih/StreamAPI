@@ -171,10 +171,13 @@ def _live_box(box):
 # the X-Crop response header on every cropped capture, and camera.crop in
 # /health: three places to notice a stale box without guessing. /stream is
 # deliberately NOT cropped, so it stays the full-scene view you re-aim against.
-# Empty on this branch (see above). The box measured on the 2026-09-23 mount
-# was 248,118,1830,986; the mount has changed since, so it needs re-measuring
-# before it goes back into STREAM_API_CROP anyway.
-_CROP_DEFAULT = ""
+# Crop is back ON as of 2026-10-07: the hardware team settled on a steel tray
+# with a measuring grid on its floor, and this box is that floor — measured
+# off a real capture by the steel edges, inside the sloped rim walls, which
+# are bright, reflective and nothing the AI needs. All fish lie within it.
+# (The 2026-09-23 box on the old mount was 248,118,1830,986.) De-glare and
+# enhance stay off on this branch; the crop is pure geometry.
+_CROP_DEFAULT = "350,185,1760,925"
 
 
 def _parse_crop(spec: str, name: str = "STREAM_API_CROP"):
