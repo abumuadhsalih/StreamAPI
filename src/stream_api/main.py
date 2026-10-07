@@ -93,9 +93,12 @@ RESOLUTIONS: dict[str, tuple[int, int]] = {
 }
 Preset = Literal["sd", "hd", "fhd", "2k"]
 
-# The sensor mode the ZED is opened in. HD1080 @ 30 is the default; HD2K is
-# the same 110-deg field of view at 1.15x the pixel density and half the frame
-# rate (the SDK caps HD2K at 15 fps). POST /camera/resolution switches live —
+# The sensor mode the ZED is opened in. HD2K is the default as of 2026-10-07:
+# the same 110-deg field of view as HD1080 at 1.15x the pixel density, at the
+# cost of half the frame rate (the SDK caps HD2K at 15 fps, so /stream runs at
+# 15 and a capture waits up to ~67 ms for a frame instead of ~33) and a ~1.3x
+# larger JPEG to encode and send. Fine for a capture endpoint; set
+# STREAM_API_CAMERA_MODE=fhd if the stream rate ever matters more. POST /camera/resolution switches live —
 # it is a close+reopen, ~2 s, and /stream clients reconnect. A bare /capture
 # always returns the sensor's native size, so switching to 2K is what hands
 # the AI pipeline a 2208x1242 frame without the mobile app changing anything.
@@ -107,10 +110,10 @@ CameraMode = Literal["fhd", "2k"]
 
 
 def _camera_mode_env() -> str:
-    raw = os.environ.get("STREAM_API_CAMERA_MODE", "fhd").strip().lower()
+    raw = os.environ.get("STREAM_API_CAMERA_MODE", "2k").strip().lower()
     if raw not in CAMERA_MODES:
-        logger.warning("STREAM_API_CAMERA_MODE=%r unknown, using fhd", raw)
-        return "fhd"
+        logger.warning("STREAM_API_CAMERA_MODE=%r unknown, using 2k", raw)
+        return "2k"
     return raw
 
 

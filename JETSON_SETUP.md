@@ -508,7 +508,7 @@ Set these as `Environment=` lines in `/etc/systemd/system/stream-api.service` (v
 | `STREAM_API_DEGLARE_STRENGTH` | `0` | Software de-glare, 0-100. `0` disables it for every client. Tune live with `POST /camera/deglare` |
 | `STREAM_API_DEGLARE_SIGMA` | `60` | De-glare radius in full-frame px. Larger = gentler; below ~40 it haloes the fish |
 | `STREAM_API_CROP` | `350,185,1760,925` | `/capture` tray crop box in full-frame coords. Empty disables it. Set live with `POST /camera/crop?value=true&box=`. Re-measure after any camera move — see ZED_MIGRATION.md |
-| `STREAM_API_CAMERA_MODE` | `fhd` | Sensor mode: `fhd` 1920x1080@30 or `2k` 2208x1242@15. Same FOV. Switch live with `POST /camera/resolution` |
+| `STREAM_API_CAMERA_MODE` | `2k` | Sensor mode: `2k` 2208x1242@15 (default) or `fhd` 1920x1080@30. Same FOV. Switch live with `POST /camera/resolution` |
 | `STREAM_API_AEC_ROI` | *(empty = off)* | Auto-exposure metering box. `tray` follows `STREAM_API_CROP`; or `x1,y1,x2,y2`. Off = the camera meters the whole frame. A/B it live with `POST /camera/aec-roi` before setting it here — see ZED_MIGRATION.md §7f |
 | `STREAM_API_CAMERA_BRIGHTNESS` | `4` | ZED ISP brightness, 0-8. Lower = darker frame with auto-exposure still running. Does **not** recover blown glare — see ZED_MIGRATION.md |
 | `STREAM_API_BATTERY_ADDRESS` | `A5:C2:37:6E:94:70` | Change here when a pack is swapped |
