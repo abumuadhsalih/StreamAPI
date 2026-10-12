@@ -177,16 +177,16 @@ def _live_box(box):
 # /health: three places to notice a stale box without guessing. /stream is
 # deliberately NOT cropped, so it stays the full-scene view you re-aim against.
 # Crop is back ON as of 2026-10-07: the hardware team settled on a steel tray
-# with a measuring grid on its floor. The box is the tray's OUTER rim with a
-# ~30 px margin of floor on every side — the client wants the tray edges
-# clearly visible in the capture (2026-10-12), so the floor-only box
-# (350,185,1760,925) that cut the sloped rim walls away was replaced, and the
-# box was re-measured on a 2026-10-12 full frame (?crop=false) after two
-# boxes worked back from cropped captures came out off by ~25 px: the outer
-# rim sits at 247,115,1832,990, verified by overlay. (The 2026-09-23 box on
-# the old mount was 248,118,1830,986.) De-glare and enhance stay off on this
-# branch; the crop is pure geometry. Always measure from ?crop=false.
-_CROP_DEFAULT = "222,90,1857,1015"
+# with a measuring grid on its floor. The box is the tray's OUTER rim edge
+# exactly, no floor margin — the client wants the tray edges visible and
+# nothing beyond them (2026-10-12). Measured on a ?crop=false full frame
+# and verified by overlay; two earlier boxes worked back from cropped
+# captures came out ~25 px off, so always measure from ?crop=false. A
+# floor-only box (350,185,1760,925) was rejected for hiding the rim, and a
+# 25 px margin (222,90,1857,1015) for showing floor. (The 2026-09-23 box on
+# the old mount was 248,118,1830,986.) De-glare and enhance stay off on
+# this branch; the crop is pure geometry.
+_CROP_DEFAULT = "249,117,1830,988"
 
 
 def _parse_crop(spec: str, name: str = "STREAM_API_CROP"):
