@@ -215,7 +215,7 @@ The box can be set live now — no unit edit while you are still moving things:
 
 ```bash
 curl -s -o full.jpg "http://<jetson-ip>:8000/capture?crop=false"          # read corners off this
-curl -X POST "http://<jetson-ip>:8000/camera/crop?value=true&box=250,70,1860,975"
+curl -X POST "http://<jetson-ip>:8000/camera/crop?value=true&box=215,45,1855,990"
 curl -X POST "http://<jetson-ip>:8000/camera/crop?value=false"             # full frame again
 ```
 

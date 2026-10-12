@@ -178,13 +178,15 @@ def _live_box(box):
 # deliberately NOT cropped, so it stays the full-scene view you re-aim against.
 # Crop is back ON as of 2026-10-07: the hardware team settled on a steel tray
 # with a measuring grid on its floor. The box is the tray's OUTER rim with a
-# ~10 px margin, measured off a real full frame by the steel edges — the
-# client wants the tray edges visible in the capture (2026-10-12), so the
-# floor-only box (350,185,1760,925) that cut the sloped rim walls away was
-# replaced. All fish lie well within it. (The 2026-09-23 box on the old mount
-# was 248,118,1830,986.) De-glare and enhance stay off on this branch; the
-# crop is pure geometry.
-_CROP_DEFAULT = "250,70,1860,975"
+# ~30 px margin of floor on every side — the client wants the tray edges
+# clearly visible in the capture (2026-10-12), so the floor-only box
+# (350,185,1760,925) that cut the sloped rim walls away was replaced, and the
+# first rim box (250,70,1860,975) was widened after the tray was found to sit
+# ~25 px further up-left than on the 2026-10-07 frame it was measured on.
+# Rim measured at ~245,76,1825,960. All fish lie well within it. (The
+# 2026-09-23 box on the old mount was 248,118,1830,986.) De-glare and enhance
+# stay off on this branch; the crop is pure geometry.
+_CROP_DEFAULT = "215,45,1855,990"
 
 
 def _parse_crop(spec: str, name: str = "STREAM_API_CROP"):
