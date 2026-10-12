@@ -181,12 +181,12 @@ def _live_box(box):
 # ~30 px margin of floor on every side — the client wants the tray edges
 # clearly visible in the capture (2026-10-12), so the floor-only box
 # (350,185,1760,925) that cut the sloped rim walls away was replaced, and the
-# first rim box (250,70,1860,975) was widened after the tray was found to sit
-# ~25 px further up-left than on the 2026-10-07 frame it was measured on.
-# Rim measured at ~245,76,1825,960. All fish lie well within it. (The
-# 2026-09-23 box on the old mount was 248,118,1830,986.) De-glare and enhance
-# stay off on this branch; the crop is pure geometry.
-_CROP_DEFAULT = "215,45,1855,990"
+# box was re-measured on a 2026-10-12 full frame (?crop=false) after two
+# boxes worked back from cropped captures came out off by ~25 px: the outer
+# rim sits at 247,115,1832,990, verified by overlay. (The 2026-09-23 box on
+# the old mount was 248,118,1830,986.) De-glare and enhance stay off on this
+# branch; the crop is pure geometry. Always measure from ?crop=false.
+_CROP_DEFAULT = "222,90,1857,1015"
 
 
 def _parse_crop(spec: str, name: str = "STREAM_API_CROP"):
