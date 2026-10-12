@@ -211,15 +211,26 @@ sudo systemctl daemon-reload && sudo systemctl restart stream-api
 
 `/stream` is never cropped, so use it in a browser while re-aiming the camera.
 
-The box can be set live now — no unit edit while you are still moving things:
+**The crop finds the tray itself now** (`STREAM_API_CROP=auto`, the default). Every
+cropped capture looks for the tray's rim in the full frame and follows it, so a nudged
+camera or table needs nothing from you. Check it is actually finding it:
 
 ```bash
-curl -s -o full.jpg "http://<jetson-ip>:8000/capture?crop=false"          # read corners off this
-curl -X POST "http://<jetson-ip>:8000/camera/crop?value=true&box=249,117,1830,988"
-curl -X POST "http://<jetson-ip>:8000/camera/crop?value=false"             # full frame again
+curl -s -D - -o cap.jpg "http://<jetson-ip>:8000/capture" | grep -i x-crop
+#   X-Crop-Source: auto      -> found the tray on this frame
+#   X-Crop-Source: fallback  -> nothing tray-sized found; serving the seed box
+curl -s "http://<jetson-ip>:8000/health" | python3 -c "import sys,json; print(json.load(sys.stdin)['camera']['crop'])"
 ```
 
-Once it settles, keep it with `Environment=STREAM_API_CROP=`.
+`fallback` on a frame that plainly shows the tray means the rim size has changed — the
+camera was raised or lowered — so re-seed `STREAM_API_TRAY_SIZE` with the rim's width
+and height in a `?crop=false` capture. To pin a box or switch it off:
+
+```bash
+curl -X POST "http://<jetson-ip>:8000/camera/crop?value=true&box=249,117,1830,988"   # fixed
+curl -X POST "http://<jetson-ip>:8000/camera/crop?value=auto"                        # back to auto
+curl -X POST "http://<jetson-ip>:8000/camera/crop?value=false"                       # full frame
+```
 
 ## 7d. Tune the de-glare pass
 

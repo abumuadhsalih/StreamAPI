@@ -186,7 +186,24 @@ def _live_box(box):
 # 25 px margin (222,90,1857,1015) for showing floor. (The 2026-09-23 box on
 # the old mount was 248,118,1830,986.) De-glare and enhance stay off on
 # this branch; the crop is pure geometry.
-_CROP_DEFAULT = "249,117,1830,988"
+# AUTO as of 2026-10-12: the hardware team nudges the camera or the table
+# between sessions, and every nudge meant a new box typed in by hand (five of
+# them in a week, two of them wrong because they were worked back from an
+# already-cropped capture). STREAM_API_CROP=auto makes /capture find the tray
+# itself — see detect_tray() — with the box below as the seed and the
+# fallback while nothing has been detected yet. An explicit x1,y1,x2,y2 pins
+# the box; empty disables the crop.
+_CROP_DEFAULT = "auto"
+_CROP_FALLBACK = "249,117,1830,988"  # outer rim measured on a 2026-10-12 full frame
+
+# What detect_tray() looks for: the tray's outer rim size in reference-frame
+# pixels at the current mount height, with a +-3.5% tolerance. That tolerance
+# is deliberately tight. The rim's inner lip and the floor/wall edge both sit
+# 4-8% inside the outer edge, so a looser window lets a mixed inner/outer pair
+# through; a tighter one would reject a real tray after a small height change.
+# Re-seed STREAM_API_TRAY_SIZE if the camera is raised or lowered by more.
+_TRAY_SIZE_DEFAULT = "1581,871"
+_TRAY_SIZE_TOL = 0.035
 
 
 def _parse_crop(spec: str, name: str = "STREAM_API_CROP"):
@@ -211,13 +228,124 @@ def _parse_crop(spec: str, name: str = "STREAM_API_CROP"):
     return (x1, y1, x2, y2)
 
 
-CROP_BOX = _parse_crop(os.environ.get("STREAM_API_CROP", _CROP_DEFAULT))
+def _parse_tray_size(spec: str):
+    try:
+        w, h = (int(v) for v in spec.split(","))
+        if w < 100 or h < 100:
+            raise ValueError
+        return (w, h)
+    except ValueError:
+        logger.warning("STREAM_API_TRAY_SIZE=%r is not 'w,h' — using %s", spec, _TRAY_SIZE_DEFAULT)
+        return _parse_tray_size(_TRAY_SIZE_DEFAULT)
 
-# The box in force. POST /camera/crop moves it live — the hardware team is
-# re-laying the tray between captures, so a box that needs a unit edit and a
-# restart to change is a box nobody updates. Reference-frame coordinates,
-# like CROP_BOX; a service restart returns to STREAM_API_CROP.
-_crop = {"box": list(CROP_BOX) if CROP_BOX else None}
+
+TRAY_SIZE = _parse_tray_size(os.environ.get("STREAM_API_TRAY_SIZE", _TRAY_SIZE_DEFAULT))
+
+_crop_env = os.environ.get("STREAM_API_CROP", _CROP_DEFAULT).strip()
+CROP_AUTO = _crop_env.lower() == "auto"
+CROP_BOX = _parse_crop(_CROP_FALLBACK if CROP_AUTO else _crop_env)
+
+# The crop in force. mode is "auto" (detect_tray() on every cropped capture,
+# box = the last good detection or the seed), "manual" (a fixed box) or
+# "off". POST /camera/crop moves all of it live — the hardware team re-lays
+# the tray between captures, so a box that needs a unit edit and a restart is
+# a box nobody updates. Boxes are reference-frame coordinates; a service
+# restart returns to STREAM_API_CROP. `detected` is the last auto result, so
+# /health shows whether the box being served was found or inherited.
+_crop = {
+    "box": list(CROP_BOX) if CROP_BOX else None,
+    "mode": "auto" if CROP_AUTO else ("manual" if CROP_BOX else "off"),
+    "source": "fallback" if CROP_AUTO else ("manual" if CROP_BOX else None),
+    "detected": None,
+}
+
+
+def _edge_peaks(profile: np.ndarray, min_sep: int = 8):
+    """Local maxima of a 1-D edge-strength profile, strongest first."""
+    thr = max(2.0, float(np.median(profile)) * 1.8)
+    out: list = []
+    for i in np.argsort(profile)[::-1]:
+        v = float(profile[i])
+        if v < thr:
+            break
+        if (i == 0 or v >= profile[i - 1]) and (i == len(profile) - 1 or v >= profile[i + 1]):
+            if all(abs(i - j) >= min_sep for j, _ in out):
+                out.append((int(i), v))
+    return out
+
+
+def _best_pair(peaks, expected: int, tol: float, min_rel: float = 0.35):
+    """Strong edge pair whose spacing is closest to `expected`, or None."""
+    if not peaks:
+        return None
+    vmax = max(v for _, v in peaks)
+    lo, hi = expected * (1 - tol), expected * (1 + tol)
+    best = None
+    for a, va in peaks:
+        if va < min_rel * vmax:
+            continue
+        for b, vb in peaks:
+            if vb < min_rel * vmax:
+                continue
+            d = b - a
+            if lo <= d <= hi:
+                err = abs(d - expected) / expected
+                if best is None or err < best[0]:
+                    best = (err, a, b)
+    return None if best is None else (best[1], best[2])
+
+
+def detect_tray(frame):
+    """Find the tray's rim in a full frame. Returns (x1,y1,x2,y2) in reference
+    coordinates, or None when nothing tray-sized is there.
+
+    The tray is the one large rectangle with long straight steel edges, so:
+    take the gradient image, average |d/dx| over the middle 60% of rows to
+    get one edge-strength profile across x (and |d/dy| over the middle 50%
+    of columns for y), find its peaks, and pick the left/right (top/bottom)
+    pair whose spacing is closest to TRAY_SIZE within _TRAY_SIZE_TOL. The
+    size prior is what makes it safe: a hand over the rim, fish lying across
+    it or the sheet beside the table all fail to produce a tray-sized pair
+    and the caller keeps the last good box. Averaging across the frame is
+    why fish do not matter — they perturb a few rows out of 650.
+
+    Checked on every full frame from this project (Sep 22/23, Oct 7 with
+    fish, Oct 12): lands on the rim every time, within ~15 px of a hand
+    measurement; the only spread is whether it takes the rim's outer edge or
+    its inner lip. Fails cleanly on the black-cloth frames. ~5 ms at 1080p.
+    """
+    if (frame.shape[1], frame.shape[0]) != (CAPTURE_WIDTH, CAPTURE_HEIGHT):
+        frame = cv2.resize(frame, (CAPTURE_WIDTH, CAPTURE_HEIGHT), interpolation=cv2.INTER_AREA)
+    g = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (0, 0), 1.2).astype(np.float32)
+    h, w = g.shape
+    gx = np.abs(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3))[int(h * 0.2):int(h * 0.8)].mean(axis=0)
+    gy = np.abs(cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3))[:, int(w * 0.25):int(w * 0.75)].mean(axis=1)
+    px = _best_pair(_edge_peaks(gx), TRAY_SIZE[0], _TRAY_SIZE_TOL)
+    py = _best_pair(_edge_peaks(gy), TRAY_SIZE[1], _TRAY_SIZE_TOL)
+    if px is None or py is None:
+        return None
+    return (px[0], py[0], px[1], py[1])
+
+
+def _auto_crop(frame) -> None:
+    """Run detect_tray() on a native frame and fold the result into _crop.
+
+    A detection replaces the box only when an edge moved by more than 3 px,
+    so a static tray gives a pixel-identical crop capture after capture
+    instead of jittering. A miss keeps the last good box and is reported.
+    """
+    found = detect_tray(frame)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    if found is None:
+        _crop["detected"] = {"ok": False, "box": None, "at": now}
+        return
+    cur = _crop["box"]
+    if cur is None or any(abs(a - b) > 3 for a, b in zip(found, cur)):
+        if cur is not None and _crop["source"] == "auto":
+            logger.info("tray moved: crop %s -> %s", cur, list(found))
+        _crop["box"] = list(found)
+    _crop["source"] = "auto"
+    _crop["detected"] = {"ok": True, "box": list(found), "at": now}
 
 # De-glare strength/radius in force. Constants here beside CROP_BOX because
 # camera_status reports both; the filter itself lives with the other image
@@ -663,8 +791,18 @@ else:
         _camera_mode.update(_mode_dict(name))
         return camera_status
 
+    _STUB_FRAME = None
+    if os.environ.get("STREAM_API_STUB_FRAME"):
+        # Dev only: serve a real capture from disk so crop detection and the
+        # image passes can be exercised on a laptop against a genuine frame.
+        _STUB_FRAME = cv2.imread(os.environ["STREAM_API_STUB_FRAME"])
+        if _STUB_FRAME is None:
+            logger.warning("STREAM_API_STUB_FRAME=%r could not be read", os.environ["STREAM_API_STUB_FRAME"])
+
     def _grab_frame():
         """Return a placeholder frame when no ZED is available."""
+        if _STUB_FRAME is not None:
+            return cv2.resize(_STUB_FRAME, (_camera_mode["width"], _camera_mode["height"]), interpolation=cv2.INTER_AREA)
         frame = np.zeros((_camera_mode["height"], _camera_mode["width"], 3), dtype=np.uint8)
         cv2.putText(
             frame,
@@ -1787,12 +1925,16 @@ def capture(
               X-Resolution.
     """
     native = (_camera_mode["width"], _camera_mode["height"])
-    box = _live_box(_crop["box"]) if crop else None
-    if box:
+    box = None
+    if crop and _crop["mode"] != "off":
         # Crop from the full-resolution frame, then scale — cropping a frame
         # that was already downscaled to the preset would throw away the
-        # resolution the crop exists to preserve.
+        # resolution the crop exists to preserve. Auto mode needs the full
+        # frame anyway: the tray is found on this very frame.
         image = get_color_frame(*native)
+        if image is not None and _crop["mode"] == "auto":
+            _auto_crop(image)
+        box = _live_box(_crop["box"])
     else:
         image = get_color_frame(*(RESOLUTIONS[preset] if preset else native))
     if image is None:
@@ -1809,6 +1951,7 @@ def capture(
         x1, y1, x2, y2 = box
         image = image[y1:y2, x1:x2]
         headers["X-Crop"] = f"{x1},{y1},{x2},{y2}"
+        headers["X-Crop-Source"] = str(_crop["source"])
         scale = RESOLUTIONS[preset][0] / native[0] if preset else 1.0
         if scale != 1.0:
             image = cv2.resize(
@@ -1983,23 +2126,43 @@ def camera_aec_roi(
     )
 
 
-@app.post("/camera/crop", summary="Set or clear the /capture tray crop box live")
+@app.post("/camera/crop", summary="Set the /capture crop: auto-detect, a fixed box, or off")
 def camera_crop(
-    value: bool = Query(...),
+    value: str = Query(...),
     box: Optional[str] = Query(None),
 ):
     """
-    value: true  — crop every param-less /capture to `box` (required the first
-                   time; omitted afterwards keeps the current box).
-           false — full frame for everyone; the box is forgotten.
+    value: auto  — find the tray on every cropped capture (detect_tray) and
+                   follow it when the camera or table is moved. The current
+                   box, or ?box= if given, is the fallback until the first
+                   detection. This is the shipped default.
+           true  — pin a fixed box: ?box= required the first time, omitted
+                   afterwards keeps the current one.
+           false — full frame for everyone.
     box:   x1,y1,x2,y2 in 1920x1080 pixels, read off a ?crop=false capture.
            Scaled automatically if the camera is in 2K mode.
 
     Pure software, nothing is sent to the camera, so it applies to the next
     capture immediately. ?crop=false on a single request still overrides it.
     Survives anything but a service restart, which returns to STREAM_API_CROP.
+    /health camera.crop shows mode, source and the last detection; every
+    cropped capture carries X-Crop and X-Crop-Source (auto/manual/fallback).
     """
-    if value:
+    v = value.strip().lower()
+    if v == "auto":
+        if box is not None:
+            seed = _parse_crop(box, "box")
+            if seed is None:
+                return JSONResponse(
+                    content={"error": "no crop box", "detail": "?box= is not a valid x1,y1,x2,y2"},
+                    status_code=400,
+                )
+            _crop["box"] = list(seed)
+            _crop["source"] = "fallback"
+        elif _crop["source"] != "auto":
+            _crop["source"] = "fallback" if _crop["box"] else None
+        _crop["mode"] = "auto"
+    elif v in ("true", "1", "on", "yes"):
         new = _parse_crop(box, "box") if box is not None else _crop["box"]
         if new is None:
             return JSONResponse(
@@ -2011,10 +2174,15 @@ def camera_crop(
                 },
                 status_code=400,
             )
-        _crop["box"] = list(new)
+        _crop.update({"box": list(new), "mode": "manual", "source": "manual"})
+    elif v in ("false", "0", "off", "no"):
+        _crop.update({"box": None, "mode": "off", "source": None})
     else:
-        _crop["box"] = None
-    logger.info("capture crop now %s", _crop["box"] or "off")
+        return JSONResponse(
+            content={"error": "bad value", "detail": "value must be auto, true or false"},
+            status_code=400,
+        )
+    logger.info("capture crop now mode=%s box=%s", _crop["mode"], _crop["box"])
     return {"crop": dict(_crop)}
 
 

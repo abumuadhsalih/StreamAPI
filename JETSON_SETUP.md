@@ -507,7 +507,8 @@ Set these as `Environment=` lines in `/etc/systemd/system/stream-api.service` (v
 | `STREAM_API_CAMERA_CONTRAST` | `4` | ZED ISP contrast, 0-8. Raise for punch in-camera, before de-glare |
 | `STREAM_API_DEGLARE_STRENGTH` | `0` | Software de-glare, 0-100. `0` disables it for every client. Tune live with `POST /camera/deglare` |
 | `STREAM_API_DEGLARE_SIGMA` | `60` | De-glare radius in full-frame px. Larger = gentler; below ~40 it haloes the fish |
-| `STREAM_API_CROP` | `249,117,1830,988` | `/capture` tray crop box in full-frame coords. Empty disables it. Set live with `POST /camera/crop?value=true&box=`. Re-measure after any camera move — see ZED_MIGRATION.md |
+| `STREAM_API_CROP` | `auto` | `/capture` crop. `auto` finds the tray rim on every capture and follows it when the camera or table moves; `x1,y1,x2,y2` pins a box; empty disables it. Live: `POST /camera/crop?value=auto|true|false&box=` |
+| `STREAM_API_TRAY_SIZE` | `1581,871` | What `auto` looks for: the rim's size in full-frame px at the current mount height, ±3.5%. Re-seed only if the camera is raised or lowered |
 | `STREAM_API_CAMERA_MODE` | `fhd` | Sensor mode: `fhd` 1920x1080@30 (default) or `2k` 2208x1242@15. Same FOV. Switch live with `POST /camera/resolution` |
 | `STREAM_API_AEC_ROI` | *(empty = off)* | Auto-exposure metering box. `tray` follows `STREAM_API_CROP`; or `x1,y1,x2,y2`. Off = the camera meters the whole frame. A/B it live with `POST /camera/aec-roi` before setting it here — see ZED_MIGRATION.md §7f |
 | `STREAM_API_CAMERA_BRIGHTNESS` | `4` | ZED ISP brightness, 0-8. Lower = darker frame with auto-exposure still running. Does **not** recover blown glare — see ZED_MIGRATION.md |
