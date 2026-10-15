@@ -350,6 +350,36 @@ def _auto_crop(frame) -> None:
     _crop["source"] = "auto"
     _crop["detected"] = {"ok": True, "box": list(found), "at": now}
 
+# Physical scale of the image, for the AI team's fish-length measurement.
+# The camera is fixed straight above the tray, the left view is rectified,
+# and the tray floor carries a printed grid, so one number converts pixels
+# to millimetres anywhere in the frame: GRID_MM (the square size — 10 mm
+# assumed, to be confirmed by the hardware team) over GRID_PX (the square's
+# pitch in reference-frame pixels at the current mount height — 29, measured
+# by autocorrelation on the 2026-10-14 capture). /capture reports the value
+# for the frame it actually returns in X-Mm-Per-Px, corrected for crop
+# scaling, presets and the 2K mode, so a client never has to know which of
+# those applied. The number is for the plane of the tray floor; the top of a
+# 3 cm thick fish sits that much closer to the lens and reads ~3% long, which
+# is the accuracy limit of this method. Re-measure GRID_PX if the camera is
+# raised or lowered — POST /camera/scale does it live, STREAM_API_GRID_PX
+# makes it permanent.
+def _float_env(name: str, default: str, lo: float, hi: float) -> float:
+    try:
+        v = float(os.environ.get(name, default))
+    except ValueError:
+        logger.warning("%s=%r is not a number, using %s", name, os.environ.get(name), default)
+        v = float(default)
+    if not lo <= v <= hi:
+        logger.warning("%s=%s out of range %s-%s, using %s", name, v, lo, hi, default)
+        v = float(default)
+    return v
+
+
+GRID_MM = _float_env("STREAM_API_GRID_MM", "10", 1, 100)
+GRID_PX = _float_env("STREAM_API_GRID_PX", "29", 5, 500)
+_scale = {"grid_mm": GRID_MM, "grid_px": GRID_PX, "mm_per_px": round(GRID_MM / GRID_PX, 5)}
+
 # De-glare strength/radius in force. Constants here beside CROP_BOX because
 # camera_status reports both; the filter itself lives with the other image
 # processing further down, next to enhance_for_text().
@@ -426,6 +456,8 @@ camera_status: dict = {
     "aec_roi": _aec_roi,
     # Sensor mode the camera is running in (POST /camera/resolution).
     "resolution": _camera_mode,
+    # Pixel-to-millimetre calibration at the reference resolution (POST /camera/scale).
+    "scale": _scale,
 }
 # `port` is the device actually opened (discovery can pick it, so the configured
 # value is not always the answer) and `format` is the parser layer the last
@@ -520,6 +552,13 @@ if sys.platform == "linux":
 
     CAMERA_BRIGHTNESS = _isp_env("STREAM_API_CAMERA_BRIGHTNESS")
     CAMERA_CONTRAST = _isp_env("STREAM_API_CAMERA_CONTRAST")
+    # SATURATION (0-8, default 4) is the third ISP output control, added
+    # 2026-10-15: on the steel tray the fish measure a saturation of ~10 on a
+    # 0-255 scale against ~8 for the floor, so the red and orange species sit
+    # almost grey and the client's phone photos run at ~17. Raising it in the
+    # ISP is cleaner than boosting colour after the fact, and like the other
+    # two it leaves auto-exposure and auto-WB untouched.
+    CAMERA_SATURATION = _isp_env("STREAM_API_CAMERA_SATURATION")
 
     # The values actually in force. POST /camera/brightness moves them; every
     # _open_camera() re-applies them. That is the whole point of keeping them
@@ -528,7 +567,11 @@ if sys.platform == "linux":
     # noticed silently reverted a hand-tuned value mid-session. Here a self-heal
     # keeps what you set; only a service restart returns to the env/constants,
     # which is deliberate — nothing poked in while testing leaks into production.
-    _isp = {"brightness": CAMERA_BRIGHTNESS, "contrast": CAMERA_CONTRAST}
+    _isp = {
+        "brightness": CAMERA_BRIGHTNESS,
+        "contrast": CAMERA_CONTRAST,
+        "saturation": CAMERA_SATURATION,
+    }
 
     _SL_RESOLUTION = {"fhd": sl.RESOLUTION.HD1080, "2k": sl.RESOLUTION.HD2K}
 
@@ -588,8 +631,10 @@ if sys.platform == "linux":
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, _isp["brightness"])
         _zed.set_camera_settings(sl.VIDEO_SETTINGS.CONTRAST, _isp["contrast"])
+        _zed.set_camera_settings(sl.VIDEO_SETTINGS.SATURATION, _isp["saturation"])
         camera_status["brightness"] = _isp["brightness"]
         camera_status["contrast"] = _isp["contrast"]
+        camera_status["saturation"] = _isp["saturation"]
 
     def _open_camera() -> bool:
         """(Re)open the ZED. Caller must hold _camera_lock."""
@@ -709,6 +754,7 @@ if sys.platform == "linux":
     _ISP_SETTINGS = {
         "brightness": "BRIGHTNESS",
         "contrast": "CONTRAST",
+        "saturation": "SATURATION",
     }
 
     def set_camera_isp(**values: Optional[int]) -> dict:
@@ -1979,6 +2025,10 @@ def capture(
         # Surface what the adaptive lift did so an on-site A/B needs no guesswork.
         headers["X-Enhance-Gamma"] = str(stats["gamma"])
         headers["X-Enhance-Median"] = str(stats["median"])
+    # Physical scale of THIS image: the reference-frame value corrected by how
+    # many output pixels each reference pixel became (crop scaling, presets, 2K).
+    ref_w = (_crop["box"][2] - _crop["box"][0]) if box else CAPTURE_WIDTH
+    headers["X-Mm-Per-Px"] = f"{_scale['mm_per_px'] * ref_w / image.shape[1]:.4f}"
     headers["X-Resolution"] = f"{image.shape[1]}x{image.shape[0]}"
     _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 100])
     return Response(content=jpeg.tobytes(), media_type="image/jpeg", headers=headers)
@@ -2055,16 +2105,22 @@ def camera_deglare(
     return {"deglare": dict(_deglare)}
 
 
-@app.post("/camera/brightness", summary="Set the ZED ISP brightness/contrast (on-site A/B)")
+@app.post("/camera/brightness", summary="Set the ZED ISP brightness/contrast/saturation (on-site A/B)")
 def camera_brightness(
     value: Optional[int] = Query(None, ge=0, le=8),
     contrast: Optional[int] = Query(None, ge=0, le=8),
+    saturation: Optional[int] = Query(None, ge=0, le=8),
 ):
     """
-    value:    ISP output brightness, 0-8 (SDK default 4).
-    contrast: ISP contrast, 0-8 (SDK default 4). Raising this is the in-camera
-              answer to the flatness the de-glare pass leaves behind — it adds
-              punch before the software correction rather than after it.
+    value:      ISP output brightness, 0-8 (SDK default 4).
+    contrast:   ISP contrast, 0-8 (SDK default 4). Raising this is the in-camera
+                answer to the flatness the de-glare pass leaves behind — it adds
+                punch before the software correction rather than after it.
+    saturation: ISP colour saturation, 0-8 (SDK default 4). The fish on the
+                steel tray come out almost grey (saturation ~10/255 against
+                ~17 on the client's phone); 5 or 6 brings the red and orange
+                species back without touching exposure. Try one step at a time
+                and judge on the silver fish — they must stay silver.
 
     Neither is manual exposure; auto-exposure and auto-WB keep running. Omitted
     values are left alone.
@@ -2077,7 +2133,7 @@ def camera_brightness(
     the sensor, so lowering it dims the whole frame without bringing the bands
     back. See ZED_MIGRATION.md.
     """
-    status = set_camera_isp(brightness=value, contrast=contrast)
+    status = set_camera_isp(brightness=value, contrast=contrast, saturation=saturation)
     return JSONResponse(
         content={"camera": status},
         status_code=200 if status["ok"] else 503,
@@ -2187,6 +2243,30 @@ def camera_crop(
         )
     logger.info("capture crop now mode=%s box=%s", _crop["mode"], _crop["box"])
     return {"crop": dict(_crop)}
+
+
+@app.post("/camera/scale", summary="Set the pixel-to-millimetre calibration live")
+def camera_scale(
+    grid_px: Optional[float] = Query(None, ge=5, le=500),
+    grid_mm: Optional[float] = Query(None, ge=1, le=100),
+):
+    """
+    grid_px: pitch of one grid square in full-frame (1920x1080) pixels at the
+             current mount height. Measure it on a ?crop=false capture.
+    grid_mm: real size of one grid square in millimetres.
+
+    mm per pixel = grid_mm / grid_px. Every /capture then carries X-Mm-Per-Px
+    for the image it returns, already corrected for crop scaling, presets and
+    the 2K mode. Omitted values are left alone. Survives anything but a service
+    restart, which returns to STREAM_API_GRID_PX / STREAM_API_GRID_MM.
+    """
+    if grid_px is not None:
+        _scale["grid_px"] = grid_px
+    if grid_mm is not None:
+        _scale["grid_mm"] = grid_mm
+    _scale["mm_per_px"] = round(_scale["grid_mm"] / _scale["grid_px"], 5)
+    logger.info("scale now %s", _scale)
+    return {"scale": dict(_scale)}
 
 
 # ---------------------------------------------------------------------------

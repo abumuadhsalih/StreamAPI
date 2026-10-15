@@ -329,7 +329,48 @@ It survives a self-heal reopen but not a restart; keep it with
 `Environment=STREAM_API_AEC_ROI=tray` (follows the crop box, so re-measuring one
 re-measures both) or an explicit `x1,y1,x2,y2`. `/health` reports it as `camera.aec_roi`.
 
-## 7g. 2K sensor mode
+## 7g. Colour, in camera
+
+The fish on the steel tray measure a saturation of ~10 (0-255) against ~17 on the
+client's phone — the red and orange species come out nearly grey. The ZED's own
+saturation control is the lever; one step at a time, and judge on the silver fish,
+which must stay silver.
+
+```bash
+curl -X POST "http://<jetson-ip>:8000/camera/brightness?saturation=5"
+curl -s -o sat5.jpg "http://<jetson-ip>:8000/capture"
+curl -X POST "http://<jetson-ip>:8000/camera/brightness?saturation=6"
+curl -s -o sat6.jpg "http://<jetson-ip>:8000/capture"
+curl -X POST "http://<jetson-ip>:8000/camera/brightness?saturation=4"      # back to default
+```
+
+Keep one with `Environment=STREAM_API_CAMERA_SATURATION=`.
+
+## 7h. Size calibration for the AI team
+
+Every `/capture` carries `X-Mm-Per-Px`: multiply a fish's pixel length in that image
+by it to get millimetres. It is computed from the tray grid — square size in mm over
+square pitch in full-frame pixels — and corrected for the crop, presets and 2K, so the
+client reads one header and never needs to know which applied.
+
+Two numbers to confirm on-site:
+
+1. **Square size.** Ask the hardware team what the grid squares are (10 mm assumed).
+2. **Square pitch in pixels.** On a `?crop=false` capture, count N squares along a
+   clean stretch of the grid and divide the pixel distance by N. 29 px was measured
+   on the 2026-10-14 frame.
+
+```bash
+curl -X POST "http://<jetson-ip>:8000/camera/scale?grid_px=29&grid_mm=10"
+curl -s -D - -o /dev/null "http://<jetson-ip>:8000/capture" | grep -i x-mm-per-px
+```
+
+Sanity check: lay a ruler or a known-length object on the tray, capture, measure it in
+pixels, multiply by the header. It should land within ~3%. Keep the values with
+`Environment=STREAM_API_GRID_PX=` / `STREAM_API_GRID_MM=`; re-measure the pitch only
+if the camera is raised or lowered.
+
+## 7i. 2K sensor mode
 
 Same 110-deg field of view, 1.15x the pixels per fish, half the frame rate (15 fps).
 Resolution was not the bottleneck in the mobile-vs-ours comparison, so this is a

@@ -505,6 +505,9 @@ Set these as `Environment=` lines in `/etc/systemd/system/stream-api.service` (v
 | `STREAM_API_SCALE_STREAM_INTERVAL` | `0.1` | SSE pacing, 10 Hz |
 | `STREAM_API_ENHANCE` | `1` | Whether a param-less `/capture` gets CLAHE + shadow lift. `0` turns it off for every client |
 | `STREAM_API_CAMERA_CONTRAST` | `4` | ZED ISP contrast, 0-8. Raise for punch in-camera, before de-glare |
+| `STREAM_API_CAMERA_SATURATION` | `4` | ZED ISP colour saturation, 0-8. 5-6 brings the red/orange fish back; silver fish must stay silver. Live: `POST /camera/brightness?saturation=` |
+| `STREAM_API_GRID_MM` | `10` | Real size of one tray-grid square, mm. Confirm with the hardware team |
+| `STREAM_API_GRID_PX` | `29` | That square's pitch in full-frame px at the current mount height. Every `/capture` carries `X-Mm-Per-Px` = mm/px for the image returned. Re-measure if the camera is raised or lowered; live: `POST /camera/scale?grid_px=` |
 | `STREAM_API_DEGLARE_STRENGTH` | `100` | Software de-glare, 0-100. `0` disables it for every client. Tune live with `POST /camera/deglare` |
 | `STREAM_API_DEGLARE_SIGMA` | `60` | De-glare radius in full-frame px. Larger = gentler; below ~40 it haloes the fish |
 | `STREAM_API_CROP` | `auto` | `/capture` crop. `auto` finds the tray rim on every capture and follows it when the camera or table moves; `x1,y1,x2,y2` pins a box; empty disables it. Live: `POST /camera/crop?value=auto|true|false&box=` |
@@ -559,7 +562,7 @@ curl -s localhost:8000/health
 `GET` — `/stream` (MJPEG), `/capture` (JPEG, `?preset=sd|hd|fhd`, `?crop=true|false` — default `true`, tray only, `?deglare=true|false` — default `true`, `?enhance=` defaults to the server setting (ships on); exposure/gain/WB are the camera's own auto modes),
 `/scale/stream` (SSE), `/scale/capture`, `/battery/capture`, `/health`, `/system/stats`,
 `/docs` (Swagger).
-`POST` — `/camera/restart`, `/camera/brightness?value=&contrast=`, `/camera/deglare?strength=&sigma=`, `/camera/enhance?value=`, `/camera/aec-roi?value=&box=`, `/camera/crop?value=&box=`, `/camera/resolution?value=`, `/scale/reconnect`, `/system/reboot`, `/system/shutdown`,
+`POST` — `/camera/restart`, `/camera/brightness?value=&contrast=&saturation=`, `/camera/deglare?strength=&sigma=`, `/camera/enhance?value=`, `/camera/aec-roi?value=&box=`, `/camera/crop?value=&box=`, `/camera/resolution?value=`, `/camera/scale?grid_px=&grid_mm=`, `/scale/reconnect`, `/system/reboot`, `/system/shutdown`,
 `/system/restart-service`.
 
 ---

@@ -24,11 +24,12 @@ An API server running on a Jetson to expose a Stereolabs ZED 2i camera (RGB), a 
 | `/health` | GET | Per-device status + last error |
 | `/system/stats` | GET | CPU / memory / disk / temperature / uptime |
 | `/camera/restart` | POST | Force a ZED camera close+reopen |
-| `/camera/brightness` | POST | Set the ZED ISP brightness 0-8 live (on-site A/B; resets to the env default on service restart) |
+| `/camera/brightness` | POST | Set the ZED ISP brightness / contrast / saturation, each 0-8, live (on-site A/B; resets to the env default on service restart) |
 | `/camera/deglare` | POST | Tune the de-glare pass live (`strength` 0-100, `sigma` 10-300); same reset-on-restart rule |
 | `/camera/enhance` | POST | Flip the `/capture` enhance default live — the only image params-less clients can receive |
 | `/camera/aec-roi` | POST | Meter auto-exposure on the tray only (`value` bool, optional `box`); off by default, same reset-on-restart rule |
 | `/camera/crop` | POST | `/capture` crop live: `value=auto` finds the tray rim itself and follows it, `true&box=` pins a box, `false` clears; same reset-on-restart rule |
+| `/camera/scale` | POST | Set the pixel-to-mm calibration (`grid_px`, `grid_mm`) live; every `/capture` carries `X-Mm-Per-Px` for the image it returns |
 | `/camera/resolution` | POST | Switch the sensor mode live: `fhd` (1080p@30, default) or `2k` (2208x1242@15); bare `/capture` returns the native size |
 | `/scale/reconnect` | POST | Force the scale serial port to reopen |
 | `/system/reboot` | POST | Reboot the Jetson (admin-token guarded) |
