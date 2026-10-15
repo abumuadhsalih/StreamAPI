@@ -507,6 +507,8 @@ Set these as `Environment=` lines in `/etc/systemd/system/stream-api.service` (v
 | `STREAM_API_CAMERA_CONTRAST` | `4` | ZED ISP contrast, 0-8. Raise for punch in-camera, before de-glare |
 | `STREAM_API_CAMERA_SATURATION` | `4` | ZED ISP colour saturation, 0-8. 5-6 brings the red/orange fish back; silver fish must stay silver. Live: `POST /camera/brightness?saturation=` |
 | `STREAM_API_GRID_MM` | `10` | Real size of one tray-grid square, mm. Confirm with the hardware team |
+| `STREAM_API_STEREO_FILL` | `0` | Experiment: fill the left image's clipped strips from the right eye on every `/capture`. Live: `POST /camera/stereo?value=` |
+| `STREAM_API_STEREO_SHIFT` | *(empty = estimate)* | Tray-plane disparity between the eyes in full-frame px; empty estimates it per capture |
 | `STREAM_API_GRID_PX` | `29` | That square's pitch in full-frame px at the current mount height. Every `/capture` carries `X-Mm-Per-Px` = mm/px for the image returned. Re-measure if the camera is raised or lowered; live: `POST /camera/scale?grid_px=` |
 | `STREAM_API_DEGLARE_STRENGTH` | `100` | Software de-glare, 0-100. `0` disables it for every client. Tune live with `POST /camera/deglare` |
 | `STREAM_API_DEGLARE_SIGMA` | `60` | De-glare radius in full-frame px. Larger = gentler; below ~40 it haloes the fish |
@@ -561,8 +563,8 @@ curl -s localhost:8000/health
 
 `GET` — `/stream` (MJPEG), `/capture` (JPEG, `?preset=sd|hd|fhd`, `?crop=true|false` — default `true`, tray only, `?deglare=true|false` — default `true`, `?enhance=` defaults to the server setting (ships on); exposure/gain/WB are the camera's own auto modes),
 `/scale/stream` (SSE), `/scale/capture`, `/battery/capture`, `/health`, `/system/stats`,
-`/docs` (Swagger).
-`POST` — `/camera/restart`, `/camera/brightness?value=&contrast=&saturation=`, `/camera/deglare?strength=&sigma=`, `/camera/enhance?value=`, `/camera/aec-roi?value=&box=`, `/camera/crop?value=&box=`, `/camera/resolution?value=`, `/camera/scale?grid_px=&grid_mm=`, `/scale/reconnect`, `/system/reboot`, `/system/shutdown`,
+`/capture/stereo?eye=both|left|right` (debug: raw pair), `/docs` (Swagger).
+`POST` — `/camera/restart`, `/camera/brightness?value=&contrast=&saturation=`, `/camera/deglare?strength=&sigma=`, `/camera/enhance?value=`, `/camera/aec-roi?value=&box=`, `/camera/crop?value=&box=`, `/camera/resolution?value=`, `/camera/scale?grid_px=&grid_mm=`, `/camera/stereo?value=&shift=`, `/scale/reconnect`, `/system/reboot`, `/system/shutdown`,
 `/system/restart-service`.
 
 ---

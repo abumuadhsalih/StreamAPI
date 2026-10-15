@@ -380,6 +380,80 @@ GRID_MM = _float_env("STREAM_API_GRID_MM", "10", 1, 100)
 GRID_PX = _float_env("STREAM_API_GRID_PX", "29", 5, 500)
 _scale = {"grid_mm": GRID_MM, "grid_px": GRID_PX, "mm_per_px": round(GRID_MM / GRID_PX, 5)}
 
+# EXPERIMENT (2026-10-15): fill the clipped light strips from the right eye.
+#
+# The ZED's two lenses sit 12 cm apart. The fish are diffuse, so they sit in
+# the same place on the tray in both views, but a mirrored light strip is a
+# specular reflection and moves between the views — for lights ~2 m above a
+# tray ~1 m below the camera the strip shifts by roughly the strip's own
+# width. So where the left image is clipped under a strip, the right image
+# mostly is not. The tray is flat and at a fixed distance, so aligning the
+# right view onto the left is a single horizontal shift (the tray-plane
+# disparity), estimated by phase correlation on the tray region or pinned
+# with STREAM_API_STEREO_SHIFT. Clipped left pixels whose aligned right
+# pixel is not clipped are replaced through a feathered mask; de-glare then
+# evens out whatever brightness step remains. Off by default: untested on
+# hardware, and the gain is expected to be partial.
+STEREO_FILL_DEFAULT = os.environ.get("STREAM_API_STEREO_FILL", "0").strip().lower() in ("1", "true", "yes", "on")
+_STEREO_SHIFT_ENV = os.environ.get("STREAM_API_STEREO_SHIFT", "").strip()
+_stereo = {
+    "enabled": STEREO_FILL_DEFAULT,
+    "shift": float(_STEREO_SHIFT_ENV) if _STEREO_SHIFT_ENV else None,  # pinned, px; None = estimate
+    "last": None,  # what the last capture did
+}
+_STEREO_CLIP = 250
+_STEREO_SHIFT_RANGE = (5.0, 400.0)
+
+
+def estimate_stereo_shift(left, right, box=None):
+    """Horizontal shift that lays the right view onto the left on the tray
+    plane, in pixels of the frames given, or None if the two do not agree.
+
+    Phase correlation on the tray region (rim edges, fish and salt are
+    strong non-periodic features; the grid alone could alias to its own
+    pitch, which is why the region should include the rim). The vertical
+    component must be ~0 — the views are rectified — and the response must be
+    a clear peak, else the pair is rejected rather than trusted.
+    """
+    if box:
+        x1, y1, x2, y2 = box
+        left, right = left[y1:y2, x1:x2], right[y1:y2, x1:x2]
+    g1 = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g2 = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    win = cv2.createHanningWindow((g1.shape[1], g1.shape[0]), cv2.CV_32F)
+    (dx, dy), resp = cv2.phaseCorrelate(g2, g1, win)
+    if resp < 0.03 or abs(dy) > 8 or not _STEREO_SHIFT_RANGE[0] <= dx <= _STEREO_SHIFT_RANGE[1]:
+        logger.info("stereo shift rejected: dx=%.1f dy=%.1f resp=%.3f", dx, dy, resp)
+        return None
+    return float(dx)
+
+
+def fill_clipped_from_right(left, right, shift: float, clip: int = _STEREO_CLIP, feather: float = 4.0):
+    """Replace clipped left pixels with the aligned right view. Returns
+    (image, clipped_fraction, filled_fraction)."""
+    d = int(round(shift))
+    aligned = np.zeros_like(right)
+    if d > 0:
+        aligned[:, d:] = right[:, :-d]
+    elif d < 0:
+        aligned[:, :d] = right[:, -d:]
+    else:
+        aligned = right
+    lclip = left.max(axis=2) >= clip
+    rclip = aligned.max(axis=2) >= clip
+    mask = lclip & ~rclip
+    if d > 0:
+        mask[:, :d] = False  # no right data here
+    elif d < 0:
+        mask[:, d:] = False
+    clipped = float(lclip.mean())
+    if not mask.any():
+        return left, clipped, 0.0
+    mask = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8))
+    alpha = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), feather)[:, :, None]
+    out = left.astype(np.float32) * (1 - alpha) + aligned.astype(np.float32) * alpha
+    return np.clip(out, 0, 255).astype(np.uint8), clipped, float(mask.mean())
+
 # De-glare strength/radius in force. Constants here beside CROP_BOX because
 # camera_status reports both; the filter itself lives with the other image
 # processing further down, next to enhance_for_text().
@@ -458,6 +532,8 @@ camera_status: dict = {
     "resolution": _camera_mode,
     # Pixel-to-millimetre calibration at the reference resolution (POST /camera/scale).
     "scale": _scale,
+    # Right-eye glare fill experiment (POST /camera/stereo).
+    "stereo": _stereo,
 }
 # `port` is the device actually opened (discovery can pick it, so the configured
 # value is not always the answer) and `format` is the parser layer the last
@@ -583,6 +659,7 @@ if sys.platform == "linux":
     _init.sdk_verbose = 0
     _runtime = sl.RuntimeParameters()
     _left = sl.Mat()  # reused across grabs; get_data() aliases its memory
+    _right = sl.Mat()
 
     # Serialize all camera access — sl.Camera grab/retrieve is not thread-safe,
     # and lazy reopen from multiple concurrent requests must be single-flighted.
@@ -710,12 +787,17 @@ if sys.platform == "linux":
         return True
 
     def _grab_frame():
+        return _grab_views(False)[0]
+
+    def _grab_views(want_right: bool):
+        """One grab, left view always, right view too when asked. Returns
+        (left, right); right is None unless asked. Both None on failure."""
         with _camera_lock:
             if not camera_status["ok"]:
                 if time.monotonic() - _camera_last_retry < _CAMERA_RETRY_COOLDOWN:
-                    return None
+                    return None, None
                 if not _open_camera():
-                    return None
+                    return None, None
             # Two attempts per request — masks transient USB hiccups (idle
             # autosuspend, brief re-enumeration, single stalled frame). On the
             # first failure we reopen the camera in-line and try once more so
@@ -728,7 +810,12 @@ if sys.platform == "linux":
                     if err == sl.ERROR_CODE.SUCCESS:
                         _zed.retrieve_image(_left, sl.VIEW.LEFT)
                         # cvtColor also copies out of the reused sl.Mat buffer.
-                        return cv2.cvtColor(_left.get_data(), cv2.COLOR_BGRA2BGR)
+                        left = cv2.cvtColor(_left.get_data(), cv2.COLOR_BGRA2BGR)
+                        right = None
+                        if want_right:
+                            _zed.retrieve_image(_right, sl.VIEW.RIGHT)
+                            right = cv2.cvtColor(_right.get_data(), cv2.COLOR_BGRA2BGR)
+                        return left, right
                     raise RuntimeError(str(err))
                 except Exception as e:
                     logger.info("frame grab attempt %d failed: %s", attempt, e)
@@ -738,10 +825,10 @@ if sys.platform == "linux":
                         pass
                     if attempt == 2:
                         _camera_failed(str(e))
-                        return None
+                        return None, None
                     if not _open_camera():
-                        return None
-            return None
+                        return None, None
+            return None, None
 
     def restart_camera() -> dict:
         """Force a camera close+reopen on demand, bypassing the cooldown."""
@@ -848,6 +935,26 @@ else:
         if _STUB_FRAME is None:
             logger.warning("STREAM_API_STUB_FRAME=%r could not be read", os.environ["STREAM_API_STUB_FRAME"])
 
+    _STUB_FRAME_RIGHT = None
+    if os.environ.get("STREAM_API_STUB_FRAME_RIGHT"):
+        _STUB_FRAME_RIGHT = cv2.imread(os.environ["STREAM_API_STUB_FRAME_RIGHT"])
+
+    def _grab_views(want_right: bool):
+        """Stub pair. A real right frame from STREAM_API_STUB_FRAME_RIGHT if
+        given; otherwise the left rolled 80 px (what a right eye sees of a
+        flat tray) with one extra clipped strip painted on the left only, so
+        the fill path has something to do and the estimator a known answer."""
+        left = _grab_frame()
+        if not want_right:
+            return left, None
+        if _STUB_FRAME_RIGHT is not None:
+            return left, cv2.resize(_STUB_FRAME_RIGHT, (left.shape[1], left.shape[0]), interpolation=cv2.INTER_AREA)
+        right = np.roll(left, -80, axis=1)
+        left = left.copy()
+        x = left.shape[1] * 5 // 12
+        left[:, x:x + 40] = 255
+        return left, right
+
     def _grab_frame():
         """Return a placeholder frame when no ZED is available."""
         if _STUB_FRAME is not None:
@@ -863,6 +970,31 @@ else:
             3,
         )
         return frame
+
+
+def _stereo_filled_frame():
+    """Grab both eyes and return the left with its clipped strips filled from
+    the right, or None if no frame. Records what happened in _stereo["last"]."""
+    left, right = _grab_views(True)
+    if left is None:
+        return None
+    if right is None:
+        _stereo["last"] = {"ok": False, "reason": "no-right-view"}
+        return left
+    shift = _stereo["shift"]
+    if shift is None:
+        shift = estimate_stereo_shift(left, right, _live_box(_crop["box"]))
+        if shift is None:
+            _stereo["last"] = {"ok": False, "reason": "no-shift-estimate"}
+            return left
+    out, clipped, filled = fill_clipped_from_right(left, right, shift)
+    _stereo["last"] = {
+        "ok": True,
+        "shift": round(shift, 1),
+        "clipped": f"{clipped:.2%}",
+        "filled": f"{filled:.2%}",
+    }
+    return out
 
 
 def get_color_frame(width: int, height: int):
@@ -1974,16 +2106,21 @@ def capture(
               X-Resolution.
     """
     native = (_camera_mode["width"], _camera_mode["height"])
+    full = None
+    if _stereo["enabled"]:
+        full = _stereo_filled_frame()
     box = None
     if crop and _crop["mode"] != "off":
         # Crop from the full-resolution frame, then scale — cropping a frame
         # that was already downscaled to the preset would throw away the
         # resolution the crop exists to preserve. Auto mode needs the full
         # frame anyway: the tray is found on this very frame.
-        image = get_color_frame(*native)
+        image = full if full is not None else get_color_frame(*native)
         if image is not None and _crop["mode"] == "auto":
             _auto_crop(image)
         box = _live_box(_crop["box"])
+    elif full is not None:
+        image = cv2.resize(full, RESOLUTIONS[preset], interpolation=cv2.INTER_AREA) if preset else full
     else:
         image = get_color_frame(*(RESOLUTIONS[preset] if preset else native))
     if image is None:
@@ -1992,6 +2129,8 @@ def capture(
             status_code=503,
         )
     headers: dict[str, str] = {}
+    if _stereo["enabled"] and _stereo["last"]:
+        headers["X-Stereo-Fill"] = ";".join(f"{k}={v}" for k, v in _stereo["last"].items())
     if _aec_roi["box"]:
         # The frame itself was exposed differently — worth knowing when the
         # saved A/B captures are compared later.
@@ -2243,6 +2382,62 @@ def camera_crop(
         )
     logger.info("capture crop now mode=%s box=%s", _crop["mode"], _crop["box"])
     return {"crop": dict(_crop)}
+
+
+@app.get("/capture/stereo", summary="Debug: raw left/right pair as one side-by-side JPEG")
+def capture_stereo(eye: Literal["both", "left", "right"] = "both"):
+    """
+    Raw full frames straight off the sensor, no crop and no processing. `both`
+    returns left|right side by side (3840x1080 at fhd); `left` or `right` one
+    eye. This is what the right-eye glare-fill experiment is tuned against:
+    save a pair under the real lights and compare where the strips fall.
+    """
+    left, right = _grab_views(True)
+    if left is None or right is None:
+        return JSONResponse(
+            content={"error": "camera not available", "detail": camera_status["error"]},
+            status_code=503,
+        )
+    image = {"both": lambda: np.hstack([left, right]), "left": lambda: left, "right": lambda: right}[eye]()
+    _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 100])
+    return Response(content=jpeg.tobytes(), media_type="image/jpeg",
+                    headers={"X-Resolution": f"{image.shape[1]}x{image.shape[0]}"})
+
+
+@app.post("/camera/stereo", summary="Experiment: fill clipped strips from the right eye")
+def camera_stereo(
+    value: bool = Query(...),
+    shift: Optional[str] = Query(None),
+):
+    """
+    value: true  — every /capture grabs both eyes and fills the left image's
+                   clipped pixels (any channel >= 250) from the right view,
+                   aligned on the tray plane. Then crop, de-glare, enhance
+                   as usual. X-Stereo-Fill on each capture reports the shift
+                   used and how much was clipped / filled.
+           false — left eye only, as before.
+    shift: tray-plane disparity in full-frame pixels, or `auto` (default) to
+           estimate it on each capture by phase correlation of the tray
+           region. Pin it once the estimate is known to be stable.
+
+    Survives anything but a service restart, which returns to
+    STREAM_API_STEREO_FILL / STREAM_API_STEREO_SHIFT.
+    """
+    if shift is not None:
+        s = shift.strip().lower()
+        if s == "auto":
+            _stereo["shift"] = None
+        else:
+            try:
+                v = float(s)
+            except ValueError:
+                return JSONResponse(content={"error": "bad shift", "detail": "shift must be a number or auto"}, status_code=400)
+            if not _STEREO_SHIFT_RANGE[0] <= v <= _STEREO_SHIFT_RANGE[1]:
+                return JSONResponse(content={"error": "bad shift", "detail": f"shift must be {_STEREO_SHIFT_RANGE[0]:.0f}-{_STEREO_SHIFT_RANGE[1]:.0f} px"}, status_code=400)
+            _stereo["shift"] = v
+    _stereo["enabled"] = value
+    logger.info("stereo fill %s shift=%s", "on" if value else "off", _stereo["shift"] or "auto")
+    return {"stereo": dict(_stereo)}
 
 
 @app.post("/camera/scale", summary="Set the pixel-to-millimetre calibration live")

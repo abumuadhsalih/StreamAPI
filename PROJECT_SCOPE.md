@@ -29,6 +29,8 @@ An API server running on a Jetson to expose a Stereolabs ZED 2i camera (RGB), a 
 | `/camera/enhance` | POST | Flip the `/capture` enhance default live — the only image params-less clients can receive |
 | `/camera/aec-roi` | POST | Meter auto-exposure on the tray only (`value` bool, optional `box`); off by default, same reset-on-restart rule |
 | `/camera/crop` | POST | `/capture` crop live: `value=auto` finds the tray rim itself and follows it, `true&box=` pins a box, `false` clears; same reset-on-restart rule |
+| `/capture/stereo` | GET | Debug: the raw left/right pair as one side-by-side JPEG (`?eye=left|right` for one) |
+| `/camera/stereo` | POST | Experiment: fill the left image's clipped light strips from the right eye (`value` bool, `shift` px or `auto`); off by default |
 | `/camera/scale` | POST | Set the pixel-to-mm calibration (`grid_px`, `grid_mm`) live; every `/capture` carries `X-Mm-Per-Px` for the image it returns |
 | `/camera/resolution` | POST | Switch the sensor mode live: `fhd` (1080p@30, default) or `2k` (2208x1242@15); bare `/capture` returns the native size |
 | `/scale/reconnect` | POST | Force the scale serial port to reopen |

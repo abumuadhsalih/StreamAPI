@@ -370,7 +370,46 @@ pixels, multiply by the header. It should land within ~3%. Keep the values with
 `Environment=STREAM_API_GRID_PX=` / `STREAM_API_GRID_MM=`; re-measure the pitch only
 if the camera is raised or lowered.
 
-## 7i. 2K sensor mode
+## 7i. Experiment: fill the light strips from the right eye
+
+The ZED's two lenses are 12 cm apart. Fish sit in the same place in both views; a
+mirrored light strip does not — it is a reflection, and it moves between the eyes by
+roughly its own width at this geometry. So where the left image is clipped under a
+strip, the right image mostly is not. With the experiment on, `/capture` grabs both
+eyes, aligns the right onto the left (one horizontal shift, the tray is flat) and
+replaces the left's clipped pixels from it before crop, de-glare and enhance.
+
+**First, save a pair** so the shift and the strip positions can be checked offline:
+
+```bash
+curl -s -o pair.jpg "http://<jetson-ip>:8000/capture/stereo"          # left|right side by side
+```
+
+Open it: the strips should sit in different places relative to the grid in the two
+halves. If they sit in the same place, the lights are too far away for this to help.
+
+**Then switch it on and compare:**
+
+```bash
+curl -s -o fill_off.jpg "http://<jetson-ip>:8000/capture"
+curl -X POST "http://<jetson-ip>:8000/camera/stereo?value=true"
+curl -s -D - -o fill_on.jpg "http://<jetson-ip>:8000/capture" | grep -i x-stereo-fill
+#   X-Stereo-Fill: ok=True;shift=84.0;clipped=6.1%;filled=4.3%
+```
+
+`shift` is the estimated disparity; it should be stable to a pixel or two between
+captures. If it is, pin it (`?shift=84`) so the estimate is skipped. `filled` is how
+much of the frame was recovered; `clipped` minus `filled` is what both eyes lost.
+`ok=False` with `no-shift-estimate` means the two views did not correlate — send the
+pair. Look at `fill_on.jpg` under the strips: fish texture back, and no visible seam.
+
+```bash
+curl -X POST "http://<jetson-ip>:8000/camera/stereo?value=false"
+```
+
+Keep it with `Environment=STREAM_API_STEREO_FILL=1` (and `STREAM_API_STEREO_SHIFT=`).
+
+## 7j. 2K sensor mode
 
 Same 110-deg field of view, 1.15x the pixels per fish, half the frame rate (15 fps).
 Resolution was not the bottleneck in the mobile-vs-ours comparison, so this is a
