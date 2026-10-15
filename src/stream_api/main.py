@@ -150,15 +150,18 @@ def _live_box(box):
         min(_camera_mode["height"], round(y2 * sy)),
     )
 
-# THIS BRANCH (feature/camera-auto-only): every software pass ships OFF —
-# crop, de-glare and enhance — so a bare /capture is the camera's own
-# auto-exposed, auto-white-balanced frame and nothing else. The hardware team
-# is changing the mount, lights and tray surface, and each change must be
-# judged on the raw sensor output, not through processing that was tuned for
-# the previous setup (de-glare on a crumpled reflective sheet turned the whole
-# frame to grey noise). The endpoints and env vars all still work, so any pass
-# can be switched on live for a comparison; only the shipped defaults differ
-# from feature/zed-2i-camera.
+# THIS BRANCH (feature/capture-enhanced, 2026-10-15): de-glare and enhance
+# are back ON by default, on top of the auto crop. The hardware changes have
+# settled on the steel tray with the grid, and the raw default capture from
+# 2026-10-14 showed the two overhead strips mirrored on the floor at 19% of
+# their pixels clipped while the fish themselves were fine (L median 118,
+# 0.3% clipped). Measured on that frame with the service's own functions:
+# de-glare 100/sigma 60 takes the strips from 19.3% clipped to 0% and the
+# floor's 5-95% range from 52-253 to 70-194, and enhance then puts the
+# contrast back (median 116 -> 140, std 38 -> 52, clipping 0.7%). AEC ROI
+# stays off: the fish were not under-exposed, so there is nothing for it to
+# fix. feature/camera-auto-only keeps the raw defaults for the next time the
+# hardware moves.
 #
 # /capture can crop to the inspection tray. The ZED's 110-deg FOV puts
 # a third to a half of every frame outside the tray — floor, fish baskets,
@@ -365,13 +368,13 @@ def _auto_crop(frame) -> None:
 # /camera/enhance flips the server default live — that endpoint exists because
 # this default was previously a bare code constant, which meant a redeploy to
 # change the one thing the params-less clients actually receive.
-ENHANCE_DEFAULT = os.environ.get("STREAM_API_ENHANCE", "0").strip().lower() not in (
+ENHANCE_DEFAULT = os.environ.get("STREAM_API_ENHANCE", "1").strip().lower() not in (
     "0", "false", "no", "off", ""
 )
 _enhance = {"default": ENHANCE_DEFAULT}
 
 DEGLARE_SIGMA = int(os.environ.get("STREAM_API_DEGLARE_SIGMA", "60"))
-DEGLARE_STRENGTH = int(os.environ.get("STREAM_API_DEGLARE_STRENGTH", "0"))
+DEGLARE_STRENGTH = int(os.environ.get("STREAM_API_DEGLARE_STRENGTH", "100"))
 _deglare = {
     "sigma": max(10, min(300, DEGLARE_SIGMA)),
     "strength": max(0, min(100, DEGLARE_STRENGTH)),

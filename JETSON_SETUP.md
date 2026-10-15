@@ -503,9 +503,9 @@ Set these as `Environment=` lines in `/etc/systemd/system/stream-api.service` (v
 | `STREAM_API_SCALE_BAUD` | `9600` | 8-N-1 |
 | `STREAM_API_SCALE_UNIT` | `kg` | The DX11 transmits **no unit**; this is the assumed one |
 | `STREAM_API_SCALE_STREAM_INTERVAL` | `0.1` | SSE pacing, 10 Hz |
-| `STREAM_API_ENHANCE` | `0` | Whether a param-less `/capture` gets CLAHE + shadow lift. `0` turns it off for every client |
+| `STREAM_API_ENHANCE` | `1` | Whether a param-less `/capture` gets CLAHE + shadow lift. `0` turns it off for every client |
 | `STREAM_API_CAMERA_CONTRAST` | `4` | ZED ISP contrast, 0-8. Raise for punch in-camera, before de-glare |
-| `STREAM_API_DEGLARE_STRENGTH` | `0` | Software de-glare, 0-100. `0` disables it for every client. Tune live with `POST /camera/deglare` |
+| `STREAM_API_DEGLARE_STRENGTH` | `100` | Software de-glare, 0-100. `0` disables it for every client. Tune live with `POST /camera/deglare` |
 | `STREAM_API_DEGLARE_SIGMA` | `60` | De-glare radius in full-frame px. Larger = gentler; below ~40 it haloes the fish |
 | `STREAM_API_CROP` | `auto` | `/capture` crop. `auto` finds the tray rim on every capture and follows it when the camera or table moves; `x1,y1,x2,y2` pins a box; empty disables it. Live: `POST /camera/crop?value=auto|true|false&box=` |
 | `STREAM_API_TRAY_SIZE` | `1581,871` | What `auto` looks for: the rim's size in full-frame px at the current mount height, ±3.5%. Re-seed only if the camera is raised or lowered |
