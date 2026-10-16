@@ -279,12 +279,14 @@ TRAY_SIZE = _parse_tray_size(os.environ.get("STREAM_API_TRAY_SIZE", _TRAY_SIZE_D
 # steel that carries nothing, the one part of the crop the de-glare pass
 # cannot even out, and 12% of the pixels the AI pipeline is handed. The
 # inset cuts the served box in from the rim to the floor edge.
-# STREAM_API_CROP_INSET: "auto" (the default) finds the floor edge inside the
-# rim on every cropped capture (detect_floor()), with the fallback below
-# until the first detection; "l,t,r,b" or a single number pins the inset in
-# reference pixels; empty / "off" / "0" serves the rim box. Movable live
-# with POST /camera/crop?inset=.
-_CROP_INSET_DEFAULT = "auto"
+# STREAM_API_CROP_INSET: "off" (the default) serves the rim box, tray edges
+# and all — the first floor-only capture (2026-10-16) was rejected on sight,
+# "tray edges are missing", so the walls stay in unless asked for; "auto"
+# finds the floor edge inside the rim on every cropped capture
+# (detect_floor()), with the fallback below until the first detection;
+# "l,t,r,b" or a single number pins the inset in reference pixels. Movable
+# live with POST /camera/crop?inset=.
+_CROP_INSET_DEFAULT = "off"
 _CROP_INSET_FALLBACK = "107,92,92,40"  # 2026-10-16 frame; rim 262,102,1844,968, floor 369,194,1752,928
 
 # What detect_floor() looks for: the floor rectangle's size in reference
@@ -2288,15 +2290,15 @@ def capture(
               image they can get. Tune or disable it live with
               POST /camera/deglare; pass ?deglare=false for a single raw A/B
               frame. Reported in X-Deglare.
-    crop:     default true — cut to the inspection tray, if a box is set
-              (POST /camera/crop or STREAM_API_CROP; reported in the X-Crop
-              header and in /health): the rim is found on the frame, then
-              the floor edge inside it, and the served box is the floor
-              (X-Crop-Inset says how far in from the rim, and whether that
-              was detected, pinned or the fallback). Everything outside the
-              floor is clutter for the AI client, which fetches bare
-              /capture. Pass ?crop=false for the full frame, which is what
-              you want when re-aiming the camera or checking the box.
+    crop:     default true — cut to the inspection tray's rim, if a box is
+              set (POST /camera/crop or STREAM_API_CROP; reported in the
+              X-Crop header and in /health). Everything outside the tray is
+              clutter for the AI client, which fetches bare /capture. Pass
+              ?crop=false for the full frame, which is what you want when
+              re-aiming the camera or checking the box. An optional inset
+              (POST /camera/crop?inset=auto, off by default) cuts further
+              in to the floor edge, dropping the walls; X-Crop-Inset says
+              what was applied.
     preset:   unset, the frame comes back at the sensor's native size for the
               mode in force (1920x1080, or 2208x1242 after POST
               /camera/resolution?value=2k — a wider view at the same pixel
@@ -2559,10 +2561,11 @@ def camera_crop(
            walls are left out and the AI gets the floor only.
            auto    — find the floor edge inside the rim on every cropped
                      capture (detect_floor); the inset in force is the
-                     fallback until the first detection. The shipped default.
+                     fallback until the first detection.
            l,t,r,b — pin it, in 1920x1080 pixels per side; a single number
                      applies to all four.
-           off     — serve the rim box.
+           off     — serve the rim box, tray edges included. The shipped
+                     default: the floor-only capture was rejected on sight.
            Either parameter may be sent alone; the other is left as it is.
     box:   x1,y1,x2,y2 in 1920x1080 pixels, read off a ?crop=false capture
            at fhd. In 2K mode the frame is 144 px wider on each side and
