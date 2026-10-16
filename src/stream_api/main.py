@@ -94,16 +94,19 @@ RESOLUTIONS: dict[str, tuple[int, int]] = {
 Preset = Literal["sd", "hd", "fhd", "2k"]
 
 # The sensor mode the ZED is opened in. HD1080 @ 30 is the default. HD2K is
-# the same 110-deg field of view at 1.15x the pixel density, at the cost of
-# half the frame rate (the SDK caps HD2K at 15 fps, so /stream runs at 15 and
-# a capture waits up to ~67 ms for a frame instead of ~33) and a ~1.3x larger
-# JPEG. It was the default for part of 2026-10-07 and was put back: the AI
-# pipeline resizes to a fixed model input, so the extra pixels bought nothing
-# and the stream paid for them. POST /camera/resolution?value=2k switches
-# live whenever that changes. POST /camera/resolution switches live —
-# it is a close+reopen, ~2 s, and /stream clients reconnect. A bare /capture
-# always returns the sensor's native size, so switching to 2K is what hands
-# the AI pipeline a 2208x1242 frame without the mobile app changing anything.
+# NOT a sharper picture: both modes share one pixel pitch and one focal length
+# (the calibration file lists the same fx for FHD and 2K), so a fish covers
+# the same number of pixels in either, and 2K simply sees 144 px more on each
+# side and 81 px more top and bottom — a 15% wider view the tray does not
+# need. The 2026-10-16 2K capture proved it: the rim measured 1582 px across
+# at 2K, exactly its 1581 px at 1080p, and the crop box that this file used
+# to scale by 1.15 came out as the tray plus a margin of floor. Its costs
+# are real: half the frame rate (the SDK caps HD2K at 15 fps, so /stream runs
+# at 15 and a capture waits up to ~67 ms for a frame instead of ~33) and a
+# ~1.3x larger JPEG. It was the default for part of 2026-10-07 and was put
+# back. POST /camera/resolution switches live — it is a close+reopen, ~2 s,
+# and /stream clients reconnect. A bare /capture always returns the sensor's
+# native size, so an uncropped 2K capture is 2208x1242 of the same scene.
 CAMERA_MODES: dict[str, tuple[int, int, int]] = {
     "fhd": (1920, 1080, 30),
     "2k": (2208, 1242, 15),
@@ -130,25 +133,51 @@ _camera_mode = _mode_dict(_camera_mode_env())
 
 # Reference frame for every box in this file. CROP_BOX and the AEC metering
 # box are measured in 1920x1080 coordinates whatever mode the camera runs in,
-# and scaled to the live sensor size at the point of use (_live_box), so a box
-# measured at fhd is still right after switching to 2K. Both modes share the
-# same field of view, which is what makes a pure scale correct.
+# and moved to the live sensor frame at the point of use (_live_box), so a
+# box measured at fhd is still right after switching to 2K. The 1080p image
+# is the centre of the 2K one at the same pixel pitch (see CAMERA_MODES), so
+# the mapping is an offset of half the size difference, not a scale — a box
+# scaled by 1.15 lands 15% too big with a floor margin, which is what the
+# 2026-10-16 2K capture showed before this was corrected. A reference pixel
+# is one live pixel in every mode offered here (HD720 would be binned 2:1
+# and is deliberately not offered).
 CAPTURE_WIDTH, CAPTURE_HEIGHT = RESOLUTIONS["fhd"]
 
 
+def _ref_offset():
+    """Where the 1920x1080 reference frame sits inside the live frame."""
+    return (
+        (_camera_mode["width"] - CAPTURE_WIDTH) // 2,
+        (_camera_mode["height"] - CAPTURE_HEIGHT) // 2,
+    )
+
+
 def _live_box(box):
-    """Scale a reference-frame (x1,y1,x2,y2) box to the live sensor size."""
+    """Move a reference-frame (x1,y1,x2,y2) box into the live sensor frame."""
     if not box:
         return None
-    sx = _camera_mode["width"] / CAPTURE_WIDTH
-    sy = _camera_mode["height"] / CAPTURE_HEIGHT
+    ox, oy = _ref_offset()
     x1, y1, x2, y2 = box
     return (
-        max(0, round(x1 * sx)),
-        max(0, round(y1 * sy)),
-        min(_camera_mode["width"], round(x2 * sx)),
-        min(_camera_mode["height"], round(y2 * sy)),
+        max(0, x1 + ox),
+        max(0, y1 + oy),
+        min(_camera_mode["width"], x2 + ox),
+        min(_camera_mode["height"], y2 + oy),
     )
+
+
+def _ref_frame(frame):
+    """The 1920x1080 reference view of a native frame: the centre of a larger
+    frame (2K), the frame itself at fhd. A frame of any other size is resized
+    as a last resort so the detectors still run, which is the only case where
+    a reference pixel is not a live pixel."""
+    h, w = frame.shape[:2]
+    if (w, h) == (CAPTURE_WIDTH, CAPTURE_HEIGHT):
+        return frame
+    if w >= CAPTURE_WIDTH and h >= CAPTURE_HEIGHT:
+        ox, oy = (w - CAPTURE_WIDTH) // 2, (h - CAPTURE_HEIGHT) // 2
+        return frame[oy:oy + CAPTURE_HEIGHT, ox:ox + CAPTURE_WIDTH]
+    return cv2.resize(frame, (CAPTURE_WIDTH, CAPTURE_HEIGHT), interpolation=cv2.INTER_AREA)
 
 # THIS BRANCH (feature/capture-enhanced, 2026-10-15): de-glare and enhance
 # are back ON by default, on top of the auto crop. The hardware changes have
@@ -317,8 +346,7 @@ def detect_tray(frame):
     measurement; the only spread is whether it takes the rim's outer edge or
     its inner lip. Fails cleanly on the black-cloth frames. ~5 ms at 1080p.
     """
-    if (frame.shape[1], frame.shape[0]) != (CAPTURE_WIDTH, CAPTURE_HEIGHT):
-        frame = cv2.resize(frame, (CAPTURE_WIDTH, CAPTURE_HEIGHT), interpolation=cv2.INTER_AREA)
+    frame = _ref_frame(frame)
     g = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (0, 0), 1.2).astype(np.float32)
     h, w = g.shape
     gx = np.abs(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3))[int(h * 0.2):int(h * 0.8)].mean(axis=0)
@@ -757,6 +785,18 @@ if sys.platform == "linux":
                 "serial": str(info.serial_number),
                 "firmware": str(info.camera_configuration.firmware_version),
             }
+            try:
+                # The left eye's optics for the mode just opened. fx is the
+                # focal length in pixels: equal at fhd and 2K means equal
+                # pixel pitch, i.e. 2K is a wider view, not a closer one.
+                cam = info.camera_configuration.calibration_parameters.left_cam
+                camera_status["device"].update({
+                    "fx": round(float(cam.fx), 1),
+                    "h_fov": round(float(cam.h_fov), 1),
+                    "v_fov": round(float(cam.v_fov), 1),
+                })
+            except Exception as e:  # pragma: no cover - SDK version differences
+                logger.debug("calibration parameters not readable: %s", e)
             # Trust the SDK over our table: if it ever opens at a size other
             # than the one asked for, every box scale in the file follows it.
             res = info.camera_configuration.resolution
@@ -958,7 +998,19 @@ else:
     def _grab_frame():
         """Return a placeholder frame when no ZED is available."""
         if _STUB_FRAME is not None:
-            return cv2.resize(_STUB_FRAME, (_camera_mode["width"], _camera_mode["height"]), interpolation=cv2.INTER_AREA)
+            # Mimic the sensor: the reference frame sits at the centre of a
+            # larger mode at the same pixel pitch, with whatever lies beyond
+            # the 1080p edge unknown (grey) — never stretched.
+            ref = _STUB_FRAME
+            if (ref.shape[1], ref.shape[0]) != (CAPTURE_WIDTH, CAPTURE_HEIGHT):
+                ref = cv2.resize(ref, (CAPTURE_WIDTH, CAPTURE_HEIGHT), interpolation=cv2.INTER_AREA)
+            w, h = _camera_mode["width"], _camera_mode["height"]
+            if (w, h) == (CAPTURE_WIDTH, CAPTURE_HEIGHT):
+                return ref
+            frame = np.full((h, w, 3), 96, dtype=np.uint8)
+            ox, oy = (w - CAPTURE_WIDTH) // 2, (h - CAPTURE_HEIGHT) // 2
+            frame[oy:oy + CAPTURE_HEIGHT, ox:ox + CAPTURE_WIDTH] = ref
+            return frame
         frame = np.zeros((_camera_mode["height"], _camera_mode["width"], 3), dtype=np.uint8)
         cv2.putText(
             frame,
@@ -2099,10 +2151,13 @@ def capture(
               re-aiming the camera or checking the box is still right.
     preset:   unset, the frame comes back at the sensor's native size for the
               mode in force (1920x1080, or 2208x1242 after POST
-              /camera/resolution?value=2k) and is never resampled. Uncropped,
+              /camera/resolution?value=2k — a wider view at the same pixel
+              pitch, so a cropped capture is the same image in both modes)
+              and is never resampled. Uncropped,
               a preset resizes to its exact dimensions, as it always has.
-              Cropped, it is applied as a scale factor against the native
-              width so the tray keeps its aspect ratio. Reported in
+              Cropped, it is applied as a scale factor against the 1920 px
+              reference width so the tray keeps its aspect ratio and the
+              same preset gives the same image in either sensor mode. Reported in
               X-Resolution.
     """
     native = (_camera_mode["width"], _camera_mode["height"])
@@ -2140,22 +2195,28 @@ def capture(
         image = image[y1:y2, x1:x2]
         headers["X-Crop"] = f"{x1},{y1},{x2},{y2}"
         headers["X-Crop-Source"] = str(_crop["source"])
-        scale = RESOLUTIONS[preset][0] / native[0] if preset else 1.0
+        # Against the reference width, not the live one, so ?preset=sd of a
+        # cropped tray is the same image whichever mode the sensor is in.
+        scale = RESOLUTIONS[preset][0] / CAPTURE_WIDTH if preset else 1.0
         if scale != 1.0:
             image = cv2.resize(
                 image,
                 (max(1, round(image.shape[1] * scale)), max(1, round(image.shape[0] * scale))),
                 interpolation=cv2.INTER_AREA,
             )
+    # Reference pixels per output pixel — the one ratio the de-glare radius
+    # and the mm-per-pixel header both need. A live pixel is a reference
+    # pixel in every mode, so the crop box and the native width are already
+    # in reference units; only presets and crop scaling move it off 1.0.
+    ref_per_out = ((box[2] - box[0]) if box else native[0]) / image.shape[1]
     if deglare and _deglare["strength"] > 0:
         # After the geometry, so sigma scales with the preset and the correction
         # looks the same whatever size was asked for. Before enhance, so the
         # adaptive lift measures an already-even frame rather than one whose
         # median is being dragged around by the glare.
-        # Both ratios are against the 1080p reference, so sigma also follows
-        # the pixel density of the sensor mode.
-        sigma = _deglare["sigma"] * (image.shape[1] / (_crop["box"][2] - _crop["box"][0])
-                                     if box else image.shape[1] / CAPTURE_WIDTH)
+        # sigma is in reference pixels; one reference pixel is one live pixel
+        # in every mode, so only the preset scaling changes it.
+        sigma = _deglare["sigma"] / ref_per_out
         image = reduce_glare(image, max(2.0, sigma), _deglare["strength"] / 100.0)
         headers["X-Deglare"] = f"{_deglare['strength']},{_deglare['sigma']}"
     if _enhance["default"] if enhance is None else enhance:
@@ -2165,9 +2226,10 @@ def capture(
         headers["X-Enhance-Gamma"] = str(stats["gamma"])
         headers["X-Enhance-Median"] = str(stats["median"])
     # Physical scale of THIS image: the reference-frame value corrected by how
-    # many output pixels each reference pixel became (crop scaling, presets, 2K).
-    ref_w = (_crop["box"][2] - _crop["box"][0]) if box else CAPTURE_WIDTH
-    headers["X-Mm-Per-Px"] = f"{_scale['mm_per_px'] * ref_w / image.shape[1]:.4f}"
+    # many output pixels each reference pixel became (crop scaling, presets).
+    # 2K changes nothing here — same pixel pitch — so a bare 2K capture
+    # carries the same number as a bare 1080p one.
+    headers["X-Mm-Per-Px"] = f"{_scale['mm_per_px'] * ref_per_out:.4f}"
     headers["X-Resolution"] = f"{image.shape[1]}x{image.shape[0]}"
     _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 100])
     return Response(content=jpeg.tobytes(), media_type="image/jpeg", headers=headers)
@@ -2186,14 +2248,16 @@ def camera_restart():
 def camera_resolution(value: CameraMode = Query(...)):
     """
     value: fhd — 1920x1080 at 30 fps, the default.
-           2k  — 2208x1242 at 15 fps. Same field of view, 1.15x the pixels
-                 per fish, half the frame rate.
+           2k  — 2208x1242 at 15 fps. Same pixel pitch and focal length, so
+                 the same pixels per fish: it is a 15% wider view, not a
+                 sharper one, at half the frame rate. /health camera.device
+                 reports fx and the field of view for the mode in force.
 
     Closes and reopens the camera (~2 s); /stream clients drop and reconnect.
-    A bare /capture returns the native size of the mode in force, so this is
-    how the AI pipeline gets a 2K frame without the mobile app changing
-    anything. Crop and AEC boxes are kept in 1080p coordinates and scaled, so
-    nothing measured needs re-entering.
+    A bare /capture returns the native size of the mode in force. Crop and
+    AEC boxes are kept in 1080p coordinates and offset to the live frame, so
+    nothing measured needs re-entering and a cropped capture is the same
+    image in either mode.
 
     Survives a self-heal reopen but NOT a service restart, which returns to
     STREAM_API_CAMERA_MODE.
@@ -2337,8 +2401,10 @@ def camera_crop(
            true  — pin a fixed box: ?box= required the first time, omitted
                    afterwards keeps the current one.
            false — full frame for everyone.
-    box:   x1,y1,x2,y2 in 1920x1080 pixels, read off a ?crop=false capture.
-           Scaled automatically if the camera is in 2K mode.
+    box:   x1,y1,x2,y2 in 1920x1080 pixels, read off a ?crop=false capture
+           at fhd. In 2K mode the frame is 144 px wider on each side and
+           81 px taller top and bottom at the same pixel pitch, so subtract
+           that offset if you measure on a 2K frame; the service adds it back.
 
     Pure software, nothing is sent to the camera, so it applies to the next
     capture immediately. ?crop=false on a single request still overrides it.

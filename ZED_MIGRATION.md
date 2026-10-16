@@ -411,10 +411,13 @@ Keep it with `Environment=STREAM_API_STEREO_FILL=1` (and `STREAM_API_STEREO_SHIF
 
 ## 7j. 2K sensor mode
 
-Same 110-deg field of view, 1.15x the pixels per fish, half the frame rate (15 fps).
-Resolution was not the bottleneck in the mobile-vs-ours comparison, so this is a
-"prove it" switch, not a fix. Bare `/capture` returns the native size of the mode in
-force, so the AI pipeline gets 2208x1242 without the mobile app changing anything.
+**2K is a wider view, not a sharper one.** Both modes share one pixel pitch and one
+focal length (the same `fx` in the calibration file), so a fish covers the same pixels
+in either; 2K adds 144 px of scene on each side and 81 px top and bottom, at half the
+frame rate (15 fps) and ~1.3x the JPEG. The 2026-10-16 2K capture showed it: the rim
+measured 1582 px across, the same as at 1080p. A cropped capture is therefore the same
+image in both modes, and the only reason to run 2K is if the tray ever outgrows the
+1080p frame. Bare `/capture` returns the native size of the mode in force.
 
 ```bash
 curl -X POST "http://<jetson-ip>:8000/camera/resolution?value=2k"     # ~2 s reopen
@@ -423,9 +426,10 @@ curl -X POST "http://<jetson-ip>:8000/camera/resolution?value=fhd"
 curl -s -D - -o cap_fhd.jpg "http://<jetson-ip>:8000/capture" | grep -i x-resolution
 ```
 
-Crop and AEC boxes stay in 1080p coordinates and are scaled to the live mode, so
-nothing needs re-entering. Check `?crop=false` at both modes shows the same scene
-edge to edge — that is the same-FOV assumption the scaling relies on. Keep it with
+Crop and AEC boxes stay in 1080p coordinates and are offset into the live frame, so
+nothing needs re-entering and `X-Mm-Per-Px` is the same number in both modes. To
+confirm the geometry on the box: `/health` `camera.device.fx` and `h_fov` for each
+mode — equal `fx`, wider `h_fov` at 2K. Keep it with
 `Environment=STREAM_API_CAMERA_MODE=2k`; `/health` reports it as `camera.resolution`.
 
 ## 8. What to bring back
