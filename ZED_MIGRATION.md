@@ -232,6 +232,30 @@ curl -X POST "http://<jetson-ip>:8000/camera/crop?value=auto"                   
 curl -X POST "http://<jetson-ip>:8000/camera/crop?value=false"                       # full frame
 ```
 
+**The crop now stops at the floor, not the rim** (`STREAM_API_CROP_INSET=auto`, the
+default since 2026-10-16). The tray's walls slope inward about 100 px on the long sides,
+90 at the top and 40 at the bottom — bright or shadowed steel the AI does not need and
+the de-glare pass cannot even out, 12% of the pixels. Inside the detected rim the service
+finds the wall/floor edge on each side and serves that box; `X-Crop-Inset` reports the
+per-side inset and whether it was detected (`auto`), pinned (`fixed`) or inherited
+(`fallback`). The default capture is now about 1373x741 instead of 1581x871.
+
+```bash
+curl -s -D - -o floor.jpg "http://<jetson-ip>:8000/capture" | grep -i x-crop
+#   X-Crop-Inset: auto;103,86,94,43   -> floor edge found; left,top,right,bottom px in from the rim
+#   X-Crop-Inset: fallback;107,92,92,40 -> not found on this frame; serving the last good / seed inset
+curl -X POST "http://<jetson-ip>:8000/camera/crop?inset=off"            # rim box, as before
+curl -X POST "http://<jetson-ip>:8000/camera/crop?inset=100,90,90,40"   # pin it (l,t,r,b in 1080p px)
+curl -X POST "http://<jetson-ip>:8000/camera/crop?inset=auto"           # back to auto
+```
+
+`floor.jpg` should start at the grid's edge on all four sides with no wall visible. A fish
+lying across the wall/floor edge is cut at the floor edge, same as one over the rim was.
+`fallback` on a frame that plainly shows the floor means the floor's size has changed
+(camera raised or lowered): re-seed `STREAM_API_FLOOR_SIZE` with the floor's width and
+height in a `?crop=false` capture, alongside `STREAM_API_TRAY_SIZE`. Keep it permanently
+with `Environment=STREAM_API_CROP_INSET=auto` (or a fixed `l,t,r,b`, or `off`).
+
 ## 7d. Tune the de-glare pass
 
 `/capture` flattens the light-strip reflections by default — **on by default because

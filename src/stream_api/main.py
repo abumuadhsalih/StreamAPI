@@ -260,18 +260,69 @@ def _parse_crop(spec: str, name: str = "STREAM_API_CROP"):
     return (x1, y1, x2, y2)
 
 
-def _parse_tray_size(spec: str):
+def _parse_tray_size(spec: str, name: str = "STREAM_API_TRAY_SIZE", default: str = _TRAY_SIZE_DEFAULT):
     try:
         w, h = (int(v) for v in spec.split(","))
         if w < 100 or h < 100:
             raise ValueError
         return (w, h)
     except ValueError:
-        logger.warning("STREAM_API_TRAY_SIZE=%r is not 'w,h' — using %s", spec, _TRAY_SIZE_DEFAULT)
-        return _parse_tray_size(_TRAY_SIZE_DEFAULT)
+        logger.warning("%s=%r is not 'w,h' — using %s", name, spec, default)
+        return _parse_tray_size(default, name, default)
 
 
 TRAY_SIZE = _parse_tray_size(os.environ.get("STREAM_API_TRAY_SIZE", _TRAY_SIZE_DEFAULT))
+
+# Inside the rim come the tray's sloped walls: on the 2026-10-16 frame ~105 px
+# of each long side, ~90 px at the top and ~40 at the bottom (the camera sits
+# nearer the bottom edge, so that wall is foreshortened). Bright or shadowed
+# steel that carries nothing, the one part of the crop the de-glare pass
+# cannot even out, and 12% of the pixels the AI pipeline is handed. The
+# inset cuts the served box in from the rim to the floor edge.
+# STREAM_API_CROP_INSET: "auto" (the default) finds the floor edge inside the
+# rim on every cropped capture (detect_floor()), with the fallback below
+# until the first detection; "l,t,r,b" or a single number pins the inset in
+# reference pixels; empty / "off" / "0" serves the rim box. Movable live
+# with POST /camera/crop?inset=.
+_CROP_INSET_DEFAULT = "auto"
+_CROP_INSET_FALLBACK = "107,92,92,40"  # 2026-10-16 frame; rim 262,102,1844,968, floor 369,194,1752,928
+
+# What detect_floor() looks for: the floor rectangle's size in reference
+# pixels. A fixed physical rectangle, so like TRAY_SIZE it is a constant at
+# a given mount height — measured 1372-1379 x 736-743 across the Oct 12, 14
+# and 16 frames. The tolerance is tighter than the rim's because the
+# candidates are closer together: the rim's inner lip pair is ~1500 wide,
+# the floor ~1373, the grid's first lines ~30 px inside that.
+_FLOOR_SIZE_DEFAULT = "1373,741"
+_FLOOR_SIZE_TOL = 0.03
+FLOOR_SIZE = _parse_tray_size(
+    os.environ.get("STREAM_API_FLOOR_SIZE", _FLOOR_SIZE_DEFAULT), "STREAM_API_FLOOR_SIZE", _FLOOR_SIZE_DEFAULT
+)
+
+_INSET_OFF_WORDS = ("", "off", "0", "false", "no", "none")
+
+
+def _parse_inset(spec: str, name: str = "STREAM_API_CROP_INSET"):
+    """'auto' -> ("auto", None); 'l,t,r,b' or 'n' -> ("fixed", [l,t,r,b]);
+    empty/off -> ("off", None). Garbage is logged and treated as off."""
+    spec = spec.strip().lower()
+    if spec == "auto":
+        return "auto", None
+    if spec in _INSET_OFF_WORDS:
+        return "off", None
+    try:
+        vals = [int(v) for v in spec.split(",")]
+        if len(vals) == 1:
+            vals = vals * 4
+        if len(vals) != 4 or any(v < 0 for v in vals):
+            raise ValueError
+    except ValueError:
+        logger.warning("%s=%r is not 'auto', 'off', n or l,t,r,b — inset off", name, spec)
+        return "off", None
+    return "fixed", vals
+
+
+_inset_mode, _inset_px = _parse_inset(os.environ.get("STREAM_API_CROP_INSET", _CROP_INSET_DEFAULT))
 
 _crop_env = os.environ.get("STREAM_API_CROP", _CROP_DEFAULT).strip()
 CROP_AUTO = _crop_env.lower() == "auto"
@@ -284,11 +335,22 @@ CROP_BOX = _parse_crop(_CROP_FALLBACK if CROP_AUTO else _crop_env)
 # a box nobody updates. Boxes are reference-frame coordinates; a service
 # restart returns to STREAM_API_CROP. `detected` is the last auto result, so
 # /health shows whether the box being served was found or inherited.
+# `inset` is the second stage: how far in from the rim box the served box
+# sits, per side (left, top, right, bottom) in reference pixels. mode is
+# "auto" (detect_floor() on every cropped capture), "fixed" or "off"; `px` is
+# the inset in force — the last good detection, the pinned value or the
+# fallback — and `source` says which. _crop_box() combines the two stages.
 _crop = {
     "box": list(CROP_BOX) if CROP_BOX else None,
     "mode": "auto" if CROP_AUTO else ("manual" if CROP_BOX else "off"),
     "source": "fallback" if CROP_AUTO else ("manual" if CROP_BOX else None),
     "detected": None,
+    "inset": {
+        "mode": _inset_mode,
+        "px": _parse_inset(_CROP_INSET_FALLBACK)[1] if _inset_mode == "auto" else _inset_px,
+        "source": {"auto": "fallback", "fixed": "fixed", "off": None}[_inset_mode],
+        "detected": None,
+    },
 }
 
 
@@ -358,25 +420,108 @@ def detect_tray(frame):
     return (px[0], py[0], px[1], py[1])
 
 
-def _auto_crop(frame) -> None:
-    """Run detect_tray() on a native frame and fold the result into _crop.
+def detect_floor(frame, rim):
+    """Find the floor's edge inside a rim box. Returns (x1,y1,x2,y2) in
+    reference coordinates, or None.
 
-    A detection replaces the box only when an edge moved by more than 3 px,
-    so a static tray gives a pixel-identical crop capture after capture
-    instead of jittering. A miss keeps the last good box and is reported.
+    The walls slope inward from the rim to the floor, so between the rim's
+    outer edge and the grid there are two more long straight edges on each
+    side: the rim's inner lip, 0-2% of the box in, and the wall/floor
+    junction, 2-15% in depending on how far that side is from the camera's
+    axis (the far wall shows its full width, the near one is foreshortened).
+    The edge profiles are averaged over the middle 60% of the rim box only,
+    so the detector sees the floor and what lies on it and nothing outside;
+    peaks are taken inside the 2-15% band on each side and the left/right
+    (top/bottom) pair whose spacing is closest to FLOOR_SIZE wins. The size
+    prior is what separates the floor edge from the lip and from the grid's
+    first line, both of which are also real edges in the band.
+
+    Checked on the Oct 12 (empty), Oct 14 and Oct 16 (fish) frames: lands on
+    the wall/floor junction on all four sides, with the bottom edge — the
+    short, foreshortened wall — the least certain by ~7 px.
     """
-    found = detect_tray(frame)
+    frame = _ref_frame(frame)
+    x1, y1, x2, y2 = rim
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 200 or bh < 200:
+        return None
+    g = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (0, 0), 1.2).astype(np.float32)
+    ry0, ry1 = y1 + int(bh * 0.2), y2 - int(bh * 0.2)
+    rx0, rx1 = x1 + int(bw * 0.2), x2 - int(bw * 0.2)
+    gx = np.abs(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3))[ry0:ry1].mean(axis=0)
+    gy = np.abs(cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3))[:, rx0:rx1].mean(axis=1)
+
+    def band(prof, edge, inward, dim):
+        lo, hi = int(dim * 0.02), int(dim * 0.15)
+        a, b = (edge + lo, edge + hi) if inward > 0 else (edge - hi, edge - lo)
+        a, b = max(0, a), min(len(prof) - 1, b)
+        if b - a < 10:
+            return []
+        return [(i + a, v) for i, v in _edge_peaks(prof[a:b + 1], 6)]
+
+    px = _best_pair(band(gx, x1, +1, bw) + band(gx, x2, -1, bw), FLOOR_SIZE[0], _FLOOR_SIZE_TOL, 0.25)
+    py = _best_pair(band(gy, y1, +1, bh) + band(gy, y2, -1, bh), FLOOR_SIZE[1], _FLOOR_SIZE_TOL, 0.25)
+    if px is None or py is None:
+        return None
+    return (px[0], py[0], px[1], py[1])
+
+
+def _crop_box():
+    """The reference-frame box /capture serves: the rim box less the inset in
+    force, or None when the crop is off. An inset that would swallow the box
+    (a nonsense fixed value) serves the rim box rather than a sliver."""
+    box = _crop["box"]
+    if not box or _crop["mode"] == "off":
+        return None
+    ins = _crop["inset"]
+    if ins["mode"] == "off" or not ins["px"]:
+        return tuple(box)
+    l, t, r, b = ins["px"]
+    x1, y1, x2, y2 = box[0] + l, box[1] + t, box[2] - r, box[3] - b
+    if x2 - x1 < 16 or y2 - y1 < 16:
+        return tuple(box)
+    return (x1, y1, x2, y2)
+
+
+def _auto_crop(frame) -> None:
+    """Run the detectors on a native frame and fold the results into _crop:
+    detect_tray() for the rim when the crop is auto, then detect_floor()
+    inside whatever rim box is in force when the inset is auto.
+
+    A detection replaces the box (or the inset) only when an edge moved by
+    more than 3 px, so a static tray gives a pixel-identical crop capture
+    after capture instead of jittering. A miss keeps the last good value and
+    is reported; a rim miss also skips the floor, since a stale rim would
+    make the floor stale too.
+    """
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
-    if found is None:
-        _crop["detected"] = {"ok": False, "box": None, "at": now}
+    if _crop["mode"] == "auto":
+        found = detect_tray(frame)
+        if found is None:
+            _crop["detected"] = {"ok": False, "box": None, "at": now}
+            return
+        cur = _crop["box"]
+        if cur is None or any(abs(a - b) > 3 for a, b in zip(found, cur)):
+            if cur is not None and _crop["source"] == "auto":
+                logger.info("tray moved: crop %s -> %s", cur, list(found))
+            _crop["box"] = list(found)
+        _crop["source"] = "auto"
+        _crop["detected"] = {"ok": True, "box": list(found), "at": now}
+    ins = _crop["inset"]
+    if ins["mode"] != "auto" or not _crop["box"]:
         return
-    cur = _crop["box"]
-    if cur is None or any(abs(a - b) > 3 for a, b in zip(found, cur)):
-        if cur is not None and _crop["source"] == "auto":
-            logger.info("tray moved: crop %s -> %s", cur, list(found))
-        _crop["box"] = list(found)
-    _crop["source"] = "auto"
-    _crop["detected"] = {"ok": True, "box": list(found), "at": now}
+    floor = detect_floor(frame, tuple(_crop["box"]))
+    if floor is None:
+        ins["detected"] = {"ok": False, "box": None, "at": now}
+        return
+    rx1, ry1, rx2, ry2 = _crop["box"]
+    px = [floor[0] - rx1, floor[1] - ry1, rx2 - floor[2], ry2 - floor[3]]
+    if ins["px"] is None or any(abs(a - b) > 3 for a, b in zip(px, ins["px"])):
+        if ins["px"] is not None and ins["source"] == "auto":
+            logger.info("floor edge moved: inset %s -> %s", ins["px"], px)
+        ins["px"] = px
+    ins["source"] = "auto"
+    ins["detected"] = {"ok": True, "box": list(floor), "at": now}
 
 # Physical scale of the image, for the AI team's fish-length measurement.
 # The camera is fixed straight above the tray, the left view is rectified,
@@ -531,7 +676,7 @@ _deglare = {
 def _aec_roi_from_env():
     spec = os.environ.get("STREAM_API_AEC_ROI", "").strip()
     if spec.lower() == "tray":
-        return _crop["box"]
+        return _crop_box()
     return _parse_crop(spec, "STREAM_API_AEC_ROI")
 
 
@@ -1035,7 +1180,7 @@ def _stereo_filled_frame():
         return left
     shift = _stereo["shift"]
     if shift is None:
-        shift = estimate_stereo_shift(left, right, _live_box(_crop["box"]))
+        shift = estimate_stereo_shift(left, right, _live_box(_crop_box()))
         if shift is None:
             _stereo["last"] = {"ok": False, "reason": "no-shift-estimate"}
             return left
@@ -2143,12 +2288,15 @@ def capture(
               image they can get. Tune or disable it live with
               POST /camera/deglare; pass ?deglare=false for a single raw A/B
               frame. Reported in X-Deglare.
-    crop:     default true — cut to the inspection tray box, if one is set
+    crop:     default true — cut to the inspection tray, if a box is set
               (POST /camera/crop or STREAM_API_CROP; reported in the X-Crop
-              header and in /health). Everything outside the tray is
-              clutter for the AI client, which fetches bare /capture. Pass
-              ?crop=false for the full frame, which is what you want when
-              re-aiming the camera or checking the box is still right.
+              header and in /health): the rim is found on the frame, then
+              the floor edge inside it, and the served box is the floor
+              (X-Crop-Inset says how far in from the rim, and whether that
+              was detected, pinned or the fallback). Everything outside the
+              floor is clutter for the AI client, which fetches bare
+              /capture. Pass ?crop=false for the full frame, which is what
+              you want when re-aiming the camera or checking the box.
     preset:   unset, the frame comes back at the sensor's native size for the
               mode in force (1920x1080, or 2208x1242 after POST
               /camera/resolution?value=2k — a wider view at the same pixel
@@ -2171,9 +2319,9 @@ def capture(
         # resolution the crop exists to preserve. Auto mode needs the full
         # frame anyway: the tray is found on this very frame.
         image = full if full is not None else get_color_frame(*native)
-        if image is not None and _crop["mode"] == "auto":
+        if image is not None and (_crop["mode"] == "auto" or _crop["inset"]["mode"] == "auto"):
             _auto_crop(image)
-        box = _live_box(_crop["box"])
+        box = _live_box(_crop_box())
     elif full is not None:
         image = cv2.resize(full, RESOLUTIONS[preset], interpolation=cv2.INTER_AREA) if preset else full
     else:
@@ -2195,6 +2343,11 @@ def capture(
         image = image[y1:y2, x1:x2]
         headers["X-Crop"] = f"{x1},{y1},{x2},{y2}"
         headers["X-Crop-Source"] = str(_crop["source"])
+        ins = _crop["inset"]
+        headers["X-Crop-Inset"] = (
+            "off" if ins["mode"] == "off" or not ins["px"]
+            else f"{ins['source']};" + ",".join(str(v) for v in ins["px"])
+        )
         # Against the reference width, not the live one, so ?preset=sd of a
         # cropped tray is the same image whichever mode the sensor is in.
         scale = RESOLUTIONS[preset][0] / CAPTURE_WIDTH if preset else 1.0
@@ -2370,7 +2523,7 @@ def camera_aec_roi(
     """
     roi = None
     if value:
-        roi = _parse_crop(box, "box") if box is not None else _crop["box"]
+        roi = _parse_crop(box, "box") if box is not None else _crop_box()
         if roi is None:
             return JSONResponse(
                 content={
@@ -2390,8 +2543,9 @@ def camera_aec_roi(
 
 @app.post("/camera/crop", summary="Set the /capture crop: auto-detect, a fixed box, or off")
 def camera_crop(
-    value: str = Query(...),
+    value: Optional[str] = Query(None),
     box: Optional[str] = Query(None),
+    inset: Optional[str] = Query(None),
 ):
     """
     value: auto  — find the tray on every cropped capture (detect_tray) and
@@ -2401,6 +2555,15 @@ def camera_crop(
            true  — pin a fixed box: ?box= required the first time, omitted
                    afterwards keeps the current one.
            false — full frame for everyone.
+    inset: how far in from the rim box the served box sits, so the sloped
+           walls are left out and the AI gets the floor only.
+           auto    — find the floor edge inside the rim on every cropped
+                     capture (detect_floor); the inset in force is the
+                     fallback until the first detection. The shipped default.
+           l,t,r,b — pin it, in 1920x1080 pixels per side; a single number
+                     applies to all four.
+           off     — serve the rim box.
+           Either parameter may be sent alone; the other is left as it is.
     box:   x1,y1,x2,y2 in 1920x1080 pixels, read off a ?crop=false capture
            at fhd. In 2K mode the frame is 144 px wider on each side and
            81 px taller top and bottom at the same pixel pitch, so subtract
@@ -2412,8 +2575,33 @@ def camera_crop(
     /health camera.crop shows mode, source and the last detection; every
     cropped capture carries X-Crop and X-Crop-Source (auto/manual/fallback).
     """
-    v = value.strip().lower()
-    if v == "auto":
+    if value is None and inset is None:
+        return JSONResponse(
+            content={"error": "bad value", "detail": "pass ?value= and/or ?inset="},
+            status_code=400,
+        )
+    if inset is not None:
+        mode, px = _parse_inset(inset, "inset")
+        if mode == "off" and inset.strip().lower() not in _INSET_OFF_WORDS:
+            return JSONResponse(
+                content={"error": "bad inset", "detail": "inset must be auto, off, n or l,t,r,b"},
+                status_code=400,
+            )
+        ins = _crop["inset"]
+        if mode == "auto":
+            if ins["mode"] != "auto":
+                # Whatever was in force stays as the fallback until the first detection.
+                ins["source"] = "fallback" if ins["px"] else None
+            ins["mode"] = "auto"
+        elif mode == "fixed":
+            ins.update({"mode": "fixed", "px": px, "source": "fixed"})
+        else:
+            # px is kept so a later ?inset=auto has a fallback.
+            ins.update({"mode": "off", "source": None})
+    v = (value or "").strip().lower()
+    if value is None:
+        pass
+    elif v == "auto":
         if box is not None:
             seed = _parse_crop(box, "box")
             if seed is None:
@@ -2446,7 +2634,10 @@ def camera_crop(
             content={"error": "bad value", "detail": "value must be auto, true or false"},
             status_code=400,
         )
-    logger.info("capture crop now mode=%s box=%s", _crop["mode"], _crop["box"])
+    logger.info(
+        "capture crop now mode=%s box=%s inset=%s/%s",
+        _crop["mode"], _crop["box"], _crop["inset"]["mode"], _crop["inset"]["px"],
+    )
     return {"crop": dict(_crop)}
 
 
