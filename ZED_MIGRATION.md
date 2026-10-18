@@ -429,7 +429,9 @@ pair. Look at `fill_on.jpg` under the strips: fish texture back, and no visible 
 curl -X POST "http://<jetson-ip>:8000/camera/stereo?value=false"
 ```
 
-Keep it with `Environment=STREAM_API_STEREO_FILL=1` (and `STREAM_API_STEREO_SHIFT=`).
+**On by default since 2026-10-18** on `feature/crop-inset`; `Environment=STREAM_API_STEREO_FILL=0`
+turns it off permanently, `POST /camera/stereo?value=false` until the next restart. Pin the
+shift with `STREAM_API_STEREO_SHIFT=` once the estimate is known to be stable.
 
 ## 7j. 2K sensor mode
 
@@ -452,7 +454,8 @@ Crop and AEC boxes stay in 1080p coordinates and are offset into the live frame,
 nothing needs re-entering and `X-Mm-Per-Px` is the same number in both modes. To
 confirm the geometry on the box: `/health` `camera.device.fx` and `h_fov` for each
 mode — equal `fx`, wider `h_fov` at 2K. Keep it with
-`Environment=STREAM_API_CAMERA_MODE=2k`; `/health` reports it as `camera.resolution`.
+**2K is the default since 2026-10-18** on `feature/crop-inset`; `Environment=STREAM_API_CAMERA_MODE=fhd`
+returns to 1080p at 30 fps. `/health` reports the mode as `camera.resolution`.
 
 ## 8. What to bring back
 

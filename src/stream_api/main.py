@@ -114,11 +114,17 @@ CAMERA_MODES: dict[str, tuple[int, int, int]] = {
 CameraMode = Literal["fhd", "2k"]
 
 
+# 2K is the shipped default since 2026-10-18 at the user's request, after the
+# geometry fix above made a cropped capture identical in both modes; the
+# uncropped frame is the wider one. STREAM_API_CAMERA_MODE=fhd restores 30 fps.
+_CAMERA_MODE_DEFAULT = "2k"
+
+
 def _camera_mode_env() -> str:
-    raw = os.environ.get("STREAM_API_CAMERA_MODE", "fhd").strip().lower()
+    raw = os.environ.get("STREAM_API_CAMERA_MODE", _CAMERA_MODE_DEFAULT).strip().lower()
     if raw not in CAMERA_MODES:
-        logger.warning("STREAM_API_CAMERA_MODE=%r unknown, using fhd", raw)
-        return "fhd"
+        logger.warning("STREAM_API_CAMERA_MODE=%r unknown, using %s", raw, _CAMERA_MODE_DEFAULT)
+        return _CAMERA_MODE_DEFAULT
     return raw
 
 
@@ -567,9 +573,11 @@ _scale = {"grid_mm": GRID_MM, "grid_px": GRID_PX, "mm_per_px": round(GRID_MM / G
 # disparity), estimated by phase correlation on the tray region or pinned
 # with STREAM_API_STEREO_SHIFT. Clipped left pixels whose aligned right
 # pixel is not clipped are replaced through a feathered mask; de-glare then
-# evens out whatever brightness step remains. Off by default: untested on
-# hardware, and the gain is expected to be partial.
-STEREO_FILL_DEFAULT = os.environ.get("STREAM_API_STEREO_FILL", "0").strip().lower() in ("1", "true", "yes", "on")
+# evens out whatever brightness step remains. ON by default since 2026-10-18
+# at the user's request (STREAM_API_STEREO_FILL=0 turns it off); the gain is
+# expected to be partial, and X-Stereo-Fill on every capture says what it
+# did — a "no-shift-estimate" there means the frame went out unfilled.
+STEREO_FILL_DEFAULT = os.environ.get("STREAM_API_STEREO_FILL", "1").strip().lower() in ("1", "true", "yes", "on")
 _STEREO_SHIFT_ENV = os.environ.get("STREAM_API_STEREO_SHIFT", "").strip()
 _stereo = {
     "enabled": STEREO_FILL_DEFAULT,
@@ -2402,8 +2410,9 @@ def camera_restart():
 @app.post("/camera/resolution", summary="Switch the sensor mode live (fhd 1080p@30 / 2k @15)")
 def camera_resolution(value: CameraMode = Query(...)):
     """
-    value: fhd — 1920x1080 at 30 fps, the default.
-           2k  — 2208x1242 at 15 fps. Same pixel pitch and focal length, so
+    value: fhd — 1920x1080 at 30 fps.
+           2k  — 2208x1242 at 15 fps, the default since 2026-10-18. Same
+                 pixel pitch and focal length, so
                  the same pixels per fish: it is a 15% wider view, not a
                  sharper one, at half the frame rate. /health camera.device
                  reports fx and the field of view for the mode in force.
@@ -2670,7 +2679,8 @@ def camera_stereo(
     shift: Optional[str] = Query(None),
 ):
     """
-    value: true  — every /capture grabs both eyes and fills the left image's
+    value: true  — the default since 2026-10-18. Every /capture grabs both
+                   eyes and fills the left image's
                    clipped pixels (any channel >= 250) from the right view,
                    aligned on the tray plane. Then crop, de-glare, enhance
                    as usual. X-Stereo-Fill on each capture reports the shift
