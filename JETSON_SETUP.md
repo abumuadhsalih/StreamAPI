@@ -515,7 +515,7 @@ Set these as `Environment=` lines in `/etc/systemd/system/stream-api.service` (v
 | `STREAM_API_CROP` | `auto` | `/capture` crop. `auto` finds the tray rim on every capture and follows it when the camera or table moves; `x1,y1,x2,y2` pins a box; empty disables it. Live: `POST /camera/crop?value=auto|true|false&box=` |
 | `STREAM_API_TRAY_SIZE` | `1581,871` | What `auto` looks for: the rim's size in full-frame px at the current mount height, ±3.5%. Re-seed only if the camera is raised or lowered |
 | `STREAM_API_CROP_FISH` | `1` | Cut the cropped tray down to the box around the fish (plus a margin). A bare tray or a miss serves the tray crop. `0` serves the tray crop. Live: `POST /camera/crop?fish=`; one request: `/capture?fish=false` |
-| `STREAM_API_CROP_FISH_MARGIN` | `64` | Full-frame px kept around the fish, 0-400. Raise it if a silver fish ever comes back with a clipped end. Live: `POST /camera/crop?fish_margin=` |
+| `STREAM_API_CROP_FISH_MARGIN` | `40` | Full-frame px kept around the fish, 0-400. Raise it if a silver fish ever comes back with a clipped end. Live: `POST /camera/crop?fish_margin=` |
 | `STREAM_API_CAMERA_MODE` | `fhd` | Sensor mode: `fhd` 1920x1080@30 (default) or `2k` 2208x1242@15. Same FOV. Switch live with `POST /camera/resolution` |
 | `STREAM_API_AEC_ROI` | *(empty = off)* | Auto-exposure metering box. `tray` follows `STREAM_API_CROP`; or `x1,y1,x2,y2`. Off = the camera meters the whole frame. A/B it live with `POST /camera/aec-roi` before setting it here — see ZED_MIGRATION.md §7f |
 | `STREAM_API_CAMERA_BRIGHTNESS` | `4` | ZED ISP brightness, 0-8. Lower = darker frame with auto-exposure still running. Does **not** recover blown glare — see ZED_MIGRATION.md |

@@ -258,14 +258,11 @@ with `Environment=STREAM_API_CROP_INSET=auto` (or a fixed `l,t,r,b`).
 `feature/fish-crop`**). The tray crop is the same size whether it holds twelve fish or
 one, so a single fish in the middle comes back as a small island in steel. With this on,
 the service finds everything lying on the tray floor and serves the box around it plus a
-margin (`STREAM_API_CROP_FISH_MARGIN`, 64 px, just over two grid squares). A full tray
-comes back at about the tray crop; one fish comes back as that fish; a bare tray, or a
-frame where nothing is found, gets the plain tray crop. A fish touching the floor edge
-keeps that whole side out to the rim, since its tail may lie up the wall, and so does any
-side that would end within 15% of the floor edge: detection misses some fish standing in
-the brightest glare band, so the service only cuts where there is real empty space. In
-practice a tray with fish spread to every edge comes back as the whole tray. The cut is a
-crop, never a resample, so `X-Mm-Per-Px` is unchanged. Image size now varies capture to
+margin (`STREAM_API_CROP_FISH_MARGIN`, 40 px, about 1.4 grid squares). The box is tight on
+every tray: on the 22-fish frame it drops the walls and the empty steel round the fish
+(1180x740 instead of the 1579x867 tray crop), and one fish comes back as that fish. A bare
+tray, or a frame where nothing is found, gets the plain tray crop. The cut is a crop,
+never a resample, so `X-Mm-Per-Px` is unchanged. Image size now varies capture to
 capture, so the AI pipeline must accept any size.
 
 ```bash
@@ -277,13 +274,12 @@ curl -X POST "http://<jetson-ip>:8000/camera/crop?fish_margin=100"     # wider c
 curl -X POST "http://<jetson-ip>:8000/camera/crop?fish=false"          # tray crop for everyone
 ```
 
-Check the first sparse captures against `?fish=false`: the detector was tuned on three
-real ZED frames from the current table (a 22-fish raw frame and two crops with fish and
-crabs), all full enough to serve the whole tray, never on a real tray holding one or two
-fish. A fish coming back with a clipped end
-means raise the margin; a box that is always the whole tray on a sparse tray means salt
-or glare is being read as fish. A fish lying entirely on the rim or wall, off the floor,
-is not searched and is left out.
+Check the first captures against `?fish=false`: the detector was tuned on three real ZED
+frames from the current table (a 22-fish raw frame and two crops with fish and crabs),
+with every fish inside the box on all three, but never on a real tray holding one or two
+fish. A fish coming back with a clipped end means raise the margin; a box much wider than
+the fish means salt, a smear or a glare edge is being read as fish. A fish lying entirely
+on the rim or wall, off the floor, is not searched and is left out.
 
 ## 7d. Tune the de-glare pass
 
