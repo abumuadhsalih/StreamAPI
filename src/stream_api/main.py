@@ -332,6 +332,40 @@ def _parse_inset(spec: str, name: str = "STREAM_API_CROP_INSET"):
 
 _inset_mode, _inset_px = _parse_inset(os.environ.get("STREAM_API_CROP_INSET", _CROP_INSET_DEFAULT))
 
+# Third crop stage, after rim and inset: cut to the fish themselves
+# (2026-10-19, feature/fish-crop, at the user's request). The tray is a fixed
+# size but the catch is not — a full tray and one fish in the middle used to
+# get the same 1582 px wide image, the single fish a small island in steel.
+# detect_fish() finds whatever lies on the floor and /capture serves the box
+# around all of it plus a margin, so a full tray still comes back at about
+# the tray crop and one fish comes back as that fish. It never cuts a fish
+# on purpose: a fish touching the floor edge gives that side back to the tray
+# box (its tail may be lying up the wall), a miss or an empty tray serves the
+# plain tray crop, and the margin covers a silver fish whose ends read as
+# weakly as steel. Cut LAST, after de-glare and enhance have run on the tray
+# crop: de-glare divides by a sigma-60 blur, and on a one-fish crop that
+# blur would be mostly fish and flatten the fish against itself.
+# STREAM_API_CROP_FISH: on (this branch's default) or off.
+# STREAM_API_CROP_FISH_MARGIN: reference px kept around the fish, default 64
+# (just over two grid squares). Both movable live with POST /camera/crop.
+_FISH_CROP_DEFAULT = "on"
+_FISH_MARGIN_DEFAULT = 64
+
+
+def _fish_margin_env() -> int:
+    raw = os.environ.get("STREAM_API_CROP_FISH_MARGIN", str(_FISH_MARGIN_DEFAULT)).strip()
+    try:
+        v = int(raw)
+        if not 0 <= v <= 400:
+            raise ValueError
+    except ValueError:
+        logger.warning("STREAM_API_CROP_FISH_MARGIN=%r is not 0-400, using %d", raw, _FISH_MARGIN_DEFAULT)
+        v = _FISH_MARGIN_DEFAULT
+    return v
+
+
+_fish_enabled = os.environ.get("STREAM_API_CROP_FISH", _FISH_CROP_DEFAULT).strip().lower() not in _INSET_OFF_WORDS
+
 _crop_env = os.environ.get("STREAM_API_CROP", _CROP_DEFAULT).strip()
 CROP_AUTO = _crop_env.lower() == "auto"
 CROP_BOX = _parse_crop(_CROP_FALLBACK if CROP_AUTO else _crop_env)
@@ -357,6 +391,14 @@ _crop = {
         "mode": _inset_mode,
         "px": _parse_inset(_CROP_INSET_FALLBACK)[1] if _inset_mode == "auto" else _inset_px,
         "source": {"auto": "fallback", "fixed": "fixed", "off": None}[_inset_mode],
+        "detected": None,
+    },
+    # Third stage: the box around the fish, cut from the tray crop. `detected`
+    # is the last result — fish count, the box served, and which floor box it
+    # searched (the inset in force, a fresh detect_floor(), or the fallback).
+    "fish": {
+        "enabled": _fish_enabled,
+        "margin": _fish_margin_env(),
         "detected": None,
     },
 }
@@ -472,6 +514,126 @@ def detect_floor(frame, rim):
     if px is None or py is None:
         return None
     return (px[0], py[0], px[1], py[1])
+
+
+# detect_fish() tuning, all measured on 9 of the client's tray photos
+# (fishAIPhoto/, phone shots from 1 to 12 fish, silver, spotted and red
+# species, grids, rulers, salt, glare) resized to the 1920x1080 reference.
+_FISH_SCALE = 0.25      # work at quarter scale: grid lines and salt specks vanish
+_FISH_LINE = 31         # straight run (quarter-scale px) that marks a tray edge, not a fish
+_FISH_WIN = 9           # window for local edge density
+_FISH_GUARD = 6         # quarter-scale px ignored at the floor edge (the junction itself)
+_FISH_BG_PCT = 40       # percentile of density taken as bare steel
+_FISH_K_LO = 2.0        # density over steel that grows a fish ...
+_FISH_K_HI = 4.0        # ... and that a fish must contain somewhere
+_FISH_OPEN = 7          # drops scratches and thin salt trails
+_FISH_MIN_AREA = 4000   # reference px^2 — the smallest blob counted (~63x63)
+_FISH_MIN_CORE = 1500   # reference px^2 of strong core the blob must carry
+
+
+def detect_fish(frame, floor, served, margin: int = _FISH_MARGIN_DEFAULT):
+    """Box around everything lying on the tray floor. Returns ((x1,y1,x2,y2),
+    count) in reference coordinates, or (None, 0) when the floor is bare.
+
+    Fish are textured — scales, fins, eyes, a dark outline — and bare steel is
+    not, so: Lab gradient magnitude at quarter scale (after a median that
+    removes the grid lines and salt specks), divided by local brightness so a
+    glare band's soft shoulder is not an edge; long straight runs removed
+    (the wall/floor junction, the printed grid, rulers); local edge density;
+    then hysteresis against the density of the bare steel — a blob counts
+    only if it is fish-sized AND carries a strong core somewhere, which is
+    what keeps scratches, salt trails and wet patches out. The box is the
+    union of every blob plus `margin`, clamped to `served`; a blob reaching
+    the floor edge sends that side to the edge of `served`, since a tail
+    lying up the wall cannot be told apart from the wall's own edges.
+
+    The masks are partial on silver fish (the flank reads close to steel)
+    but every fish on the test set left at least its head, tail and outline,
+    which is all a bounding box needs; the margin is the cushion. ~8 ms.
+    Never run on a ZED frame when written — check the first real captures.
+    """
+    frame = _ref_frame(frame)
+    fx1, fy1, fx2, fy2 = floor
+    roi = frame[fy1:fy2, fx1:fx2]
+    if roi.shape[0] < 64 or roi.shape[1] < 64:
+        return None, 0
+    sw = max(1, round(roi.shape[1] * _FISH_SCALE))
+    sh = max(1, round(roi.shape[0] * _FISH_SCALE))
+    sm = cv2.medianBlur(cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_AREA), 5)
+    lab = cv2.cvtColor(sm, cv2.COLOR_BGR2LAB).astype(np.float32)
+    g = np.zeros((sh, sw), np.float32)
+    for c, wt in ((0, 1.0), (1, 2.0), (2, 2.0)):
+        g += wt * cv2.magnitude(
+            cv2.Scharr(lab[..., c], cv2.CV_32F, 1, 0), cv2.Scharr(lab[..., c], cv2.CV_32F, 0, 1)
+        )
+    g /= np.maximum(cv2.GaussianBlur(lab[..., 0], (0, 0), 8), 30.0)
+    strong = (g > 2.0 * float(np.median(g))).astype(np.uint8)
+    lines = cv2.morphologyEx(strong, cv2.MORPH_OPEN, np.ones((1, _FISH_LINE), np.uint8)) | cv2.morphologyEx(
+        strong, cv2.MORPH_OPEN, np.ones((_FISH_LINE, 1), np.uint8)
+    )
+    g[cv2.dilate(lines, np.ones((3, 3), np.uint8)) > 0] = 0
+    d = cv2.blur(g, (_FISH_WIN, _FISH_WIN))
+    gd = _FISH_GUARD
+    if sh <= 4 * gd or sw <= 4 * gd:
+        return None, 0
+    d[:gd, :] = 0
+    d[-gd:, :] = 0
+    d[:, :gd] = 0
+    d[:, -gd:] = 0
+    bg = max(float(np.percentile(d[gd:-gd, gd:-gd], _FISH_BG_PCT)), 1e-3)
+    lo = (d > _FISH_K_LO * bg).astype(np.uint8)
+    lo = cv2.morphologyEx(lo, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_FISH_OPEN, _FISH_OPEN)))
+    hi = (d > _FISH_K_HI * bg).astype(np.uint8) & lo
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(lo, 8)
+    core = np.bincount(lbl.ravel(), weights=hi.ravel().astype(np.float64), minlength=n)
+    a = _FISH_SCALE ** 2
+    keep = [
+        i for i in range(1, n)
+        if st[i, cv2.CC_STAT_AREA] >= _FISH_MIN_AREA * a and core[i] >= _FISH_MIN_CORE * a
+    ]
+    if not keep:
+        return None, 0
+    x1 = min(st[i, 0] for i in keep)
+    y1 = min(st[i, 1] for i in keep)
+    x2 = max(st[i, 0] + st[i, 2] for i in keep)
+    y2 = max(st[i, 1] + st[i, 3] for i in keep)
+    f, t = 1.0 / _FISH_SCALE, gd + 1
+    sx1, sy1, sx2, sy2 = served
+    box = (
+        sx1 if x1 <= t else max(sx1, fx1 + int(x1 * f) - margin),
+        sy1 if y1 <= t else max(sy1, fy1 + int(y1 * f) - margin),
+        sx2 if x2 >= sw - t else min(sx2, fx1 + int(x2 * f) + margin),
+        sy2 if y2 >= sh - t else min(sy2, fy1 + int(y2 * f) + margin),
+    )
+    return box, len(keep)
+
+
+def _fish_crop(frame, served):
+    """The fish box for this capture, in reference coordinates, folded into
+    _crop["fish"]["detected"]; `served` (the tray box) when nothing is found.
+
+    Searches the floor, not the served box: the walls' own edges would read
+    as fish. The floor is the inset box when an inset is in force, else a
+    fresh detect_floor() inside the rim, else the rim less the fallback inset.
+    """
+    rim = tuple(_crop["box"])
+    ins = _crop["inset"]
+    if ins["mode"] != "off" and ins["px"]:
+        floor, src = tuple(served), "inset"
+    else:
+        floor, src = detect_floor(frame, rim), "detected"
+        if floor is None:
+            l, t, r, b = _parse_inset(_CROP_INSET_FALLBACK)[1]
+            floor, src = (rim[0] + l, rim[1] + t, rim[2] - r, rim[3] - b), "fallback"
+    box, n = detect_fish(frame, floor, tuple(served), _crop["fish"]["margin"])
+    _crop["fish"]["detected"] = {
+        "ok": box is not None,
+        "fish": n,
+        "box": list(box) if box else None,
+        "floor": src,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    return box if box is not None else tuple(served)
 
 
 def _crop_box():
@@ -2296,6 +2458,7 @@ def capture(
     enhance: Optional[bool] = None,
     crop: bool = True,
     deglare: bool = True,
+    fish: Optional[bool] = None,
 ):
     """
     enhance:  CLAHE + adaptive gamma lift + unsharp. Unset follows the server
@@ -2319,6 +2482,15 @@ def capture(
               (POST /camera/crop?inset=auto, off by default) cuts further
               in to the floor edge, dropping the walls; X-Crop-Inset says
               what was applied.
+    fish:     cut the cropped tray down to the box around the fish on it,
+              plus a margin. Unset follows the server default (POST
+              /camera/crop?fish=, STREAM_API_CROP_FISH), which ships ON on
+              this branch: a full tray comes back at about the tray crop,
+              one fish comes back as that fish. A bare tray, or one where
+              nothing is found, gets the plain tray crop. Pass ?fish=false
+              for the tray crop on a single request. X-Crop-Fish carries
+              the fish count and the box, or "none"; X-Crop is always the
+              box actually served. Needs crop on.
     preset:   unset, the frame comes back at the sensor's native size for the
               mode in force (1920x1080, or 2208x1242 after POST
               /camera/resolution?value=2k — a wider view at the same pixel
@@ -2332,6 +2504,7 @@ def capture(
     """
     native = (_camera_mode["width"], _camera_mode["height"])
     full = None
+    fish_box = None
     if _stereo["enabled"]:
         full = _stereo_filled_frame()
     box = None
@@ -2344,6 +2517,9 @@ def capture(
         if image is not None and (_crop["mode"] == "auto" or _crop["inset"]["mode"] == "auto"):
             _auto_crop(image)
         box = _live_box(_crop_box())
+        if image is not None and box and (_crop["fish"]["enabled"] if fish is None else fish):
+            # Found on the full frame now, cut at the very end — see _fish_crop.
+            fish_box = _live_box(_fish_crop(image, _crop_box()))
     elif full is not None:
         image = cv2.resize(full, RESOLUTIONS[preset], interpolation=cv2.INTER_AREA) if preset else full
     else:
@@ -2363,7 +2539,6 @@ def capture(
     if box:
         x1, y1, x2, y2 = box
         image = image[y1:y2, x1:x2]
-        headers["X-Crop"] = f"{x1},{y1},{x2},{y2}"
         headers["X-Crop-Source"] = str(_crop["source"])
         ins = _crop["inset"]
         headers["X-Crop-Inset"] = (
@@ -2373,6 +2548,7 @@ def capture(
         # Against the reference width, not the live one, so ?preset=sd of a
         # cropped tray is the same image whichever mode the sensor is in.
         scale = RESOLUTIONS[preset][0] / CAPTURE_WIDTH if preset else 1.0
+        crop_scale = scale
         if scale != 1.0:
             image = cv2.resize(
                 image,
@@ -2405,6 +2581,22 @@ def capture(
     # 2K changes nothing here — same pixel pitch — so a bare 2K capture
     # carries the same number as a bare 1080p one.
     headers["X-Mm-Per-Px"] = f"{_scale['mm_per_px'] * ref_per_out:.4f}"
+    if box:
+        if fish_box is not None:
+            # Last, on the de-glared and enhanced tray crop. A cut only, never
+            # a resample, so X-Mm-Per-Px above holds for the fish image too.
+            det = _crop["fish"]["detected"] or {}
+            headers["X-Crop-Fish"] = (
+                f"{det.get('fish', 0)};" + ",".join(str(v) for v in fish_box) if det.get("ok") else "none"
+            )
+            h, w = image.shape[:2]
+            cx1 = min(w - 1, max(0, round((fish_box[0] - box[0]) * crop_scale)))
+            cy1 = min(h - 1, max(0, round((fish_box[1] - box[1]) * crop_scale)))
+            cx2 = min(w, max(cx1 + 1, round((fish_box[2] - box[0]) * crop_scale)))
+            cy2 = min(h, max(cy1 + 1, round((fish_box[3] - box[1]) * crop_scale)))
+            image = image[cy1:cy2, cx1:cx2]
+            box = fish_box
+        headers["X-Crop"] = ",".join(str(v) for v in box)
     headers["X-Resolution"] = f"{image.shape[1]}x{image.shape[0]}"
     _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 100])
     return Response(content=jpeg.tobytes(), media_type="image/jpeg", headers=headers)
@@ -2570,6 +2762,8 @@ def camera_crop(
     value: Optional[str] = Query(None),
     box: Optional[str] = Query(None),
     inset: Optional[str] = Query(None),
+    fish: Optional[bool] = Query(None),
+    fish_margin: Optional[int] = Query(None, ge=0, le=400),
 ):
     """
     value: auto  — find the tray on every cropped capture (detect_tray) and
@@ -2588,7 +2782,13 @@ def camera_crop(
                      applies to all four.
            off     — serve the rim box, tray edges included. The shipped
                      default: the floor-only capture was rejected on sight.
-           Either parameter may be sent alone; the other is left as it is.
+    fish:  true/false — the server default for cutting a cropped capture
+           down to the box around the fish (detect_fish). A bare tray or a
+           miss serves the tray crop either way.
+    fish_margin: reference px kept around the fish, 0-400 (default 64).
+           Raise it if a silver fish ever comes back with a clipped end.
+           Any of these parameters may be sent alone; the rest are left as
+           they are.
     box:   x1,y1,x2,y2 in 1920x1080 pixels, read off a ?crop=false capture
            at fhd. In 2K mode the frame is 144 px wider on each side and
            81 px taller top and bottom at the same pixel pitch, so subtract
@@ -2600,11 +2800,15 @@ def camera_crop(
     /health camera.crop shows mode, source and the last detection; every
     cropped capture carries X-Crop and X-Crop-Source (auto/manual/fallback).
     """
-    if value is None and inset is None:
+    if value is None and inset is None and fish is None and fish_margin is None:
         return JSONResponse(
-            content={"error": "bad value", "detail": "pass ?value= and/or ?inset="},
+            content={"error": "bad value", "detail": "pass ?value=, ?inset=, ?fish= and/or ?fish_margin="},
             status_code=400,
         )
+    if fish is not None:
+        _crop["fish"]["enabled"] = fish
+    if fish_margin is not None:
+        _crop["fish"]["margin"] = fish_margin
     if inset is not None:
         mode, px = _parse_inset(inset, "inset")
         if mode == "off" and inset.strip().lower() not in _INSET_OFF_WORDS:
@@ -2660,8 +2864,9 @@ def camera_crop(
             status_code=400,
         )
     logger.info(
-        "capture crop now mode=%s box=%s inset=%s/%s",
+        "capture crop now mode=%s box=%s inset=%s/%s fish=%s/%d",
         _crop["mode"], _crop["box"], _crop["inset"]["mode"], _crop["inset"]["px"],
+        _crop["fish"]["enabled"], _crop["fish"]["margin"],
     )
     return {"crop": dict(_crop)}
 

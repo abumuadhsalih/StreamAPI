@@ -254,6 +254,32 @@ curl -X POST "http://<jetson-ip>:8000/camera/crop?inset=off"            # rim bo
 height in a `?crop=false` capture, alongside `STREAM_API_TRAY_SIZE`. Keep it permanently
 with `Environment=STREAM_API_CROP_INSET=auto` (or a fixed `l,t,r,b`).
 
+**Crop to the fish, not the tray** (`STREAM_API_CROP_FISH`, **on by default on
+`feature/fish-crop`**). The tray crop is the same size whether it holds twelve fish or
+one, so a single fish in the middle comes back as a small island in steel. With this on,
+the service finds everything lying on the tray floor and serves the box around it plus a
+margin (`STREAM_API_CROP_FISH_MARGIN`, 64 px, just over two grid squares). A full tray
+comes back at about the tray crop; one fish comes back as that fish; a bare tray, or a
+frame where nothing is found, gets the plain tray crop. A fish touching the floor edge
+keeps that whole side out to the rim, since its tail may lie up the wall. The cut is a
+crop, never a resample, so `X-Mm-Per-Px` is unchanged. Image size now varies capture to
+capture, so the AI pipeline must accept any size.
+
+```bash
+curl -s -D - -o fish.jpg "http://<jetson-ip>:8000/capture" | grep -i x-crop
+#   X-Crop-Fish: 4;596,382,1852,974   -> 4 blobs found; the box served, in live-frame px
+#   X-Crop-Fish: none                 -> nothing found; the tray crop was served
+curl -s -o tray.jpg "http://<jetson-ip>:8000/capture?fish=false"      # tray crop, one request
+curl -X POST "http://<jetson-ip>:8000/camera/crop?fish_margin=100"     # wider cushion
+curl -X POST "http://<jetson-ip>:8000/camera/crop?fish=false"          # tray crop for everyone
+```
+
+Check the first real captures from the ZED against `?fish=false`: the detector was tuned
+on the client's phone photos, not on a ZED frame. A fish coming back with a clipped end
+means raise the margin; a box that is always the whole tray on a sparse tray means salt
+or glare is being read as fish. A fish lying entirely on the rim or wall, off the floor,
+is not searched and is left out.
+
 ## 7d. Tune the de-glare pass
 
 `/capture` flattens the light-strip reflections by default — **on by default because
