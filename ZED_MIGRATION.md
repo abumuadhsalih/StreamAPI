@@ -261,7 +261,10 @@ the service finds everything lying on the tray floor and serves the box around i
 margin (`STREAM_API_CROP_FISH_MARGIN`, 64 px, just over two grid squares). A full tray
 comes back at about the tray crop; one fish comes back as that fish; a bare tray, or a
 frame where nothing is found, gets the plain tray crop. A fish touching the floor edge
-keeps that whole side out to the rim, since its tail may lie up the wall. The cut is a
+keeps that whole side out to the rim, since its tail may lie up the wall, and so does any
+side that would end within 15% of the floor edge: detection misses some fish standing in
+the brightest glare band, so the service only cuts where there is real empty space. In
+practice a tray with fish spread to every edge comes back as the whole tray. The cut is a
 crop, never a resample, so `X-Mm-Per-Px` is unchanged. Image size now varies capture to
 capture, so the AI pipeline must accept any size.
 
@@ -274,8 +277,10 @@ curl -X POST "http://<jetson-ip>:8000/camera/crop?fish_margin=100"     # wider c
 curl -X POST "http://<jetson-ip>:8000/camera/crop?fish=false"          # tray crop for everyone
 ```
 
-Check the first real captures from the ZED against `?fish=false`: the detector was tuned
-on the client's phone photos, not on a ZED frame. A fish coming back with a clipped end
+Check the first sparse captures against `?fish=false`: the detector was tuned on three
+real ZED frames from the current table (a 22-fish raw frame and two crops with fish and
+crabs), all full enough to serve the whole tray, never on a real tray holding one or two
+fish. A fish coming back with a clipped end
 means raise the margin; a box that is always the whole tray on a sparse tray means salt
 or glare is being read as fish. A fish lying entirely on the rim or wall, off the floor,
 is not searched and is left out.

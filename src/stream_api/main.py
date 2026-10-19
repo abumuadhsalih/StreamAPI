@@ -341,10 +341,11 @@ _inset_mode, _inset_px = _parse_inset(os.environ.get("STREAM_API_CROP_INSET", _C
 # the tray crop and one fish comes back as that fish. It never cuts a fish
 # on purpose: a fish touching the floor edge gives that side back to the tray
 # box (its tail may be lying up the wall), a miss or an empty tray serves the
-# plain tray crop, and the margin covers a silver fish whose ends read as
-# weakly as steel. Cut LAST, after de-glare and enhance have run on the tray
-# crop: de-glare divides by a sigma-60 blur, and on a one-fish crop that
-# blur would be mostly fish and flatten the fish against itself.
+# plain tray crop, a side that would end near the floor edge goes to the
+# rim, and the margin covers a silver fish whose ends read weakly. Cut
+# LAST, after de-glare and enhance have run on the tray crop: de-glare
+# divides by a sigma-60 blur, and on a one-fish crop that blur would be
+# mostly fish and flatten the fish against itself.
 # STREAM_API_CROP_FISH: on (this branch's default) or off.
 # STREAM_API_CROP_FISH_MARGIN: reference px kept around the fish, default 64
 # (just over two grid squares). Both movable live with POST /camera/crop.
@@ -516,50 +517,65 @@ def detect_floor(frame, rim):
     return (px[0], py[0], px[1], py[1])
 
 
-# detect_fish() tuning, all measured on 9 of the client's tray photos
-# (fishAIPhoto/, phone shots from 1 to 12 fish, silver, spotted and red
-# species, grids, rulers, salt, glare) resized to the 1920x1080 reference.
-_FISH_SCALE = 0.25      # work at quarter scale: grid lines and salt specks vanish
-_FISH_LINE = 31         # straight run (quarter-scale px) that marks a tray edge, not a fish
-_FISH_WIN = 9           # window for local edge density
-_FISH_GUARD = 6         # quarter-scale px ignored at the floor edge (the junction itself)
-_FISH_BG_PCT = 40       # percentile of density taken as bare steel
-_FISH_K_LO = 2.0        # density over steel that grows a fish ...
-_FISH_K_HI = 4.0        # ... and that a fish must contain somewhere
-_FISH_OPEN = 7          # drops scratches and thin salt trails
-_FISH_MIN_AREA = 4000   # reference px^2 — the smallest blob counted (~63x63)
-_FISH_MIN_CORE = 1500   # reference px^2 of strong core the blob must carry
+# detect_fish() tuning, measured on the ZED 2i frames from the current table
+# (2026-10-19: a 22-fish raw full frame, and the initial and 16 Oct rim crops
+# with fish and blue crabs). A first cut tuned on the legacy phone photos
+# found 2 of 22 fish on the raw frame: on the ZED a silver fish on bright
+# steel shows as a ring — a strong outline round a smooth body — not as a
+# dense texture, and quarter-scale smoothing erased the ring.
+_FISH_SCALE = 0.5       # half scale: keeps the 1-2 px outlines
+_FISH_WIN = 5           # window for local edge density
+_FISH_GUARD = 12        # half-scale px ignored at the floor edge (the junction itself)
+_FISH_K_LO = 2.0        # density over the floor median that traces an outline ...
+_FISH_K_HI = 3.0        # ... and that a blob must contain somewhere
+_FISH_LONG = 0.25       # straight runs this fraction of the floor are band or wall edges
+_FISH_CLOSE = 9         # closes an outline into a ring before it is filled
+_FISH_OPEN = 9          # drops salt rings, scratches and grid stubs
+_FISH_MIN_AREA = 3000   # reference px^2 — the smallest blob counted (~55x55)
+_FISH_MIN_CORE = 600    # reference px^2 of strong outline the blob must carry
+_FISH_SNAP = 0.15       # a side this close to the floor edge goes to the rim
+
+
+def _fill_holes(mask):
+    """Fill every region of a 0/1 mask not reachable from its border."""
+    ff = np.pad(mask, 1).copy()
+    cv2.floodFill(ff, np.zeros((ff.shape[0] + 2, ff.shape[1] + 2), np.uint8), (0, 0), 1)
+    return mask | (1 - ff[1:-1, 1:-1])
 
 
 def detect_fish(frame, floor, served, margin: int = _FISH_MARGIN_DEFAULT):
     """Box around everything lying on the tray floor. Returns ((x1,y1,x2,y2),
     count) in reference coordinates, or (None, 0) when the floor is bare.
 
-    Fish are textured — scales, fins, eyes, a dark outline — and bare steel is
-    not, so: Lab gradient magnitude at quarter scale (after a median that
-    removes the grid lines and salt specks), divided by local brightness so a
-    glare band's soft shoulder is not an edge; long straight runs removed
-    (the wall/floor junction, the printed grid, rulers); local edge density;
-    then hysteresis against the density of the bare steel — a blob counts
-    only if it is fish-sized AND carries a strong core somewhere, which is
-    what keeps scratches, salt trails and wet patches out. The box is the
-    union of every blob plus `margin`, clamped to `served`; a blob reaching
-    the floor edge sends that side to the edge of `served`, since a tail
-    lying up the wall cannot be told apart from the wall's own edges.
+    Lab gradient at half scale, over local brightness; local edge density
+    thresholded against the floor's median, which traces each fish's outline;
+    long straight runs removed (glare-band edges, the wall junction, rulers);
+    each outline closed and filled into a solid blob; a blob counts if it is
+    fish-sized and carries a strong outline somewhere — salt crystals and
+    smears do not. The box is the union of every blob plus `margin`.
 
-    The masks are partial on silver fish (the flank reads close to steel)
-    but every fish on the test set left at least its head, tail and outline,
-    which is all a bounding box needs; the margin is the cushion. ~8 ms.
-    Never run on a ZED frame when written — check the first real captures.
+    Two rules keep it from cutting a fish, which is worse than not cropping:
+    a blob touching the floor edge sends that side out to the edge of
+    `served` (its tail may lie up the wall), and so does a side that ends
+    within _FISH_SNAP of the floor edge anyway. The second exists because
+    detection is not complete: on the 22-fish frame the column standing in
+    the brightest glare band was found only in fragments. A tray with fish
+    near every edge therefore comes back as the whole tray, and only a tray
+    with real empty space is cut. ~15 ms.
+
+    Checked on three real frames (all full enough to serve the whole tray,
+    no fish cut). Never checked on a real sparse ZED tray — the first one
+    should be compared against ?fish=false.
     """
     frame = _ref_frame(frame)
     fx1, fy1, fx2, fy2 = floor
     roi = frame[fy1:fy2, fx1:fx2]
-    if roi.shape[0] < 64 or roi.shape[1] < 64:
-        return None, 0
     sw = max(1, round(roi.shape[1] * _FISH_SCALE))
     sh = max(1, round(roi.shape[0] * _FISH_SCALE))
-    sm = cv2.medianBlur(cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_AREA), 5)
+    gd = _FISH_GUARD
+    if sh <= 4 * gd or sw <= 4 * gd:
+        return None, 0
+    sm = cv2.medianBlur(cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_AREA), 3)
     lab = cv2.cvtColor(sm, cv2.COLOR_BGR2LAB).astype(np.float32)
     g = np.zeros((sh, sw), np.float32)
     for c, wt in ((0, 1.0), (1, 2.0), (2, 2.0)):
@@ -567,23 +583,23 @@ def detect_fish(frame, floor, served, margin: int = _FISH_MARGIN_DEFAULT):
             cv2.Scharr(lab[..., c], cv2.CV_32F, 1, 0), cv2.Scharr(lab[..., c], cv2.CV_32F, 0, 1)
         )
     g /= np.maximum(cv2.GaussianBlur(lab[..., 0], (0, 0), 8), 30.0)
-    strong = (g > 2.0 * float(np.median(g))).astype(np.uint8)
-    lines = cv2.morphologyEx(strong, cv2.MORPH_OPEN, np.ones((1, _FISH_LINE), np.uint8)) | cv2.morphologyEx(
-        strong, cv2.MORPH_OPEN, np.ones((_FISH_LINE, 1), np.uint8)
-    )
-    g[cv2.dilate(lines, np.ones((3, 3), np.uint8)) > 0] = 0
     d = cv2.blur(g, (_FISH_WIN, _FISH_WIN))
-    gd = _FISH_GUARD
-    if sh <= 4 * gd or sw <= 4 * gd:
-        return None, 0
-    d[:gd, :] = 0
-    d[-gd:, :] = 0
+    d[:gd] = 0
+    d[-gd:] = 0
     d[:, :gd] = 0
     d[:, -gd:] = 0
-    bg = max(float(np.percentile(d[gd:-gd, gd:-gd], _FISH_BG_PCT)), 1e-3)
-    lo = (d > _FISH_K_LO * bg).astype(np.uint8)
-    lo = cv2.morphologyEx(lo, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_FISH_OPEN, _FISH_OPEN)))
-    hi = (d > _FISH_K_HI * bg).astype(np.uint8) & lo
+    med = max(float(np.median(d[gd:-gd, gd:-gd])), 1e-3)
+    lo = (d > _FISH_K_LO * med).astype(np.uint8)
+    lv, lh = max(15, int(sh * _FISH_LONG)), max(15, int(sw * _FISH_LONG))
+    longs = cv2.morphologyEx(lo, cv2.MORPH_OPEN, np.ones((lv, 1), np.uint8)) | cv2.morphologyEx(
+        lo, cv2.MORPH_OPEN, np.ones((1, lh), np.uint8)
+    )
+    lo[cv2.dilate(longs, np.ones((5, 5), np.uint8)) > 0] = 0
+    ell = cv2.getStructuringElement
+    lo = cv2.morphologyEx(lo, cv2.MORPH_CLOSE, ell(cv2.MORPH_ELLIPSE, (_FISH_CLOSE, _FISH_CLOSE)))
+    lo = _fill_holes(lo)
+    lo = cv2.morphologyEx(lo, cv2.MORPH_OPEN, ell(cv2.MORPH_ELLIPSE, (_FISH_OPEN, _FISH_OPEN)))
+    hi = ((d > _FISH_K_HI * med) & (lo > 0)).astype(np.uint8)
     n, lbl, st, _ = cv2.connectedComponentsWithStats(lo, 8)
     core = np.bincount(lbl.ravel(), weights=hi.ravel().astype(np.float64), minlength=n)
     a = _FISH_SCALE ** 2
@@ -598,12 +614,15 @@ def detect_fish(frame, floor, served, margin: int = _FISH_MARGIN_DEFAULT):
     x2 = max(st[i, 0] + st[i, 2] for i in keep)
     y2 = max(st[i, 1] + st[i, 3] for i in keep)
     f, t = 1.0 / _FISH_SCALE, gd + 1
+    bx1, by1 = fx1 + int(x1 * f) - margin, fy1 + int(y1 * f) - margin
+    bx2, by2 = fx1 + int(x2 * f) + margin, fy1 + int(y2 * f) + margin
+    snx, sny = _FISH_SNAP * (fx2 - fx1), _FISH_SNAP * (fy2 - fy1)
     sx1, sy1, sx2, sy2 = served
     box = (
-        sx1 if x1 <= t else max(sx1, fx1 + int(x1 * f) - margin),
-        sy1 if y1 <= t else max(sy1, fy1 + int(y1 * f) - margin),
-        sx2 if x2 >= sw - t else min(sx2, fx1 + int(x2 * f) + margin),
-        sy2 if y2 >= sh - t else min(sy2, fy1 + int(y2 * f) + margin),
+        sx1 if x1 <= t or bx1 - fx1 < snx else max(sx1, bx1),
+        sy1 if y1 <= t or by1 - fy1 < sny else max(sy1, by1),
+        sx2 if x2 >= sw - t or fx2 - bx2 < snx else min(sx2, bx2),
+        sy2 if y2 >= sh - t or fy2 - by2 < sny else min(sy2, by2),
     )
     return box, len(keep)
 
