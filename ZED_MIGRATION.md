@@ -354,19 +354,19 @@ re-measures both) or an explicit `x1,y1,x2,y2`. `/health` reports it as `camera.
 ## 7g. Colour, in camera
 
 The fish on the steel tray measure a saturation of ~10 (0-255) against ~17 on the
-client's phone — the red and orange species come out nearly grey. The ZED's own
-saturation control is the lever; one step at a time, and judge on the silver fish,
-which must stay silver.
+client's phone — the red and orange species come out nearly grey at the SDK's
+default of 4. The ZED's own saturation control is the lever, and the service
+ships it at **6** since 2026-10-18. One step at a time, and judge on the silver
+fish, which must stay silver.
 
 ```bash
-curl -X POST "http://<jetson-ip>:8000/camera/brightness?saturation=5"
-curl -s -o sat5.jpg "http://<jetson-ip>:8000/capture"
-curl -X POST "http://<jetson-ip>:8000/camera/brightness?saturation=6"
+curl -X POST "http://<jetson-ip>:8000/camera/brightness?saturation=4"      # SDK default, for comparison
+curl -s -o sat4.jpg "http://<jetson-ip>:8000/capture"
+curl -X POST "http://<jetson-ip>:8000/camera/brightness?saturation=6"      # back to the service default
 curl -s -o sat6.jpg "http://<jetson-ip>:8000/capture"
-curl -X POST "http://<jetson-ip>:8000/camera/brightness?saturation=4"      # back to default
 ```
 
-Keep one with `Environment=STREAM_API_CAMERA_SATURATION=`.
+Keep a different one with `Environment=STREAM_API_CAMERA_SATURATION=`.
 
 ## 7h. Size calibration for the AI team
 

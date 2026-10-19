@@ -803,21 +803,33 @@ if sys.platform == "linux":
     #
     # Env-backed so an on-site A/B is a unit edit + restart, not a rebuild, and
     # settable live via POST /camera/brightness so it is not even that.
-    def _isp_env(name: str) -> int:
-        raw = int(os.environ.get(name, "4"))
+    def _isp_env(name: str, default: int = 4) -> int:
+        raw = int(os.environ.get(name, str(default)))
         if not 0 <= raw <= 8:
             logger.warning("%s=%s out of range 0-8, clamping", name, raw)
         return max(0, min(8, raw))
 
     CAMERA_BRIGHTNESS = _isp_env("STREAM_API_CAMERA_BRIGHTNESS")
     CAMERA_CONTRAST = _isp_env("STREAM_API_CAMERA_CONTRAST")
-    # SATURATION (0-8, default 4) is the third ISP output control, added
+    # SATURATION (0-8, SDK default 4) is the third ISP output control, added
     # 2026-10-15: on the steel tray the fish measure a saturation of ~10 on a
     # 0-255 scale against ~8 for the floor, so the red and orange species sit
     # almost grey and the client's phone photos run at ~17. Raising it in the
     # ISP is cleaner than boosting colour after the fact, and like the other
     # two it leaves auto-exposure and auto-WB untouched.
-    CAMERA_SATURATION = _isp_env("STREAM_API_CAMERA_SATURATION")
+    #
+    # Ships at 6, not the SDK's 4, since 2026-10-18 at the user's request: the
+    # 14 Oct capture had the AI pipeline calling three Shry "Yem"/"Nsr" that
+    # the phone photo of the same tray got right. Measured, the ZED's white
+    # balance was already neutral (steel at LAB a/b -0.9/-0.1) and the fish
+    # carried the same chroma as on the phone, so colour was not the main
+    # cause — the blown-out light band and fewer pixels per fish were — but
+    # the phone renders warmer and more saturated and that is the look the
+    # pipeline was tuned on. 6 is the top of the range the on-site A/B in
+    # ZED_MIGRATION.md 7g suggested; judge it on the silver fish, which must
+    # stay silver, and set STREAM_API_CAMERA_SATURATION=4 to return to the
+    # SDK default.
+    CAMERA_SATURATION = _isp_env("STREAM_API_CAMERA_SATURATION", default=6)
 
     # The values actually in force. POST /camera/brightness moves them; every
     # _open_camera() re-applies them. That is the whole point of keeping them
@@ -2483,11 +2495,12 @@ def camera_brightness(
     contrast:   ISP contrast, 0-8 (SDK default 4). Raising this is the in-camera
                 answer to the flatness the de-glare pass leaves behind — it adds
                 punch before the software correction rather than after it.
-    saturation: ISP colour saturation, 0-8 (SDK default 4). The fish on the
-                steel tray come out almost grey (saturation ~10/255 against
-                ~17 on the client's phone); 5 or 6 brings the red and orange
-                species back without touching exposure. Try one step at a time
-                and judge on the silver fish — they must stay silver.
+    saturation: ISP colour saturation, 0-8 (SDK default 4, service default
+                6). The fish on the steel tray come out almost grey at 4
+                (saturation ~10/255 against ~17 on the client's phone); 6
+                brings the red and orange species back without touching
+                exposure. Try one step at a time and judge on the silver
+                fish — they must stay silver.
 
     Neither is manual exposure; auto-exposure and auto-WB keep running. Omitted
     values are left alone.

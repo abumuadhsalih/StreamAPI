@@ -505,7 +505,7 @@ Set these as `Environment=` lines in `/etc/systemd/system/stream-api.service` (v
 | `STREAM_API_SCALE_STREAM_INTERVAL` | `0.1` | SSE pacing, 10 Hz |
 | `STREAM_API_ENHANCE` | `1` | Whether a param-less `/capture` gets CLAHE + shadow lift. `0` turns it off for every client |
 | `STREAM_API_CAMERA_CONTRAST` | `4` | ZED ISP contrast, 0-8. Raise for punch in-camera, before de-glare |
-| `STREAM_API_CAMERA_SATURATION` | `4` | ZED ISP colour saturation, 0-8. 5-6 brings the red/orange fish back; silver fish must stay silver. Live: `POST /camera/brightness?saturation=` |
+| `STREAM_API_CAMERA_SATURATION` | `6` | ZED ISP colour saturation, 0-8 (SDK default 4; the service ships 6 since 2026-10-18 so the red/orange fish are not grey). Silver fish must stay silver — set `4` to go back to the SDK look. Live: `POST /camera/brightness?saturation=` |
 | `STREAM_API_GRID_MM` | `10` | Real size of one tray-grid square, mm. Confirm with the hardware team |
 | `STREAM_API_STEREO_FILL` | `0` | Experiment: fill the left image's clipped strips from the right eye on every `/capture`. Live: `POST /camera/stereo?value=` |
 | `STREAM_API_STEREO_SHIFT` | *(empty = estimate)* | Tray-plane disparity between the eyes in full-frame px; empty estimates it per capture |
