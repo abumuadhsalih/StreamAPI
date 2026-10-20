@@ -853,6 +853,21 @@ _deglare = {
     "strength": max(0, min(100, DEGLARE_STRENGTH)),
 }
 
+# Keep the colour when de-glare and enhance move the lightness (2026-10-20).
+# Both work on LAB L only and leave a*/b* where they were, so a fish they
+# brighten keeps the same absolute chroma at a higher L — it reads greyer.
+# Measured on the 20 Oct unprocessed frame (tray at L 74, so the pipeline
+# lifts hard): the red/pink fish went L 82-113 -> 125-147 and lost a quarter
+# of their saturation (HSV S 35-42 -> 27-34); with a*/b* scaled by the L
+# ratio they keep about half of that back (31-38), and the silver fish and
+# the steel stay neutral. OFF by default: it changes what the AI pipeline
+# receives, so it is A/B'd on site first (?chroma=true on one capture, POST
+# /camera/chroma to flip the default). Reported in X-Keep-Chroma.
+_chroma = {
+    "keep": os.environ.get("STREAM_API_KEEP_CHROMA", "0").strip().lower()
+    not in ("0", "false", "no", "off", ""),
+}
+
 # Auto-exposure metering region, in full-frame coordinates like CROP_BOX.
 #
 # OFF by default: the camera meters the whole frame, exactly as before this
@@ -895,6 +910,8 @@ camera_status: dict = {
     "deglare": _deglare,
     # Whether a param-less /capture gets enhance_for_text().
     "enhance": _enhance,
+    # Whether de-glare/enhance scale a*/b* with the lightness they add.
+    "chroma": _chroma,
     # Auto-exposure metering box in force, or null for full-frame metering.
     "aec_roi": _aec_roi,
     # Sensor mode the camera is running in (POST /camera/resolution).
@@ -2354,15 +2371,31 @@ def system_stats():
 # be the default — an opt-in flag would simply never be passed. ?deglare=false
 # is there for an A/B, and POST /camera/deglare tunes it live from the Jetson
 # without a restart, same as the brightness endpoint.
-def reduce_glare(image: np.ndarray, sigma: float, strength: float) -> np.ndarray:
+def _keep_chroma(lab: np.ndarray, l_before: np.ndarray) -> None:
+    """Scale a*/b* in place by how much L moved, so saturation survives it.
+
+    Clamped to 0.5-2x so a near-black pixel lifted a long way cannot be pushed
+    into false colour.
+    """
+    k = (lab[:, :, 0].astype(np.float32) + 1.0) / (l_before.astype(np.float32) + 1.0)
+    k = np.clip(k, 0.5, 2.0)[:, :, None]
+    ab = 128.0 + (lab[:, :, 1:].astype(np.float32) - 128.0) * k
+    lab[:, :, 1:] = np.clip(ab, 0, 255).astype(np.uint8)
+
+
+def reduce_glare(
+    image: np.ndarray, sigma: float, strength: float, keep_chroma: bool = False
+) -> np.ndarray:
     """Flatten the specular bands by dividing out a blurred illumination estimate.
 
     `strength` is 0.0-1.0 and blends against the original, so a half-measure is
     possible when a full correction looks too flat. Works on L only; the colour
-    channels are untouched, which is what keeps the fish looking like fish.
+    channels are untouched, which is what keeps the fish looking like fish —
+    unless `keep_chroma`, which scales them with L (see _chroma).
     """
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    L = lab[:, :, 0].astype(np.float32)
+    l_before = lab[:, :, 0].copy()
+    L = l_before.astype(np.float32)
     illum = cv2.GaussianBlur(L, (0, 0), sigma)
     # Renormalise to the scene's own median so the frame keeps its overall
     # brightness instead of drifting with the size of the glare.
@@ -2370,6 +2403,8 @@ def reduce_glare(image: np.ndarray, sigma: float, strength: float) -> np.ndarray
     if strength < 1.0:
         flat = L + strength * (flat - L)
     lab[:, :, 0] = np.clip(flat, 0, 255).astype(np.uint8)
+    if keep_chroma:
+        _keep_chroma(lab, l_before)
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
@@ -2437,14 +2472,18 @@ def _choose_lift_gamma(l: np.ndarray) -> tuple[float, int]:
     return round(gamma, 2), median
 
 
-def enhance_for_text(image: np.ndarray, stats: dict | None = None) -> np.ndarray:
+def enhance_for_text(
+    image: np.ndarray, stats: dict | None = None, keep_chroma: bool = False
+) -> np.ndarray:
     """LAB CLAHE + adaptive shadow gamma lift + unsharp — default /capture post-processing.
 
     If `stats` is given it is filled with the chosen `gamma` and the measured
-    `median` so /capture can report them in response headers.
+    `median` so /capture can report them in response headers. `keep_chroma`
+    scales a*/b* with the lightness CLAHE and the lift add (see _chroma).
     """
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
+    l_before = l
     # Local contrast — recovers detail in near-saturated bright bands (where a
     # low-exposure capture leaves headroom to work with). Kept gentle: see
     # ENHANCE_CLAHE_CLIP.
@@ -2456,7 +2495,10 @@ def enhance_for_text(image: np.ndarray, stats: dict | None = None) -> np.ndarray
         stats["median"] = median
     if gamma < ENHANCE_GAMMA_MAX:
         l = cv2.LUT(l, _gamma_lut(gamma))
-    out = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+    lab = cv2.merge((l, a, b))
+    if keep_chroma:
+        _keep_chroma(lab, l_before)
+    out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
     blurred = cv2.GaussianBlur(out, (0, 0), sigmaX=1.5)
     return cv2.addWeighted(out, ENHANCE_UNSHARP, blurred, -(ENHANCE_UNSHARP - 1.0), 0)
 
@@ -2483,8 +2525,14 @@ def capture(
     crop: bool = True,
     deglare: bool = True,
     fish: Optional[bool] = None,
+    chroma: Optional[bool] = None,
 ):
     """
+    chroma:   scale the colour with the lightness de-glare and enhance add,
+              so a fish they brighten keeps its saturation instead of going
+              grey. Unset follows the server default (POST /camera/chroma,
+              STREAM_API_KEEP_CHROMA), which ships OFF until it is A/B'd on
+              site. Reported in X-Keep-Chroma when either pass ran.
     enhance:  CLAHE + adaptive gamma lift + unsharp. Unset follows the server
               default (POST /camera/enhance, STREAM_API_ENHANCE), which ships
               ON because the de-glare pass evens out the illumination and so
@@ -2584,6 +2632,10 @@ def capture(
     # pixel in every mode, so the crop box and the native width are already
     # in reference units; only presets and crop scaling move it off 1.0.
     ref_per_out = ((box[2] - box[0]) if box else native[0]) / image.shape[1]
+    keep_chroma = _chroma["keep"] if chroma is None else chroma
+    do_enhance = _enhance["default"] if enhance is None else enhance
+    if (deglare and _deglare["strength"] > 0) or do_enhance:
+        headers["X-Keep-Chroma"] = "1" if keep_chroma else "0"
     if deglare and _deglare["strength"] > 0:
         # After the geometry, so sigma scales with the preset and the correction
         # looks the same whatever size was asked for. Before enhance, so the
@@ -2592,11 +2644,13 @@ def capture(
         # sigma is in reference pixels; one reference pixel is one live pixel
         # in every mode, so only the preset scaling changes it.
         sigma = _deglare["sigma"] / ref_per_out
-        image = reduce_glare(image, max(2.0, sigma), _deglare["strength"] / 100.0)
+        image = reduce_glare(
+            image, max(2.0, sigma), _deglare["strength"] / 100.0, keep_chroma
+        )
         headers["X-Deglare"] = f"{_deglare['strength']},{_deglare['sigma']}"
-    if _enhance["default"] if enhance is None else enhance:
+    if do_enhance:
         stats: dict = {}
-        image = enhance_for_text(image, stats)
+        image = enhance_for_text(image, stats, keep_chroma)
         # Surface what the adaptive lift did so an on-site A/B needs no guesswork.
         headers["X-Enhance-Gamma"] = str(stats["gamma"])
         headers["X-Enhance-Median"] = str(stats["median"])
@@ -2673,6 +2727,19 @@ def camera_enhance(value: bool = Query(...)):
     _enhance["default"] = value
     logger.info("capture enhance default set to %s", value)
     return {"enhance": dict(_enhance)}
+
+
+@app.post("/camera/chroma", summary="Flip the /capture keep-chroma default live")
+def camera_chroma(value: bool = Query(...)):
+    """
+    Sets whether a param-less /capture scales the colour with the lightness
+    de-glare and enhance add. ?chroma= on a single request still overrides it.
+
+    Resets to STREAM_API_KEEP_CHROMA on service restart.
+    """
+    _chroma["keep"] = value
+    logger.info("capture keep-chroma default set to %s", value)
+    return {"chroma": dict(_chroma)}
 
 
 @app.post("/camera/deglare", summary="Tune the de-glare pass live (on-site A/B)")
