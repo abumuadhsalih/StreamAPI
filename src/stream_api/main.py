@@ -343,10 +343,13 @@ _inset_mode, _inset_px = _parse_inset(os.environ.get("STREAM_API_CROP_INSET", _C
 # de-glare and enhance have run on the tray crop: de-glare divides by a
 # sigma-60 blur, and on a one-fish crop that blur would be mostly fish and
 # flatten the fish against itself.
-# STREAM_API_CROP_FISH: on (this branch's default) or off.
+# OFF by default since 2026-11-05: the client asked to go back to the full
+# tray with its edges (the rim crop), not a zoom onto the fish. The stage and
+# its hold stay in, switchable per request (?fish=true) or for everyone.
+# STREAM_API_CROP_FISH: off (the default) or on.
 # STREAM_API_CROP_FISH_MARGIN: reference px kept around the fish, default 40
 # (about 1.4 grid squares). Both movable live with POST /camera/crop.
-_FISH_CROP_DEFAULT = "on"
+_FISH_CROP_DEFAULT = "off"
 _FISH_MARGIN_DEFAULT = 40
 
 
@@ -2618,11 +2621,11 @@ def capture(
               what was applied.
     fish:     cut the cropped tray down to the box around the fish on it,
               plus a margin. Unset follows the server default (POST
-              /camera/crop?fish=, STREAM_API_CROP_FISH), which ships ON on
-              this branch: a full tray comes back at about the tray crop,
-              one fish comes back as that fish. A bare tray, or one where
-              nothing is found, gets the plain tray crop. Pass ?fish=false
-              for the tray crop on a single request. X-Crop-Fish carries
+              /camera/crop?fish=, STREAM_API_CROP_FISH), which ships OFF
+              (2026-11-05): the default image is the whole tray up to its
+              edges. Pass ?fish=true to cut to the fish on a single
+              request; a bare tray, or one where nothing is found, still
+              gets the plain tray crop. X-Crop-Fish carries
               the fish count and the box, or "none"; X-Crop is always the
               box actually served. Needs crop on.
     preset:   unset, the frame comes back at the sensor's native size for the

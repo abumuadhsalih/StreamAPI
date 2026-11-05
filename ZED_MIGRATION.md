@@ -254,8 +254,9 @@ curl -X POST "http://<jetson-ip>:8000/camera/crop?inset=off"            # rim bo
 height in a `?crop=false` capture, alongside `STREAM_API_TRAY_SIZE`. Keep it permanently
 with `Environment=STREAM_API_CROP_INSET=auto` (or a fixed `l,t,r,b`).
 
-**Crop to the fish, not the tray** (`STREAM_API_CROP_FISH`, **on by default on
-`feature/fish-crop`**). The tray crop is the same size whether it holds twelve fish or
+**Crop to the fish, not the tray** (`STREAM_API_CROP_FISH`, **off by default since
+2026-11-05**: the client went back to the full tray up to its edges; `?fish=true` or
+`STREAM_API_CROP_FISH=on` brings it back). The tray crop is the same size whether it holds twelve fish or
 one, so a single fish in the middle comes back as a small island in steel. With this on,
 the service finds everything lying on the tray floor and serves the box around it plus a
 margin (`STREAM_API_CROP_FISH_MARGIN`, 40 px, about 1.4 grid squares). The box is tight on
