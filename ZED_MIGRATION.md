@@ -269,6 +269,9 @@ capture, so the AI pipeline must accept any size.
 curl -s -D - -o fish.jpg "http://<jetson-ip>:8000/capture" | grep -i x-crop
 #   X-Crop-Fish: 4;596,382,1852,974   -> 4 blobs found; the box served, in live-frame px
 #   X-Crop-Fish: none                 -> nothing found; the tray crop was served
+#   X-Crop-Fish-Hold: fresh|same|grown|held|shrunk -> how the box was held against
+#                                       the previous capture (<3 s ago); 'held' = a smaller
+#                                       box is waiting for a second capture to confirm it
 curl -s -o tray.jpg "http://<jetson-ip>:8000/capture?fish=false"      # tray crop, one request
 curl -X POST "http://<jetson-ip>:8000/camera/crop?fish_margin=100"     # wider cushion
 curl -X POST "http://<jetson-ip>:8000/camera/crop?fish=false"          # tray crop for everyone

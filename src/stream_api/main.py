@@ -532,6 +532,25 @@ _FISH_MIN_CORE = 600    # reference px^2 of strong outline the blob must carry
 _FISH_BODY = 13         # half-scale opening that leaves only solid bodies ...
 _FISH_REACH = 30        # ... and how far (half-scale px) a fin or tail may run from one
 
+# Hold on the fish box, for clients that poll /capture as a preview
+# (2026-11-05: the tablet app refreshed /capture about once a second, and
+# on an empty tray salt and glare edges made the box change on every call,
+# so the preview kept zooming in and out). detect_fish() runs fresh on
+# every frame and, unlike the rim and floor, had no deadband. The rule
+# never cuts a fish to stay steady: a box that GROWS past the held one by
+# more than _FISH_HOLD_TOL is taken at once, merged with the held box. A box
+# that SHRINKS is taken only after _FISH_HOLD_CONFIRM consecutive captures
+# agree on it within _FISH_HOLD_TOL. Random boxes found on a bare tray never
+# agree, so the preview holds the larger box. The hold applies only between
+# captures less than _FISH_HOLD_S apart. A client that calls once per tray
+# (the AI pipeline, Capture Now) always gets a fresh detection, exactly as
+# before.
+_FISH_HOLD_S = 3.0
+_FISH_HOLD_TOL = 24       # reference px (~8 mm) a side may move without counting
+_FISH_HOLD_CONFIRM = 2
+_fish_hold = {"box": None, "served": None, "margin": None, "t": 0.0, "pending": None, "n": 0}
+_fish_hold_lock = threading.Lock()
+
 
 def _fill_holes(mask):
     """Fill every region of a 0/1 mask not reachable from its border."""
@@ -649,15 +668,58 @@ def _fish_crop(frame, served):
         if floor is None:
             l, t, r, b = _parse_inset(_CROP_INSET_FALLBACK)[1]
             floor, src = (rim[0] + l, rim[1] + t, rim[2] - r, rim[3] - b), "fallback"
-    box, n = detect_fish(frame, floor, tuple(served), _crop["fish"]["margin"])
+    served = tuple(served)
+    margin = _crop["fish"]["margin"]
+    box, n = detect_fish(frame, floor, served, margin)
+    out, hold = _hold_fish_box(box if box is not None else served, served, margin)
     _crop["fish"]["detected"] = {
         "ok": box is not None,
         "fish": n,
         "box": list(box) if box else None,
+        "served": list(out),
+        "hold": hold,
         "floor": src,
         "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
-    return box if box is not None else tuple(served)
+    return out
+
+
+def _hold_fish_box(want, served, margin):
+    """Apply the hold (see _FISH_HOLD_S) to this capture's fish box `want`.
+    Returns (box to serve, what happened): fresh (no recent capture, the
+    tray moved or the margin changed), same, grown, held (a shrink waiting
+    for confirmation) or shrunk."""
+    tol = _FISH_HOLD_TOL
+    now = time.monotonic()
+    with _fish_hold_lock:
+        h = _fish_hold
+        cur = h["box"]
+        if (cur is None or now - h["t"] > _FISH_HOLD_S
+                or h["served"] != served or h["margin"] != margin):
+            h.update(box=want, pending=None, n=0)
+            what = "fresh"
+        elif (want[0] < cur[0] - tol or want[1] < cur[1] - tol
+              or want[2] > cur[2] + tol or want[3] > cur[3] + tol):
+            h.update(box=(min(want[0], cur[0]), min(want[1], cur[1]),
+                          max(want[2], cur[2]), max(want[3], cur[3])),
+                     pending=None, n=0)
+            what = "grown"
+        elif all(abs(a - b) <= tol for a, b in zip(want, cur)):
+            h.update(pending=None, n=0)
+            what = "same"
+        else:
+            p = h["pending"]
+            if p is not None and all(abs(a - b) <= tol for a, b in zip(want, p)):
+                h["n"] += 1
+            else:
+                h.update(pending=want, n=1)
+            if h["n"] >= _FISH_HOLD_CONFIRM:
+                h.update(box=want, pending=None, n=0)
+                what = "shrunk"
+            else:
+                what = "held"
+        h.update(served=served, margin=margin, t=now)
+        return tuple(h["box"]), what
 
 
 def _crop_box():
@@ -2664,9 +2726,13 @@ def capture(
             # Last, on the de-glared and enhanced tray crop. A cut only, never
             # a resample, so X-Mm-Per-Px above holds for the fish image too.
             det = _crop["fish"]["detected"] or {}
+            # "none" when the whole tray is served (the hold can keep a fish
+            # box through a miss, and can serve the tray through a find).
             headers["X-Crop-Fish"] = (
-                f"{det.get('fish', 0)};" + ",".join(str(v) for v in fish_box) if det.get("ok") else "none"
+                f"{det.get('fish', 0)};" + ",".join(str(v) for v in fish_box)
+                if det.get("served") != list(_crop_box() or ()) else "none"
             )
+            headers["X-Crop-Fish-Hold"] = det.get("hold", "fresh")
             h, w = image.shape[:2]
             cx1 = min(w - 1, max(0, round((fish_box[0] - box[0]) * crop_scale)))
             cy1 = min(h - 1, max(0, round((fish_box[1] - box[1]) * crop_scale)))
