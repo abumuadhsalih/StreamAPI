@@ -4,9 +4,7 @@ import json
 import time
 import glob
 import hmac
-import math
 import asyncio
-import functools
 import logging
 import threading
 import subprocess
@@ -23,7 +21,7 @@ from .scale import parse_scale_line, resolve_scale_port, split_frames
 
 logger = logging.getLogger("stream_api")
 
-app = FastAPI(title="ZED Stream API")
+app = FastAPI(title="Stream API")
 
 # Open CORS for POC — LAN browser/mobile clients on arbitrary origins.
 # Lock down `allow_origins` to specific domains before any production use.
@@ -83,882 +81,243 @@ def _admin_error_handler(request, exc: _AdminError):
 # Resolution presets
 # ---------------------------------------------------------------------------
 
-# Capture runs at the largest preset; smaller presets are downscaled per-request
-# so multiple clients can request different resolutions concurrently.
+# Output sizes a client can ask for. The camera runs at one native size and
+# every request is scaled from that frame, so clients can ask for different
+# presets from the same stream. A preset is a bounding box: the frame is
+# scaled down to fit inside it with its aspect ratio kept, never stretched and
+# never enlarged. The AR2020 is a 4:3 sensor, so ?preset=fhd of a full-sensor
+# frame is 1440x1080, not 1920x1080. (On the 16:9 ZED these were exact sizes;
+# the 2k preset went with it.)
 RESOLUTIONS: dict[str, tuple[int, int]] = {
     "sd": (640, 480),
     "hd": (1280, 720),
     "fhd": (1920, 1080),
-    "2k": (2208, 1242),
 }
-Preset = Literal["sd", "hd", "fhd", "2k"]
-
-# The sensor mode the ZED is opened in. HD1080 @ 30 is the default. HD2K is
-# NOT a sharper picture: both modes share one pixel pitch and one focal length
-# (the calibration file lists the same fx for FHD and 2K), so a fish covers
-# the same number of pixels in either, and 2K simply sees 144 px more on each
-# side and 81 px more top and bottom — a 15% wider view the tray does not
-# need. The 2026-10-16 2K capture proved it: the rim measured 1582 px across
-# at 2K, exactly its 1581 px at 1080p, and the crop box that this file used
-# to scale by 1.15 came out as the tray plus a margin of floor. Its costs
-# are real: half the frame rate (the SDK caps HD2K at 15 fps, so /stream runs
-# at 15 and a capture waits up to ~67 ms for a frame instead of ~33) and a
-# ~1.3x larger JPEG. It was the default for part of 2026-10-07 and was put
-# back. POST /camera/resolution switches live — it is a close+reopen, ~2 s,
-# and /stream clients reconnect. A bare /capture always returns the sensor's
-# native size, so an uncropped 2K capture is 2208x1242 of the same scene.
-CAMERA_MODES: dict[str, tuple[int, int, int]] = {
-    "fhd": (1920, 1080, 30),
-    "2k": (2208, 1242, 15),
-}
-CameraMode = Literal["fhd", "2k"]
+Preset = Literal["sd", "hd", "fhd"]
 
 
-# 2K is the shipped default since 2026-10-18 at the user's request, after the
-# geometry fix above made a cropped capture identical in both modes; the
-# uncropped frame is the wider one. STREAM_API_CAMERA_MODE=fhd restores 30 fps.
-_CAMERA_MODE_DEFAULT = "2k"
-
-
-def _camera_mode_env() -> str:
-    raw = os.environ.get("STREAM_API_CAMERA_MODE", _CAMERA_MODE_DEFAULT).strip().lower()
-    if raw not in CAMERA_MODES:
-        logger.warning("STREAM_API_CAMERA_MODE=%r unknown, using %s", raw, _CAMERA_MODE_DEFAULT)
-        return _CAMERA_MODE_DEFAULT
-    return raw
-
-
-def _mode_dict(name: str) -> dict:
-    w, h, fps = CAMERA_MODES[name]
-    return {"name": name, "width": w, "height": h, "fps": fps}
-
-
-# The mode in force. Reported in /health, kept across self-heal reopens like
-# the ISP values; a service restart returns to STREAM_API_CAMERA_MODE.
-_camera_mode = _mode_dict(_camera_mode_env())
-
-# Reference frame for every box in this file. CROP_BOX and the AEC metering
-# box are measured in 1920x1080 coordinates whatever mode the camera runs in,
-# and moved to the live sensor frame at the point of use (_live_box), so a
-# box measured at fhd is still right after switching to 2K. The 1080p image
-# is the centre of the 2K one at the same pixel pitch (see CAMERA_MODES), so
-# the mapping is an offset of half the size difference, not a scale — a box
-# scaled by 1.15 lands 15% too big with a floor margin, which is what the
-# 2026-10-16 2K capture showed before this was corrected. A reference pixel
-# is one live pixel in every mode offered here (HD720 would be binned 2:1
-# and is deliberately not offered).
-CAPTURE_WIDTH, CAPTURE_HEIGHT = RESOLUTIONS["fhd"]
-
-
-def _ref_offset():
-    """Where the 1920x1080 reference frame sits inside the live frame."""
-    return (
-        (_camera_mode["width"] - CAPTURE_WIDTH) // 2,
-        (_camera_mode["height"] - CAPTURE_HEIGHT) // 2,
+def _fit(image: np.ndarray, preset: Optional[str]) -> np.ndarray:
+    """Scale `image` down to fit inside the preset's box, aspect kept."""
+    if preset is None:
+        return image
+    bw, bh = RESOLUTIONS[preset]
+    h, w = image.shape[:2]
+    s = min(bw / w, bh / h)
+    if s >= 1.0:
+        return image
+    return cv2.resize(
+        image, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA
     )
 
 
-def _live_box(box):
-    """Move a reference-frame (x1,y1,x2,y2) box into the live sensor frame."""
-    if not box:
-        return None
-    ox, oy = _ref_offset()
-    x1, y1, x2, y2 = box
-    return (
-        max(0, x1 + ox),
-        max(0, y1 + oy),
-        min(_camera_mode["width"], x2 + ox),
-        min(_camera_mode["height"], y2 + oy),
-    )
-
-
-def _ref_frame(frame):
-    """The 1920x1080 reference view of a native frame: the centre of a larger
-    frame (2K), the frame itself at fhd. A frame of any other size is resized
-    as a last resort so the detectors still run, which is the only case where
-    a reference pixel is not a live pixel."""
-    h, w = frame.shape[:2]
-    if (w, h) == (CAPTURE_WIDTH, CAPTURE_HEIGHT):
-        return frame
-    if w >= CAPTURE_WIDTH and h >= CAPTURE_HEIGHT:
-        ox, oy = (w - CAPTURE_WIDTH) // 2, (h - CAPTURE_HEIGHT) // 2
-        return frame[oy:oy + CAPTURE_HEIGHT, ox:ox + CAPTURE_WIDTH]
-    return cv2.resize(frame, (CAPTURE_WIDTH, CAPTURE_HEIGHT), interpolation=cv2.INTER_AREA)
-
-# THIS BRANCH (feature/capture-enhanced, 2026-10-15): de-glare and enhance
-# are back ON by default, on top of the auto crop. The hardware changes have
-# settled on the steel tray with the grid, and the raw default capture from
-# 2026-10-14 showed the two overhead strips mirrored on the floor at 19% of
-# their pixels clipped while the fish themselves were fine (L median 118,
-# 0.3% clipped). Measured on that frame with the service's own functions:
-# de-glare 100/sigma 60 takes the strips from 19.3% clipped to 0% and the
-# floor's 5-95% range from 52-253 to 70-194, and enhance then puts the
-# contrast back (median 116 -> 140, std 38 -> 52, clipping 0.7%). AEC ROI
-# stays off: the fish were not under-exposed, so there is nothing for it to
-# fix. feature/camera-auto-only keeps the raw defaults for the next time the
-# hardware moves.
+# ---------------------------------------------------------------------------
+# Camera configuration — Vadzo Falcon-2020CRS (onsemi AR2020, 20 MP, USB 3)
+# ---------------------------------------------------------------------------
 #
-# /capture can crop to the inspection tray. The ZED's 110-deg FOV puts
-# a third to a half of every frame outside the tray — floor, fish baskets,
-# whoever is standing there — and the client's AI pipeline fetches bare
-# /capture, so that clutter was going straight to the model. Cropping also
-# roughly doubles the pixels-per-fish at the same output size.
+# Nothing in this service processes the image. Since the move from the ZED 2i
+# (2026-11-10) /capture serves what the camera produces: the crop, de-glare,
+# enhance, keep-chroma, fish-crop, stereo-fill and mm-per-pixel stages of the
+# ZED branches are gone, and the only levers on the picture are the camera's
+# own ISP controls (POST /camera/controls). The ZED code lives on
+# feature/fish-crop.
 #
-# Box measured on the 2026-09-23 on-site capture by mapping the tray's steel
-# edges across the frame: the whole tray including its rim, with the worst-case
-# edge taken on each side, which clears the basket at the top and a foot at the
-# top right. It is in FULL-FRAME (1920x1080) coordinates.
-#
-# This is mount-specific — nudge the camera or change its height and the box is
-# wrong, silently. Hence STREAM_API_CROP (x1,y1,x2,y2, or empty to disable),
-# the X-Crop response header on every cropped capture, and camera.crop in
-# /health: three places to notice a stale box without guessing. /stream is
-# deliberately NOT cropped, so it stays the full-scene view you re-aim against.
-# Crop is back ON as of 2026-10-07: the hardware team settled on a steel tray
-# with a measuring grid on its floor. The box is the tray's OUTER rim edge
-# exactly, no floor margin — the client wants the tray edges visible and
-# nothing beyond them (2026-10-12). Measured on a ?crop=false full frame
-# and verified by overlay; two earlier boxes worked back from cropped
-# captures came out ~25 px off, so always measure from ?crop=false. A
-# floor-only box (350,185,1760,925) was rejected for hiding the rim, and a
-# 25 px margin (222,90,1857,1015) for showing floor. (The 2026-09-23 box on
-# the old mount was 248,118,1830,986.) De-glare and enhance stay off on
-# this branch; the crop is pure geometry.
-# AUTO as of 2026-10-12: the hardware team nudges the camera or the table
-# between sessions, and every nudge meant a new box typed in by hand (five of
-# them in a week, two of them wrong because they were worked back from an
-# already-cropped capture). STREAM_API_CROP=auto makes /capture find the tray
-# itself — see detect_tray() — with the box below as the seed and the
-# fallback while nothing has been detected yet. An explicit x1,y1,x2,y2 pins
-# the box; empty disables the crop.
-_CROP_DEFAULT = "auto"
-_CROP_FALLBACK = "249,117,1830,988"  # outer rim measured on a 2026-10-12 full frame
-
-# What detect_tray() looks for: the tray's outer rim size in reference-frame
-# pixels at the current mount height, with a +-3.5% tolerance. That tolerance
-# is deliberately tight. The rim's inner lip and the floor/wall edge both sit
-# 4-8% inside the outer edge, so a looser window lets a mixed inner/outer pair
-# through; a tighter one would reject a real tray after a small height change.
-# Re-seed STREAM_API_TRAY_SIZE if the camera is raised or lowered by more.
-_TRAY_SIZE_DEFAULT = "1581,871"
-_TRAY_SIZE_TOL = 0.035
+# Every setting below is optional. Unset means "whatever the camera and the
+# SDK choose", which is the right default until the camera has been probed on
+# the Jetson.
 
 
-def _parse_crop(spec: str, name: str = "STREAM_API_CROP"):
-    """Parse 'x1,y1,x2,y2' into a clamped box, or None if empty/invalid.
+def _env(name: str) -> str:
+    return os.environ.get(name, "").strip()
 
-    `name` only labels the warning — the same parser serves the crop box, the
-    AEC metering box and the ?box= query param.
-    """
-    spec = spec.strip()
+
+# Which camera to open, by the name the SDK reports (get_devices()). Empty =
+# the first one found. The name is stored in the camera itself
+# (set_device_name), so a commissioned name survives a change of USB port.
+CAMERA_NAME = _env("STREAM_API_CAMERA_NAME")
+
+# Pixel formats tried in order at every open; the first one the camera
+# streams and this file can decode wins, and is reported as camera.format in
+# /health and X-Pixel-Format on /capture. MJPG first: a 20 MP frame
+# uncompressed is ~39 MB in YUYV, which holds USB 3 to a few frames a second,
+# whereas MJPEG is the camera's own encoder, and a bare /capture then returns
+# the camera's JPEG byte for byte. STREAM_API_CAMERA_FORMAT pins a single one
+# (e.g. UYVY for uncompressed frames).
+_CAMERA_FORMATS_DEFAULT = ("MJPG", "UYVY", "YUYV", "BA81")
+CAMERA_FORMATS = (
+    (_env("STREAM_API_CAMERA_FORMAT").upper(),)
+    if _env("STREAM_API_CAMERA_FORMAT")
+    else _CAMERA_FORMATS_DEFAULT
+)
+
+
+def _parse_size(spec: str):
+    """'WxH' -> (w, h), or None for empty/garbage (logged)."""
     if not spec:
         return None
     try:
-        x1, y1, x2, y2 = (int(v) for v in spec.split(","))
-    except ValueError:
-        logger.warning("%s=%r is not 'x1,y1,x2,y2' — ignored", name, spec)
-        return None
-    x1, x2 = max(0, min(x1, x2)), min(CAPTURE_WIDTH, max(x1, x2))
-    y1, y2 = max(0, min(y1, y2)), min(CAPTURE_HEIGHT, max(y1, y2))
-    if x2 - x1 < 16 or y2 - y1 < 16:
-        logger.warning("%s=%r is degenerate — ignored", name, spec)
-        return None
-    return (x1, y1, x2, y2)
-
-
-def _parse_tray_size(spec: str, name: str = "STREAM_API_TRAY_SIZE", default: str = _TRAY_SIZE_DEFAULT):
-    try:
-        w, h = (int(v) for v in spec.split(","))
-        if w < 100 or h < 100:
+        w, h = (int(v) for v in spec.lower().split("x"))
+        if not (100 <= w <= 5120 and 100 <= h <= 3840):
             raise ValueError
-        return (w, h)
     except ValueError:
-        logger.warning("%s=%r is not 'w,h' — using %s", name, spec, default)
-        return _parse_tray_size(default, name, default)
+        logger.warning("STREAM_API_CAMERA_SIZE=%r is not WxH within 5120x3840, ignored", spec)
+        return None
+    return (w, h)
 
 
-TRAY_SIZE = _parse_tray_size(os.environ.get("STREAM_API_TRAY_SIZE", _TRAY_SIZE_DEFAULT))
+# Output size from the camera, "WxH". Empty = the camera's default mode.
+# Beware the SDK's "virtual resolution": a size smaller than an advertised
+# mode is a WINDOW cut out of the larger mode, not a downscale, so 1920x1080
+# is a narrower view of the tray, not the whole tray at fewer pixels. For a
+# smaller image of the whole scene use ?preset= instead.
+CAMERA_SIZE = _parse_size(_env("STREAM_API_CAMERA_SIZE"))
 
-# Inside the rim come the tray's sloped walls: on the 2026-10-16 frame ~105 px
-# of each long side, ~90 px at the top and ~40 at the bottom (the camera sits
-# nearer the bottom edge, so that wall is foreshortened). Bright or shadowed
-# steel that carries nothing, the one part of the crop the de-glare pass
-# cannot even out, and 12% of the pixels the AI pipeline is handed. The
-# inset cuts the served box in from the rim to the floor edge.
-# STREAM_API_CROP_INSET: "off" (the default) serves the rim box, tray edges
-# and all — the first floor-only capture (2026-10-16) was rejected on sight,
-# "tray edges are missing", so the walls stay in unless asked for; "auto"
-# finds the floor edge inside the rim on every cropped capture
-# (detect_floor()), with the fallback below until the first detection;
-# "l,t,r,b" or a single number pins the inset in reference pixels. Movable
-# live with POST /camera/crop?inset=.
-_CROP_INSET_DEFAULT = "off"
-_CROP_INSET_FALLBACK = "107,92,92,40"  # 2026-10-16 frame; rim 262,102,1844,968, floor 369,194,1752,928
 
-# What detect_floor() looks for: the floor rectangle's size in reference
-# pixels. A fixed physical rectangle, so like TRAY_SIZE it is a constant at
-# a given mount height — measured 1372-1379 x 736-743 across the Oct 12, 14
-# and 16 frames. The tolerance is tighter than the rim's because the
-# candidates are closer together: the rim's inner lip pair is ~1500 wide,
-# the floor ~1373, the grid's first lines ~30 px inside that.
-_FLOOR_SIZE_DEFAULT = "1373,741"
-_FLOOR_SIZE_TOL = 0.03
-FLOOR_SIZE = _parse_tray_size(
-    os.environ.get("STREAM_API_FLOOR_SIZE", _FLOOR_SIZE_DEFAULT), "STREAM_API_FLOOR_SIZE", _FLOOR_SIZE_DEFAULT
+def _parse_fps(spec: str) -> Optional[int]:
+    if not spec:
+        return None
+    try:
+        v = int(spec)
+        if not 1 <= v <= 120:
+            raise ValueError
+    except ValueError:
+        logger.warning("STREAM_API_CAMERA_FPS=%r is not 1-120, ignored", spec)
+        return None
+    return v
+
+
+# Frame rate requested from the camera. Empty = the camera's default for the
+# mode. Long exposures cap it regardless.
+CAMERA_FPS = _parse_fps(_env("STREAM_API_CAMERA_FPS"))
+
+# Only used if the camera streams raw Bayer (BA81). Vadzo's example converts
+# BA81 with COLOR_BayerRG2BGR; if red and blue come out swapped, try BG, GB or
+# GR. This is decoding, not processing: a Bayer frame is not an image until
+# it has been demosaiced.
+_BAYER_CODES = {
+    "RG": cv2.COLOR_BayerRG2BGR,
+    "BG": cv2.COLOR_BayerBG2BGR,
+    "GB": cv2.COLOR_BayerGB2BGR,
+    "GR": cv2.COLOR_BayerGR2BGR,
+}
+CAMERA_BAYER = _env("STREAM_API_CAMERA_BAYER").upper() or "RG"
+if CAMERA_BAYER not in _BAYER_CODES:
+    logger.warning("STREAM_API_CAMERA_BAYER=%r is not RG/BG/GB/GR, using RG", CAMERA_BAYER)
+    CAMERA_BAYER = "RG"
+
+
+def decode_frame(raw: np.ndarray, fourcc: str) -> np.ndarray:
+    """Turn a frame as the SDK delivers it into a plain BGR image.
+
+    Shapes per the VISPA guide (section 7.2): MJPEG is one-dimensional (its
+    size varies per frame), YUYV/UYVY are (h, w*2), RGB24/BGR24 (h, w*3),
+    GREY and Bayer (h, w). Raises ValueError on anything it cannot decode.
+    """
+    if fourcc == "BGR":  # the macOS stub, already an image
+        return raw
+    if fourcc == "MJPG":
+        image = cv2.imdecode(raw.reshape(-1), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError("MJPEG frame did not decode")
+        return image
+    if raw.ndim != 2:
+        raise ValueError(f"unexpected {fourcc} frame shape {raw.shape}")
+    h, row = raw.shape
+    if fourcc in ("YUYV", "UYVY"):
+        code = cv2.COLOR_YUV2BGR_YUYV if fourcc == "YUYV" else cv2.COLOR_YUV2BGR_UYVY
+        return cv2.cvtColor(raw.reshape(h, row // 2, 2), code)
+    if fourcc in ("RGB3", "BGR3"):
+        image = raw.reshape(h, row // 3, 3)
+        return cv2.cvtColor(image, cv2.COLOR_RGB2BGR) if fourcc == "RGB3" else image
+    if fourcc == "GREY":
+        return cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+    if fourcc == "BA81":
+        return cv2.cvtColor(raw, _BAYER_CODES[CAMERA_BAYER])
+    raise ValueError(f"pixel format {fourcc} is not supported")
+
+
+# The camera's own ISP controls, each a VISPA set_<name>_op(device, int).
+# Applied after every open in THIS order, so an auto switch lands before the
+# manual value it gates. Ranges are the camera's: the SDK rejects an
+# out-of-range value with a message naming the range, and POST
+# /camera/controls hands that message straight back, so nothing here
+# hardcodes a range that could drift from the firmware.
+# roi_exposure is the one control with four values: set_roi_exposure_op(
+# device, mode, x, y, size), meter auto-exposure on a window instead of the
+# whole frame (mode 0 = full frame; x and y on a 0-255 grid).
+CAMERA_CONTROLS = (
+    "auto_exposure",
+    "exposure",
+    "gain",
+    "roi_exposure",
+    "brightness",
+    "auto_white_balance",
+    "white_balance",
+    "contrast",
+    "saturation",
+    "hue",
+    "gamma",
+    "sharpness",
+    "black_level",
+    "denoise",
+    "hdr",
+    "tone_control",
+    "color_mode",
+    "scene_mode",
+    "flicker",
+    "flip",
 )
 
-_INSET_OFF_WORDS = ("", "off", "0", "false", "no", "none")
+# Auto exposure and auto white balance are asserted on every open, as the ZED
+# path did with AEC_AGC and WHITEBALANCE_AUTO: settings can persist in the
+# camera between opens, and a manual value left behind by a vendor tool would
+# otherwise survive silently. Everything else stays at the camera's default
+# unless STREAM_API_CAMERA_<NAME> sets it, e.g. STREAM_API_CAMERA_FLICKER=1
+# for 50 Hz mains or STREAM_API_CAMERA_ROI_EXPOSURE=1,128,128,4.
+_CONTROL_DEFAULTS = {"auto_exposure": 1, "auto_white_balance": 1}
 
 
-def _parse_inset(spec: str, name: str = "STREAM_API_CROP_INSET"):
-    """'auto' -> ("auto", None); 'l,t,r,b' or 'n' -> ("fixed", [l,t,r,b]);
-    empty/off -> ("off", None). Garbage is logged and treated as off."""
-    spec = spec.strip().lower()
-    if spec == "auto":
-        return "auto", None
-    if spec in _INSET_OFF_WORDS:
-        return "off", None
+def _parse_roi_exposure(spec: str):
+    """'mode,x,y,size' -> [mode, x, y, size], or None if malformed."""
     try:
         vals = [int(v) for v in spec.split(",")]
-        if len(vals) == 1:
-            vals = vals * 4
-        if len(vals) != 4 or any(v < 0 for v in vals):
-            raise ValueError
     except ValueError:
-        logger.warning("%s=%r is not 'auto', 'off', n or l,t,r,b — inset off", name, spec)
-        return "off", None
-    return "fixed", vals
-
-
-_inset_mode, _inset_px = _parse_inset(os.environ.get("STREAM_API_CROP_INSET", _CROP_INSET_DEFAULT))
-
-# Third crop stage, after rim and inset: cut to the fish themselves
-# (2026-10-19, feature/fish-crop, at the user's request). The tray is a fixed
-# size but the catch is not — a full tray and one fish in the middle used to
-# get the same 1582 px wide image, the single fish a small island in steel.
-# detect_fish() finds whatever lies on the floor and /capture serves the box
-# around all of it plus a margin — tight on every tray, full or sparse; the
-# user asked for the fish, not the tray, so no side is widened to the rim.
-# A bare tray or a miss serves the plain tray crop. Cut LAST, after
-# de-glare and enhance have run on the tray crop: de-glare divides by a
-# sigma-60 blur, and on a one-fish crop that blur would be mostly fish and
-# flatten the fish against itself.
-# OFF by default since 2026-11-05: the client asked to go back to the full
-# tray with its edges (the rim crop), not a zoom onto the fish. The stage and
-# its hold stay in, switchable per request (?fish=true) or for everyone.
-# STREAM_API_CROP_FISH: off (the default) or on.
-# STREAM_API_CROP_FISH_MARGIN: reference px kept around the fish, default 40
-# (about 1.4 grid squares). Both movable live with POST /camera/crop.
-_FISH_CROP_DEFAULT = "off"
-_FISH_MARGIN_DEFAULT = 40
-
-
-def _fish_margin_env() -> int:
-    raw = os.environ.get("STREAM_API_CROP_FISH_MARGIN", str(_FISH_MARGIN_DEFAULT)).strip()
-    try:
-        v = int(raw)
-        if not 0 <= v <= 400:
-            raise ValueError
-    except ValueError:
-        logger.warning("STREAM_API_CROP_FISH_MARGIN=%r is not 0-400, using %d", raw, _FISH_MARGIN_DEFAULT)
-        v = _FISH_MARGIN_DEFAULT
-    return v
-
-
-_fish_enabled = os.environ.get("STREAM_API_CROP_FISH", _FISH_CROP_DEFAULT).strip().lower() not in _INSET_OFF_WORDS
-
-_crop_env = os.environ.get("STREAM_API_CROP", _CROP_DEFAULT).strip()
-CROP_AUTO = _crop_env.lower() == "auto"
-CROP_BOX = _parse_crop(_CROP_FALLBACK if CROP_AUTO else _crop_env)
-
-# The crop in force. mode is "auto" (detect_tray() on every cropped capture,
-# box = the last good detection or the seed), "manual" (a fixed box) or
-# "off". POST /camera/crop moves all of it live — the hardware team re-lays
-# the tray between captures, so a box that needs a unit edit and a restart is
-# a box nobody updates. Boxes are reference-frame coordinates; a service
-# restart returns to STREAM_API_CROP. `detected` is the last auto result, so
-# /health shows whether the box being served was found or inherited.
-# `inset` is the second stage: how far in from the rim box the served box
-# sits, per side (left, top, right, bottom) in reference pixels. mode is
-# "auto" (detect_floor() on every cropped capture), "fixed" or "off"; `px` is
-# the inset in force — the last good detection, the pinned value or the
-# fallback — and `source` says which. _crop_box() combines the two stages.
-_crop = {
-    "box": list(CROP_BOX) if CROP_BOX else None,
-    "mode": "auto" if CROP_AUTO else ("manual" if CROP_BOX else "off"),
-    "source": "fallback" if CROP_AUTO else ("manual" if CROP_BOX else None),
-    "detected": None,
-    "inset": {
-        "mode": _inset_mode,
-        "px": _parse_inset(_CROP_INSET_FALLBACK)[1] if _inset_mode == "auto" else _inset_px,
-        "source": {"auto": "fallback", "fixed": "fixed", "off": None}[_inset_mode],
-        "detected": None,
-    },
-    # Third stage: the box around the fish, cut from the tray crop. `detected`
-    # is the last result — fish count, the box served, and which floor box it
-    # searched (the inset in force, a fresh detect_floor(), or the fallback).
-    "fish": {
-        "enabled": _fish_enabled,
-        "margin": _fish_margin_env(),
-        "detected": None,
-    },
-}
-
-
-def _edge_peaks(profile: np.ndarray, min_sep: int = 8):
-    """Local maxima of a 1-D edge-strength profile, strongest first."""
-    thr = max(2.0, float(np.median(profile)) * 1.8)
-    out: list = []
-    for i in np.argsort(profile)[::-1]:
-        v = float(profile[i])
-        if v < thr:
-            break
-        if (i == 0 or v >= profile[i - 1]) and (i == len(profile) - 1 or v >= profile[i + 1]):
-            if all(abs(i - j) >= min_sep for j, _ in out):
-                out.append((int(i), v))
-    return out
-
-
-def _best_pair(peaks, expected: int, tol: float, min_rel: float = 0.35):
-    """Strong edge pair whose spacing is closest to `expected`, or None."""
-    if not peaks:
         return None
-    vmax = max(v for _, v in peaks)
-    lo, hi = expected * (1 - tol), expected * (1 + tol)
-    best = None
-    for a, va in peaks:
-        if va < min_rel * vmax:
+    return vals if len(vals) == 4 else None
+
+
+def _controls_from_env() -> dict:
+    out: dict = {}
+    for name in CAMERA_CONTROLS:
+        var = f"STREAM_API_CAMERA_{name.upper()}"
+        raw = _env(var)
+        if not raw:
+            if name in _CONTROL_DEFAULTS:
+                out[name] = _CONTROL_DEFAULTS[name]
             continue
-        for b, vb in peaks:
-            if vb < min_rel * vmax:
+        if name == "roi_exposure":
+            value = _parse_roi_exposure(raw)
+            if value is None:
+                logger.warning("%s=%r is not mode,x,y,size, ignored", var, raw)
                 continue
-            d = b - a
-            if lo <= d <= hi:
-                err = abs(d - expected) / expected
-                if best is None or err < best[0]:
-                    best = (err, a, b)
-    return None if best is None else (best[1], best[2])
-
-
-def detect_tray(frame):
-    """Find the tray's rim in a full frame. Returns (x1,y1,x2,y2) in reference
-    coordinates, or None when nothing tray-sized is there.
-
-    The tray is the one large rectangle with long straight steel edges, so:
-    take the gradient image, average |d/dx| over the middle 60% of rows to
-    get one edge-strength profile across x (and |d/dy| over the middle 50%
-    of columns for y), find its peaks, and pick the left/right (top/bottom)
-    pair whose spacing is closest to TRAY_SIZE within _TRAY_SIZE_TOL. The
-    size prior is what makes it safe: a hand over the rim, fish lying across
-    it or the sheet beside the table all fail to produce a tray-sized pair
-    and the caller keeps the last good box. Averaging across the frame is
-    why fish do not matter — they perturb a few rows out of 650.
-
-    Checked on every full frame from this project (Sep 22/23, Oct 7 with
-    fish, Oct 12): lands on the rim every time, within ~15 px of a hand
-    measurement; the only spread is whether it takes the rim's outer edge or
-    its inner lip. Fails cleanly on the black-cloth frames. ~5 ms at 1080p.
-    """
-    frame = _ref_frame(frame)
-    g = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (0, 0), 1.2).astype(np.float32)
-    h, w = g.shape
-    gx = np.abs(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3))[int(h * 0.2):int(h * 0.8)].mean(axis=0)
-    gy = np.abs(cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3))[:, int(w * 0.25):int(w * 0.75)].mean(axis=1)
-    px = _best_pair(_edge_peaks(gx), TRAY_SIZE[0], _TRAY_SIZE_TOL)
-    py = _best_pair(_edge_peaks(gy), TRAY_SIZE[1], _TRAY_SIZE_TOL)
-    if px is None or py is None:
-        return None
-    return (px[0], py[0], px[1], py[1])
-
-
-def detect_floor(frame, rim):
-    """Find the floor's edge inside a rim box. Returns (x1,y1,x2,y2) in
-    reference coordinates, or None.
-
-    The walls slope inward from the rim to the floor, so between the rim's
-    outer edge and the grid there are two more long straight edges on each
-    side: the rim's inner lip, 0-2% of the box in, and the wall/floor
-    junction, 2-15% in depending on how far that side is from the camera's
-    axis (the far wall shows its full width, the near one is foreshortened).
-    The edge profiles are averaged over the middle 60% of the rim box only,
-    so the detector sees the floor and what lies on it and nothing outside;
-    peaks are taken inside the 2-15% band on each side and the left/right
-    (top/bottom) pair whose spacing is closest to FLOOR_SIZE wins. The size
-    prior is what separates the floor edge from the lip and from the grid's
-    first line, both of which are also real edges in the band.
-
-    Checked on the Oct 12 (empty), Oct 14 and Oct 16 (fish) frames: lands on
-    the wall/floor junction on all four sides, with the bottom edge — the
-    short, foreshortened wall — the least certain by ~7 px.
-    """
-    frame = _ref_frame(frame)
-    x1, y1, x2, y2 = rim
-    bw, bh = x2 - x1, y2 - y1
-    if bw < 200 or bh < 200:
-        return None
-    g = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (0, 0), 1.2).astype(np.float32)
-    ry0, ry1 = y1 + int(bh * 0.2), y2 - int(bh * 0.2)
-    rx0, rx1 = x1 + int(bw * 0.2), x2 - int(bw * 0.2)
-    gx = np.abs(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3))[ry0:ry1].mean(axis=0)
-    gy = np.abs(cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3))[:, rx0:rx1].mean(axis=1)
-
-    def band(prof, edge, inward, dim):
-        lo, hi = int(dim * 0.02), int(dim * 0.15)
-        a, b = (edge + lo, edge + hi) if inward > 0 else (edge - hi, edge - lo)
-        a, b = max(0, a), min(len(prof) - 1, b)
-        if b - a < 10:
-            return []
-        return [(i + a, v) for i, v in _edge_peaks(prof[a:b + 1], 6)]
-
-    px = _best_pair(band(gx, x1, +1, bw) + band(gx, x2, -1, bw), FLOOR_SIZE[0], _FLOOR_SIZE_TOL, 0.25)
-    py = _best_pair(band(gy, y1, +1, bh) + band(gy, y2, -1, bh), FLOOR_SIZE[1], _FLOOR_SIZE_TOL, 0.25)
-    if px is None or py is None:
-        return None
-    return (px[0], py[0], px[1], py[1])
-
-
-# detect_fish() tuning, measured on the ZED 2i frames from the current table
-# (2026-10-19: a 22-fish raw full frame, and the initial and 16 Oct rim crops
-# with fish and blue crabs). On the ZED a silver fish on bright steel is a
-# strong curved outline round a smooth body; the steel's own edges — glare
-# bands, grid lines, rulers, the wall junction — are straight and axis-aligned.
-_FISH_SCALE = 0.5       # half scale: keeps the 1-2 px outlines
-_FISH_OWIN = 7          # window in which an outline must turn (edges in x AND y)
-_FISH_GUARD = 12        # half-scale px ignored at the floor edge (the junction itself)
-_FISH_K_LO = 2.0        # edge density over the floor median that traces an outline ...
-_FISH_K_HI = 3.0        # ... and that a blob must contain somewhere
-_FISH_LONG = 0.25       # straight runs this fraction of the floor are band or wall edges
-_FISH_CLOSE = 9         # closes an outline into a ring before it is filled
-_FISH_OPEN = 9          # drops salt rings, scratches and grid stubs
-_FISH_MIN_AREA = 3000   # reference px^2 — the smallest blob counted (~55x55)
-_FISH_MIN_CORE = 600    # reference px^2 of strong outline the blob must carry
-_FISH_BODY = 13         # half-scale opening that leaves only solid bodies ...
-_FISH_REACH = 30        # ... and how far (half-scale px) a fin or tail may run from one
-
-# Hold on the fish box, for clients that poll /capture as a preview
-# (2026-11-05: the tablet app refreshed /capture about once a second, and
-# on an empty tray salt and glare edges made the box change on every call,
-# so the preview kept zooming in and out). detect_fish() runs fresh on
-# every frame and, unlike the rim and floor, had no deadband. The rule
-# never cuts a fish to stay steady: a box that GROWS past the held one by
-# more than _FISH_HOLD_TOL is taken at once, merged with the held box. A box
-# that SHRINKS is taken only after _FISH_HOLD_CONFIRM consecutive captures
-# agree on it within _FISH_HOLD_TOL. Random boxes found on a bare tray never
-# agree, so the preview holds the larger box. The hold applies only between
-# captures less than _FISH_HOLD_S apart. A client that calls once per tray
-# (the AI pipeline, Capture Now) always gets a fresh detection, exactly as
-# before.
-_FISH_HOLD_S = 3.0
-_FISH_HOLD_TOL = 24       # reference px (~8 mm) a side may move without counting
-_FISH_HOLD_CONFIRM = 2
-_fish_hold = {"box": None, "served": None, "margin": None, "t": 0.0, "pending": None, "n": 0}
-_fish_hold_lock = threading.Lock()
-
-
-def _fill_holes(mask):
-    """Fill every region of a 0/1 mask not reachable from its border."""
-    ff = np.pad(mask, 1).copy()
-    cv2.floodFill(ff, np.zeros((ff.shape[0] + 2, ff.shape[1] + 2), np.uint8), (0, 0), 1)
-    return mask | (1 - ff[1:-1, 1:-1])
-
-
-def _fish_mask(lab, normalise: bool):
-    """Filled fish blobs from one edge-density pass over a half-scale floor."""
-    sh, sw = lab.shape[:2]
-    gx = np.zeros((sh, sw), np.float32)
-    gy = np.zeros((sh, sw), np.float32)
-    for c, wt in ((0, 1.0), (1, 2.0), (2, 2.0)):
-        gx += wt * np.abs(cv2.Scharr(lab[..., c], cv2.CV_32F, 1, 0))
-        gy += wt * np.abs(cv2.Scharr(lab[..., c], cv2.CV_32F, 0, 1))
-    if normalise:
-        nl = np.maximum(cv2.GaussianBlur(lab[..., 0], (0, 0), 8), 30.0)
-        gx /= nl
-        gy /= nl
-    w = _FISH_OWIN
-    # Geometric mean of the two directions: a curved outline scores, a
-    # straight band edge, grid line or ruler (one direction only) does not.
-    d = 2.0 * np.sqrt(cv2.blur(gx, (w, w)) * cv2.blur(gy, (w, w)))
-    gd = _FISH_GUARD
-    d[:gd] = 0
-    d[-gd:] = 0
-    d[:, :gd] = 0
-    d[:, -gd:] = 0
-    med = max(float(np.median(d[gd:-gd, gd:-gd])), 1e-3)
-    lo = (d > _FISH_K_LO * med).astype(np.uint8)
-    lv, lh = max(15, int(sh * _FISH_LONG)), max(15, int(sw * _FISH_LONG))
-    longs = cv2.morphologyEx(lo, cv2.MORPH_OPEN, np.ones((lv, 1), np.uint8)) | cv2.morphologyEx(
-        lo, cv2.MORPH_OPEN, np.ones((1, lh), np.uint8)
-    )
-    lo[cv2.dilate(longs, np.ones((5, 5), np.uint8)) > 0] = 0
-    ell = cv2.getStructuringElement
-    lo = cv2.morphologyEx(lo, cv2.MORPH_CLOSE, ell(cv2.MORPH_ELLIPSE, (_FISH_CLOSE, _FISH_CLOSE)))
-    lo = _fill_holes(lo)
-    lo = cv2.morphologyEx(lo, cv2.MORPH_OPEN, ell(cv2.MORPH_ELLIPSE, (_FISH_OPEN, _FISH_OPEN)))
-    hi = ((d > _FISH_K_HI * med) & (lo > 0)).astype(np.uint8)
-    n, lbl, st, _ = cv2.connectedComponentsWithStats(lo, 8)
-    core = np.bincount(lbl.ravel(), weights=hi.ravel().astype(np.float64), minlength=n)
-    a = _FISH_SCALE ** 2
-    keep = [
-        i for i in range(1, n)
-        if st[i, cv2.CC_STAT_AREA] >= _FISH_MIN_AREA * a and core[i] >= _FISH_MIN_CORE * a
-    ]
-    return np.isin(lbl, keep).astype(np.uint8)
-
-
-def detect_fish(frame, floor, served, margin: int = _FISH_MARGIN_DEFAULT):
-    """Tight box around everything lying on the tray floor. Returns
-    ((x1,y1,x2,y2), count) in reference coordinates, or (None, 0) when the
-    floor is bare.
-
-    Two passes over the half-scale floor, unioned: edge density divided by
-    local brightness, and raw. The first finds fish on dull steel, the second
-    the ones standing in a glare band, where dividing by the band's
-    brightness drowns their outline — on the 22-fish frame each pass alone
-    missed a column the other found. In each pass the outline must turn
-    (edges in both directions, which rejects the straight band edges, grid
-    and rulers), is closed and filled into a solid blob, and the blob must be
-    fish-sized and carry a strong outline (salt and smears do not). Then
-    anything further than _FISH_REACH from a solid body is trimmed, which
-    removes the leaks a blob sends along a band edge but keeps fins and tails.
-    The box is the union plus `margin`, clamped to `served`.
-
-    Tight on purpose (the user wants the fish, not the tray): no side is
-    widened to the rim. Checked on three real frames — every fish and crab
-    inside the box, within ~25 px of the outermost fish on the full tray.
-    Not yet checked on a real tray holding one or two fish. ~15 ms.
-    """
-    frame = _ref_frame(frame)
-    fx1, fy1, fx2, fy2 = floor
-    roi = frame[fy1:fy2, fx1:fx2]
-    sw = max(1, round(roi.shape[1] * _FISH_SCALE))
-    sh = max(1, round(roi.shape[0] * _FISH_SCALE))
-    if sh <= 4 * _FISH_GUARD or sw <= 4 * _FISH_GUARD:
-        return None, 0
-    sm = cv2.medianBlur(cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_AREA), 3)
-    lab = cv2.cvtColor(sm, cv2.COLOR_BGR2LAB).astype(np.float32)
-    m = _fish_mask(lab, True) | _fish_mask(lab, False)
-    ell = cv2.getStructuringElement
-    body = cv2.morphologyEx(m, cv2.MORPH_OPEN, ell(cv2.MORPH_ELLIPSE, (_FISH_BODY, _FISH_BODY)))
-    m &= cv2.dilate(body, ell(cv2.MORPH_ELLIPSE, (2 * _FISH_REACH + 1, 2 * _FISH_REACH + 1)))
-    ys, xs = np.nonzero(m)
-    if len(xs) == 0:
-        return None, 0
-    f = 1.0 / _FISH_SCALE
-    sx1, sy1, sx2, sy2 = served
-    box = (
-        max(sx1, fx1 + int(xs.min() * f) - margin),
-        max(sy1, fy1 + int(ys.min() * f) - margin),
-        min(sx2, fx1 + int((xs.max() + 1) * f) + margin),
-        min(sy2, fy1 + int((ys.max() + 1) * f) + margin),
-    )
-    return box, cv2.connectedComponents(m)[0] - 1
-
-
-def _fish_crop(frame, served):
-    """The fish box for this capture, in reference coordinates, folded into
-    _crop["fish"]["detected"]; `served` (the tray box) when nothing is found.
-
-    Searches the floor, not the served box: the walls' own edges would read
-    as fish. The floor is the inset box when an inset is in force, else a
-    fresh detect_floor() inside the rim, else the rim less the fallback inset.
-    """
-    rim = tuple(_crop["box"])
-    ins = _crop["inset"]
-    if ins["mode"] != "off" and ins["px"]:
-        floor, src = tuple(served), "inset"
-    else:
-        floor, src = detect_floor(frame, rim), "detected"
-        if floor is None:
-            l, t, r, b = _parse_inset(_CROP_INSET_FALLBACK)[1]
-            floor, src = (rim[0] + l, rim[1] + t, rim[2] - r, rim[3] - b), "fallback"
-    served = tuple(served)
-    margin = _crop["fish"]["margin"]
-    box, n = detect_fish(frame, floor, served, margin)
-    out, hold = _hold_fish_box(box if box is not None else served, served, margin)
-    _crop["fish"]["detected"] = {
-        "ok": box is not None,
-        "fish": n,
-        "box": list(box) if box else None,
-        "served": list(out),
-        "hold": hold,
-        "floor": src,
-        "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
+        else:
+            try:
+                value = int(raw)
+            except ValueError:
+                logger.warning("%s=%r is not an integer, ignored", var, raw)
+                continue
+        out[name] = value
     return out
 
 
-def _hold_fish_box(want, served, margin):
-    """Apply the hold (see _FISH_HOLD_S) to this capture's fish box `want`.
-    Returns (box to serve, what happened): fresh (no recent capture, the
-    tray moved or the margin changed), same, grown, held (a shrink waiting
-    for confirmation) or shrunk."""
-    tol = _FISH_HOLD_TOL
-    now = time.monotonic()
-    with _fish_hold_lock:
-        h = _fish_hold
-        cur = h["box"]
-        if (cur is None or now - h["t"] > _FISH_HOLD_S
-                or h["served"] != served or h["margin"] != margin):
-            h.update(box=want, pending=None, n=0)
-            what = "fresh"
-        elif (want[0] < cur[0] - tol or want[1] < cur[1] - tol
-              or want[2] > cur[2] + tol or want[3] > cur[3] + tol):
-            h.update(box=(min(want[0], cur[0]), min(want[1], cur[1]),
-                          max(want[2], cur[2]), max(want[3], cur[3])),
-                     pending=None, n=0)
-            what = "grown"
-        elif all(abs(a - b) <= tol for a, b in zip(want, cur)):
-            h.update(pending=None, n=0)
-            what = "same"
-        else:
-            p = h["pending"]
-            if p is not None and all(abs(a - b) <= tol for a, b in zip(want, p)):
-                h["n"] += 1
-            else:
-                h.update(pending=want, n=1)
-            if h["n"] >= _FISH_HOLD_CONFIRM:
-                h.update(box=want, pending=None, n=0)
-                what = "shrunk"
-            else:
-                what = "held"
-        h.update(served=served, margin=margin, t=now)
-        return tuple(h["box"]), what
+# The control values in force. POST /camera/controls moves them and every
+# open re-applies them, so a self-heal reopen keeps what was set; a service
+# restart returns to the environment, so nothing poked in while testing leaks
+# into production.
+_controls = _controls_from_env()
 
 
-def _crop_box():
-    """The reference-frame box /capture serves: the rim box less the inset in
-    force, or None when the crop is off. An inset that would swallow the box
-    (a nonsense fixed value) serves the rim box rather than a sliver."""
-    box = _crop["box"]
-    if not box or _crop["mode"] == "off":
-        return None
-    ins = _crop["inset"]
-    if ins["mode"] == "off" or not ins["px"]:
-        return tuple(box)
-    l, t, r, b = ins["px"]
-    x1, y1, x2, y2 = box[0] + l, box[1] + t, box[2] - r, box[3] - b
-    if x2 - x1 < 16 or y2 - y1 < 16:
-        return tuple(box)
-    return (x1, y1, x2, y2)
-
-
-def _auto_crop(frame) -> None:
-    """Run the detectors on a native frame and fold the results into _crop:
-    detect_tray() for the rim when the crop is auto, then detect_floor()
-    inside whatever rim box is in force when the inset is auto.
-
-    A detection replaces the box (or the inset) only when an edge moved by
-    more than 3 px, so a static tray gives a pixel-identical crop capture
-    after capture instead of jittering. A miss keeps the last good value and
-    is reported; a rim miss also skips the floor, since a stale rim would
-    make the floor stale too.
-    """
-    now = time.strftime("%Y-%m-%dT%H:%M:%S")
-    if _crop["mode"] == "auto":
-        found = detect_tray(frame)
-        if found is None:
-            _crop["detected"] = {"ok": False, "box": None, "at": now}
-            return
-        cur = _crop["box"]
-        if cur is None or any(abs(a - b) > 3 for a, b in zip(found, cur)):
-            if cur is not None and _crop["source"] == "auto":
-                logger.info("tray moved: crop %s -> %s", cur, list(found))
-            _crop["box"] = list(found)
-        _crop["source"] = "auto"
-        _crop["detected"] = {"ok": True, "box": list(found), "at": now}
-    ins = _crop["inset"]
-    if ins["mode"] != "auto" or not _crop["box"]:
-        return
-    floor = detect_floor(frame, tuple(_crop["box"]))
-    if floor is None:
-        ins["detected"] = {"ok": False, "box": None, "at": now}
-        return
-    rx1, ry1, rx2, ry2 = _crop["box"]
-    px = [floor[0] - rx1, floor[1] - ry1, rx2 - floor[2], ry2 - floor[3]]
-    if ins["px"] is None or any(abs(a - b) > 3 for a, b in zip(px, ins["px"])):
-        if ins["px"] is not None and ins["source"] == "auto":
-            logger.info("floor edge moved: inset %s -> %s", ins["px"], px)
-        ins["px"] = px
-    ins["source"] = "auto"
-    ins["detected"] = {"ok": True, "box": list(floor), "at": now}
-
-# Physical scale of the image, for the AI team's fish-length measurement.
-# The camera is fixed straight above the tray, the left view is rectified,
-# and the tray floor carries a printed grid, so one number converts pixels
-# to millimetres anywhere in the frame: GRID_MM (the square size — 10 mm
-# assumed, to be confirmed by the hardware team) over GRID_PX (the square's
-# pitch in reference-frame pixels at the current mount height — 29, measured
-# by autocorrelation on the 2026-10-14 capture). /capture reports the value
-# for the frame it actually returns in X-Mm-Per-Px, corrected for crop
-# scaling, presets and the 2K mode, so a client never has to know which of
-# those applied. The number is for the plane of the tray floor; the top of a
-# 3 cm thick fish sits that much closer to the lens and reads ~3% long, which
-# is the accuracy limit of this method. Re-measure GRID_PX if the camera is
-# raised or lowered — POST /camera/scale does it live, STREAM_API_GRID_PX
-# makes it permanent.
-def _float_env(name: str, default: str, lo: float, hi: float) -> float:
-    try:
-        v = float(os.environ.get(name, default))
-    except ValueError:
-        logger.warning("%s=%r is not a number, using %s", name, os.environ.get(name), default)
-        v = float(default)
-    if not lo <= v <= hi:
-        logger.warning("%s=%s out of range %s-%s, using %s", name, v, lo, hi, default)
-        v = float(default)
-    return v
-
-
-GRID_MM = _float_env("STREAM_API_GRID_MM", "10", 1, 100)
-GRID_PX = _float_env("STREAM_API_GRID_PX", "29", 5, 500)
-_scale = {"grid_mm": GRID_MM, "grid_px": GRID_PX, "mm_per_px": round(GRID_MM / GRID_PX, 5)}
-
-# EXPERIMENT (2026-10-15): fill the clipped light strips from the right eye.
-#
-# The ZED's two lenses sit 12 cm apart. The fish are diffuse, so they sit in
-# the same place on the tray in both views, but a mirrored light strip is a
-# specular reflection and moves between the views — for lights ~2 m above a
-# tray ~1 m below the camera the strip shifts by roughly the strip's own
-# width. So where the left image is clipped under a strip, the right image
-# mostly is not. The tray is flat and at a fixed distance, so aligning the
-# right view onto the left is a single horizontal shift (the tray-plane
-# disparity), estimated by phase correlation on the tray region or pinned
-# with STREAM_API_STEREO_SHIFT. Clipped left pixels whose aligned right
-# pixel is not clipped are replaced through a feathered mask; de-glare then
-# evens out whatever brightness step remains. ON by default since 2026-10-18
-# at the user's request (STREAM_API_STEREO_FILL=0 turns it off); the gain is
-# expected to be partial, and X-Stereo-Fill on every capture says what it
-# did — a "no-shift-estimate" there means the frame went out unfilled.
-STEREO_FILL_DEFAULT = os.environ.get("STREAM_API_STEREO_FILL", "1").strip().lower() in ("1", "true", "yes", "on")
-_STEREO_SHIFT_ENV = os.environ.get("STREAM_API_STEREO_SHIFT", "").strip()
-_stereo = {
-    "enabled": STEREO_FILL_DEFAULT,
-    "shift": float(_STEREO_SHIFT_ENV) if _STEREO_SHIFT_ENV else None,  # pinned, px; None = estimate
-    "last": None,  # what the last capture did
-}
-_STEREO_CLIP = 250
-_STEREO_SHIFT_RANGE = (5.0, 400.0)
-
-
-def estimate_stereo_shift(left, right, box=None):
-    """Horizontal shift that lays the right view onto the left on the tray
-    plane, in pixels of the frames given, or None if the two do not agree.
-
-    Phase correlation on the tray region (rim edges, fish and salt are
-    strong non-periodic features; the grid alone could alias to its own
-    pitch, which is why the region should include the rim). The vertical
-    component must be ~0 — the views are rectified — and the response must be
-    a clear peak, else the pair is rejected rather than trusted.
-    """
-    if box:
-        x1, y1, x2, y2 = box
-        left, right = left[y1:y2, x1:x2], right[y1:y2, x1:x2]
-    g1 = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    g2 = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    win = cv2.createHanningWindow((g1.shape[1], g1.shape[0]), cv2.CV_32F)
-    (dx, dy), resp = cv2.phaseCorrelate(g2, g1, win)
-    if resp < 0.03 or abs(dy) > 8 or not _STEREO_SHIFT_RANGE[0] <= dx <= _STEREO_SHIFT_RANGE[1]:
-        logger.info("stereo shift rejected: dx=%.1f dy=%.1f resp=%.3f", dx, dy, resp)
-        return None
-    return float(dx)
-
-
-def fill_clipped_from_right(left, right, shift: float, clip: int = _STEREO_CLIP, feather: float = 4.0):
-    """Replace clipped left pixels with the aligned right view. Returns
-    (image, clipped_fraction, filled_fraction)."""
-    d = int(round(shift))
-    aligned = np.zeros_like(right)
-    if d > 0:
-        aligned[:, d:] = right[:, :-d]
-    elif d < 0:
-        aligned[:, :d] = right[:, -d:]
-    else:
-        aligned = right
-    lclip = left.max(axis=2) >= clip
-    rclip = aligned.max(axis=2) >= clip
-    mask = lclip & ~rclip
-    if d > 0:
-        mask[:, :d] = False  # no right data here
-    elif d < 0:
-        mask[:, d:] = False
-    clipped = float(lclip.mean())
-    if not mask.any():
-        return left, clipped, 0.0
-    mask = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8))
-    alpha = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), feather)[:, :, None]
-    out = left.astype(np.float32) * (1 - alpha) + aligned.astype(np.float32) * alpha
-    return np.clip(out, 0, 255).astype(np.uint8), clipped, float(mask.mean())
-
-# De-glare strength/radius in force. Constants here beside CROP_BOX because
-# camera_status reports both; the filter itself lives with the other image
-# processing further down, next to enhance_for_text().
-# enhance_for_text() is back ON by default (2026-09-23). It was switched off
-# when the D435 left, because the ZED's auto-exposure produced a well-exposed
-# frame that needed no lift — correct at the time. The de-glare pass then
-# changed the premise: evening out the illumination is also what removes
-# contrast, so the de-glared frame is correct but flat. Measured across both
-# on-site captures, de-glare leaves L median 107-114 and std 30-34 using only
-# 65-71% of the tonal range; enhance brings them to median 139 and std 43-46
-# at 75-80% of the range, with clipping still under 0.7%.
-#
-# Same reasoning as deglare for the default: the mobile app sends no query
-# params and the AI pipeline fetches bare /capture, so an opt-in flag would
-# never be passed. ?enhance=false gives a raw A/B frame, and POST
-# /camera/enhance flips the server default live — that endpoint exists because
-# this default was previously a bare code constant, which meant a redeploy to
-# change the one thing the params-less clients actually receive.
-ENHANCE_DEFAULT = os.environ.get("STREAM_API_ENHANCE", "1").strip().lower() not in (
-    "0", "false", "no", "off", ""
-)
-_enhance = {"default": ENHANCE_DEFAULT}
-
-DEGLARE_SIGMA = int(os.environ.get("STREAM_API_DEGLARE_SIGMA", "60"))
-DEGLARE_STRENGTH = int(os.environ.get("STREAM_API_DEGLARE_STRENGTH", "100"))
-_deglare = {
-    "sigma": max(10, min(300, DEGLARE_SIGMA)),
-    "strength": max(0, min(100, DEGLARE_STRENGTH)),
-}
-
-# Keep the colour when de-glare and enhance move the lightness (2026-10-20).
-# Both work on LAB L only and leave a*/b* where they were, so a fish they
-# brighten keeps the same absolute chroma at a higher L — it reads greyer.
-# Measured on the 20 Oct unprocessed frame (tray at L 74, so the pipeline
-# lifts hard): the red/pink fish went L 82-113 -> 125-147 and lost a quarter
-# of their saturation (HSV S 35-42 -> 27-34); with a*/b* scaled by the L
-# ratio they keep about half of that back (31-38), and the silver fish and
-# the steel stay neutral. OFF by default: it changes what the AI pipeline
-# receives, so it is A/B'd on site first (?chroma=true on one capture, POST
-# /camera/chroma to flip the default). Reported in X-Keep-Chroma.
-_chroma = {
-    "keep": os.environ.get("STREAM_API_KEEP_CHROMA", "0").strip().lower()
-    not in ("0", "false", "no", "off", ""),
-}
-
-# Auto-exposure metering region, in full-frame coordinates like CROP_BOX.
-#
-# OFF by default: the camera meters the whole frame, exactly as before this
-# existed, so deploying it changes nothing until it is switched on. On, the
-# ISP meters only the box — VIDEO_SETTINGS.AEC_AGC_ROI, the built-in lever for
-# the case where the glare bands outside the tray drag the exposure down for
-# the fish inside it (measured 2026-09-23: clean tray at L median 86 while the
-# worst band sat at 222). It is a trade, not a free win: more exposure on the
-# fish also pushes more of the bands into hard clipping, and clipped pixels are
-# the one thing de-glare cannot recover. Hence off by default plus a live
-# POST /camera/aec-roi, so it is A/B'd on-site under the real lights rather
-# than flipped blind from a desk. Not manual exposure — AEC/AGC keeps running,
-# it just looks at less of the frame.
-#
-# STREAM_API_AEC_ROI: empty = off, "tray" = follow CROP_BOX (so the two boxes
-# cannot drift apart when the camera is re-hung), or an explicit x1,y1,x2,y2.
-def _aec_roi_from_env():
-    spec = os.environ.get("STREAM_API_AEC_ROI", "").strip()
-    if spec.lower() == "tray":
-        return _crop_box()
-    return _parse_crop(spec, "STREAM_API_AEC_ROI")
-
-
-AEC_ROI_DEFAULT = _aec_roi_from_env()
-_aec_roi = {"box": list(AEC_ROI_DEFAULT) if AEC_ROI_DEFAULT else None}
-
+def _ordered_controls(values: dict) -> list:
+    return sorted(values.items(), key=lambda kv: CAMERA_CONTROLS.index(kv[0]))
 
 # ---------------------------------------------------------------------------
 # Hardware status — surfaced via /health and used to short-circuit endpoints
@@ -968,23 +327,18 @@ camera_status: dict = {
     "ok": False,
     "error": "not yet started",
     "mode": "real",
-    # The /capture crop box in full-frame coordinates, or null when disabled —
-    # a stale box after the camera is moved is otherwise invisible.
-    "crop": _crop,
-    # Software de-glare in force; "strength": 0 means every client gets raw.
-    "deglare": _deglare,
-    # Whether a param-less /capture gets enhance_for_text().
-    "enhance": _enhance,
-    # Whether de-glare/enhance scale a*/b* with the lightness they add.
-    "chroma": _chroma,
-    # Auto-exposure metering box in force, or null for full-frame metering.
-    "aec_roi": _aec_roi,
-    # Sensor mode the camera is running in (POST /camera/resolution).
-    "resolution": _camera_mode,
-    # Pixel-to-millimetre calibration at the reference resolution (POST /camera/scale).
-    "scale": _scale,
-    # Right-eye glare fill experiment (POST /camera/stereo).
-    "stereo": _stereo,
+    # Camera name as the SDK reports it, plus get_device_info() (firmware).
+    "device": None,
+    # vispa.version() of the installed SDK.
+    "sdk": None,
+    # Pixel format in force (one of CAMERA_FORMATS) and the size of the
+    # frames it delivers — the native size a bare /capture returns.
+    "format": None,
+    "frame": None,
+    # Frame rate requested (STREAM_API_CAMERA_FPS), null = camera default.
+    "fps": CAMERA_FPS,
+    # ISP control values in force, re-applied on every open.
+    "controls": _controls,
 }
 # `port` is the device actually opened (discovery can pick it, so the configured
 # value is not always the answer) and `format` is the parser layer the last
@@ -1031,273 +385,196 @@ def _battery_failed(error: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Camera — pyzed (ZED SDK) needs CUDA and is Linux-only; stub elsewhere for dev
+# Camera — Vadzo VISPA SDK on Linux (aarch64 wheel); stub elsewhere for dev
 # ---------------------------------------------------------------------------
 
+# Seconds to wait for a frame. The guide's default for continuous reads; the
+# first frame after a start gets longer while the camera settles.
+_FRAME_TIMEOUT = 2.0
+_FIRST_FRAME_TIMEOUT = 5.0
+
+_CAMERA_ERR_NO_SDK = (
+    "the VISPA camera SDK is not installed in this venv — install the "
+    "vispa-*-cp313-*_aarch64.whl from the Falcon-2020CRS pack (see DEPLOYMENT.md)"
+)
+_CAMERA_ERR_NOT_FOUND = (
+    "no Falcon camera found — check the USB 3 cable and port, and that "
+    "vadzo_env.sh has been run (without its udev rule the SDK cannot see "
+    "the camera); unplug/replug after running it"
+)
+_CAMERA_ERR_BUSY = (
+    "Falcon camera detected but busy — another process holds it (a vendor "
+    "viewer, a probe script, or a second copy of this service); close it and retry"
+)
+
 if sys.platform == "linux":
-    import pyzed.sl as sl
+    try:
+        import vispa
+        from VISPA_Falcon import FalconCamera
+        _sdk_error = None
+        camera_status["sdk"] = str(vispa.version())
+    except ImportError as e:
+        logger.error("VISPA SDK import failed: %s", e)
+        FalconCamera = None
+        _sdk_error = _CAMERA_ERR_NO_SDK
 
-    # One shared sl.Camera for the process. Constructing it is cheap — the
-    # hardware and the CUDA context are only touched by open(). RGB only:
-    # DEPTH_MODE.NONE keeps the GPU idle (depth is deferred, PROJECT_SCOPE.md).
-    # The left view is the rectified reference image; the SDK hands it back
-    # as BGRA, converted to BGR in _grab_frame() so the rest of the file only
-    # ever sees a plain 3-channel frame.
-    #
-    # Exposure, gain and white balance are left to the camera's own ISP
-    # (AEC_AGC + WHITEBALANCE_AUTO). The D435 needed a hand-tuned 80 us manual
-    # exposure to survive the tray's glare; the ZED 2i's polarizer and ISP take
-    # that over, so there are no manual sensor values and no per-request
-    # overrides.
-    #
-    # BRIGHTNESS is the one exception, and it is NOT manual exposure: it is an
-    # ISP output control (0-8, SDK default 4) that shifts the rendered image
-    # while auto-exposure keeps running. Lower it for a darker-looking frame.
-    #
-    # It does NOT recover blown highlights. The first on-site ZED capture
-    # (2026-09-22) measured fish at L median 128 with 0.3% clipping — well
-    # exposed — while two vertical glare bands, the overhead fixtures mirrored
-    # off the steel, sat at 12-17% clipped. Those pixels are saturated at the
-    # sensor; dimming the ISP output maps them down but the detail is already
-    # gone. Glare is fixed by moving/diffusing the light or changing the angle
-    # between lamp, tray and lens (a polarizer works best at ~50-60 deg off the
-    # surface, and the camera currently looks almost straight down). This
-    # constant is for the look of the frame, not for the bands.
-    #
-    # CONTRAST is the in-camera answer to the flatness the de-glare pass leaves
-    # behind: raising it adds punch in the ISP, BEFORE the software correction,
-    # which is cleaner than putting contrast back afterwards. Both are 0-8 with
-    # an SDK default of 4, so the shipped defaults change nothing on their own.
-    #
-    # Env-backed so an on-site A/B is a unit edit + restart, not a rebuild, and
-    # settable live via POST /camera/brightness so it is not even that.
-    def _isp_env(name: str, default: int = 4) -> int:
-        raw = int(os.environ.get(name, str(default)))
-        if not 0 <= raw <= 8:
-            logger.warning("%s=%s out of range 0-8, clamping", name, raw)
-        return max(0, min(8, raw))
+    # The SDK addresses everything through one controller and the camera's
+    # name. Created lazily on the first open (post-fork, in the startup hook)
+    # and kept for the life of the process; only the device is closed and
+    # reopened on a self-heal.
+    _cam = None
+    _dev: Optional[str] = None
 
-    CAMERA_BRIGHTNESS = _isp_env("STREAM_API_CAMERA_BRIGHTNESS")
-    CAMERA_CONTRAST = _isp_env("STREAM_API_CAMERA_CONTRAST")
-    # SATURATION (0-8, SDK default 4) is the third ISP output control, added
-    # 2026-10-15: on the steel tray the fish measure a saturation of ~10 on a
-    # 0-255 scale against ~8 for the floor, so the red and orange species sit
-    # almost grey and the client's phone photos run at ~17. Raising it in the
-    # ISP is cleaner than boosting colour after the fact, and like the other
-    # two it leaves auto-exposure and auto-WB untouched.
-    #
-    # Ships at 6, not the SDK's 4, since 2026-10-18 at the user's request: the
-    # 14 Oct capture had the AI pipeline calling three Shry "Yem"/"Nsr" that
-    # the phone photo of the same tray got right. Measured, the ZED's white
-    # balance was already neutral (steel at LAB a/b -0.9/-0.1) and the fish
-    # carried the same chroma as on the phone, so colour was not the main
-    # cause — the blown-out light band and fewer pixels per fish were — but
-    # the phone renders warmer and more saturated and that is the look the
-    # pipeline was tuned on. 6 is the top of the range the on-site A/B in
-    # ZED_MIGRATION.md 7g suggested; judge it on the silver fish, which must
-    # stay silver, and set STREAM_API_CAMERA_SATURATION=4 to return to the
-    # SDK default.
-    CAMERA_SATURATION = _isp_env("STREAM_API_CAMERA_SATURATION", default=6)
-
-    # The values actually in force. POST /camera/brightness moves them; every
-    # _open_camera() re-applies them. That is the whole point of keeping them
-    # here rather than re-reading the constants: on the D435, a per-request
-    # override was wiped by the next pipeline restart, so a USB hiccup nobody
-    # noticed silently reverted a hand-tuned value mid-session. Here a self-heal
-    # keeps what you set; only a service restart returns to the env/constants,
-    # which is deliberate — nothing poked in while testing leaks into production.
-    _isp = {
-        "brightness": CAMERA_BRIGHTNESS,
-        "contrast": CAMERA_CONTRAST,
-        "saturation": CAMERA_SATURATION,
-    }
-
-    _SL_RESOLUTION = {"fhd": sl.RESOLUTION.HD1080, "2k": sl.RESOLUTION.HD2K}
-
-    _zed = sl.Camera()
-    _init = sl.InitParameters()
-    _init.camera_resolution = _SL_RESOLUTION[_camera_mode["name"]]
-    _init.camera_fps = _camera_mode["fps"]
-    _init.depth_mode = sl.DEPTH_MODE.NONE
-    _init.sdk_verbose = 0
-    _runtime = sl.RuntimeParameters()
-    _left = sl.Mat()  # reused across grabs; get_data() aliases its memory
-    _right = sl.Mat()
-
-    # Serialize all camera access — sl.Camera grab/retrieve is not thread-safe,
-    # and lazy reopen from multiple concurrent requests must be single-flighted.
+    # Serialize all camera access: the SDK hands frames over a
+    # single-consumer ring, and a lazy reopen from concurrent requests must be
+    # single-flighted.
     _camera_lock = threading.Lock()
     _camera_last_retry = 0.0
-    _CAMERA_RETRY_COOLDOWN = 5.0  # seconds — avoid hammering USB after a disconnect
+    _CAMERA_RETRY_COOLDOWN = 5.0  # seconds, so a dead USB bus is not hammered by /stream
 
-    def _apply_aec_roi() -> None:
-        """Push the metering box in _aec_roi to the camera, or clear it.
+    def _check(status, what: str) -> None:
+        # The SDK reports failure as a descriptive string instead of raising;
+        # equality with "success" is the only reliable test (guide, section 9).
+        if status != "success":
+            raise RuntimeError(f"{what}: {status}")
 
-        Called even when no box is set: nothing promises a reopen forgets the
-        ROI, so "off" actively resets to full-frame rather than trusting that
-        a box from a previous run or a ZED_Explorer session is gone. The SDK
-        takes the box in the live sensor resolution, so the reference-frame
-        box is scaled through _live_box() first.
-        """
-        box = _live_box(_aec_roi["box"])
-        try:
-            if box:
-                x1, y1, x2, y2 = box
-                err = _zed.set_camera_settings_roi(
-                    sl.VIDEO_SETTINGS.AEC_AGC_ROI,
-                    sl.Rect(x1, y1, x2 - x1, y2 - y1),
-                    sl.SIDE.BOTH,
-                )
-            else:
-                err = _zed.set_camera_settings_roi(
-                    sl.VIDEO_SETTINGS.AEC_AGC_ROI, sl.Rect(), sl.SIDE.BOTH, True
-                )
-        except Exception as e:
-            logger.warning("failed to set AEC ROI %s: %s", box, e)
-            return
-        if err is not None and err != sl.ERROR_CODE.SUCCESS:
-            logger.warning("camera refused AEC ROI %s: %s", box, err)
+    def _close_camera() -> None:
+        """Stop and release the device. Caller holds _camera_lock."""
+        global _dev
+        if _cam is not None and _dev is not None:
+            for call in (_cam.stop_acquisition, _cam.close_device):
+                try:
+                    call(_dev)
+                except Exception:
+                    pass
+        _dev = None
 
-    def _reset_isp_auto() -> None:
-        """Hand exposure/gain and white balance back to the camera's ISP.
+    def _apply_control(name: str, value) -> str:
+        if name == "roi_exposure":
+            return _cam.set_roi_exposure_op(_dev, *value)
+        return getattr(_cam, f"set_{name}_op")(_dev, value)
 
-        ISP settings can persist on the device between opens (ZED_Explorer or
-        a diagnostic run may have left a manual value behind), so these are set
-        explicitly rather than trusting the SDK defaults. Runs after every
-        open, so a self-heal restores the same imaging as a cold start.
-        """
-        _zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
-        _apply_aec_roi()
-        _zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
-        _zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, _isp["brightness"])
-        _zed.set_camera_settings(sl.VIDEO_SETTINGS.CONTRAST, _isp["contrast"])
-        _zed.set_camera_settings(sl.VIDEO_SETTINGS.SATURATION, _isp["saturation"])
-        camera_status["brightness"] = _isp["brightness"]
-        camera_status["contrast"] = _isp["contrast"]
-        camera_status["saturation"] = _isp["saturation"]
+    def _apply_controls() -> None:
+        """Push every control in force to the camera. Must run AFTER
+        start_acquisition(): starting re-applies the camera's standard control
+        set and overwrites any _op value set before it (guide, section 8)."""
+        for name, value in _ordered_controls(_controls):
+            try:
+                status = _apply_control(name, value)
+            except Exception as e:
+                status = str(e)
+            if status != "success":
+                logger.warning("camera control %s=%s not applied: %s", name, value, status)
+
+    def _start(fmt: str) -> np.ndarray:
+        """Configure, start and read one frame in `fmt`. Returns it decoded;
+        raises with the SDK's message if any step fails."""
+        _check(_cam.set_pixel_format(_dev, fmt), "set_pixel_format")
+        if CAMERA_SIZE:
+            _check(_cam.set_roi(_dev, width=CAMERA_SIZE[0], height=CAMERA_SIZE[1]), "set_roi")
+        # Newest frame first: a request wants "now", not the oldest frame
+        # queued since the last one (the same reasoning as the scale reader).
+        _check(_cam.set_acquisition_mode(_dev, "continuous", order="lifo"), "set_acquisition_mode")
+        _check(_cam.start_acquisition(_dev), "start_acquisition")
+        if CAMERA_FPS:
+            status = _cam.set_frame_rate_op(_dev, CAMERA_FPS)
+            if status != "success":
+                logger.warning("camera frame rate %d not applied: %s", CAMERA_FPS, status)
+        # blocking=True: with False the SDK resets the camera on its own when a
+        # frame is late, which repeats and hides the original problem while the
+        # camera is coming up (guide, section 7.3). Recovery is ours.
+        frame = _cam.get_frame(_dev, timeout=_FIRST_FRAME_TIMEOUT, blocking=True)
+        if isinstance(frame, str):
+            raise RuntimeError(f"first frame: {frame}")
+        return decode_frame(np.array(frame, copy=True), fmt)
 
     def _open_camera() -> bool:
-        """(Re)open the ZED. Caller must hold _camera_lock."""
-        global _camera_last_retry
+        """(Re)open the camera. Caller must hold _camera_lock."""
+        global _cam, _dev, _camera_last_retry
         _camera_last_retry = time.monotonic()
+        if _sdk_error:
+            _camera_failed(_sdk_error)
+            return False
+        _close_camera()
         try:
-            _zed.close()
-        except Exception:
-            pass
-        # Enumerate first so we can distinguish "no camera on USB" (hardware
-        # unplugged / bad cable / wrong port) from "camera present but held by
-        # another process" — a ZED accepts one client at a time, so a
-        # ZED_Explorer left open on the desktop looks exactly like a fault.
-        try:
-            devices = sl.Camera.get_device_list()
+            if _cam is None:
+                _cam = FalconCamera().falcon_controller()
+            devices = list(_cam.get_devices() or [])
         except Exception as e:
-            _camera_failed(f"failed to enumerate USB devices: {e}")
+            _camera_failed(f"failed to enumerate cameras: {e}")
             return False
-        if len(devices) == 0:
-            _camera_failed(
-                "no ZED device detected on USB — check the cable, "
-                "try a different USB 3.0 port, or unplug/replug the camera"
-            )
+        # Re-listed on every open: after a disconnect the camera may come
+        # back under a different identity (guide, section 9).
+        if not devices:
+            _camera_failed(_CAMERA_ERR_NOT_FOUND)
             return False
-        device = devices[0]
-        if device.camera_state == sl.CAMERA_STATE.NOT_AVAILABLE:
-            _camera_failed(
-                "ZED detected but held by another process (ZED_Explorer, "
-                "ZED_Diagnostic or another service) — close it and retry"
-            )
+        name = CAMERA_NAME or devices[0]
+        if name not in devices:
+            _camera_failed(f"camera {name!r} (STREAM_API_CAMERA_NAME) not found; connected: {devices}")
             return False
-        err = _zed.open(_init)
-        if err != sl.ERROR_CODE.SUCCESS:
-            _camera_failed(
-                f"camera open refused (camera detected but the SDK could not "
-                f"start it — check CUDA, the calibration file and USB 3.0): {err}"
-            )
+        status = _cam.open_device(name)
+        if status != "success":
+            _camera_failed(_CAMERA_ERR_BUSY if "busy" in str(status).lower() else f"camera open refused: {status}")
             return False
+        _dev = name
         try:
-            info = _zed.get_camera_information()
-            camera_status["device"] = {
-                "name": str(info.camera_model),
-                "serial": str(info.serial_number),
-                "firmware": str(info.camera_configuration.firmware_version),
-            }
-            try:
-                # The left eye's optics for the mode just opened. fx is the
-                # focal length in pixels: equal at fhd and 2K means equal
-                # pixel pitch, i.e. 2K is a wider view, not a closer one.
-                cam = info.camera_configuration.calibration_parameters.left_cam
-                camera_status["device"].update({
-                    "fx": round(float(cam.fx), 1),
-                    "h_fov": round(float(cam.h_fov), 1),
-                    "v_fov": round(float(cam.v_fov), 1),
-                })
-            except Exception as e:  # pragma: no cover - SDK version differences
-                logger.debug("calibration parameters not readable: %s", e)
-            # Trust the SDK over our table: if it ever opens at a size other
-            # than the one asked for, every box scale in the file follows it.
-            res = info.camera_configuration.resolution
-            if (res.width, res.height) != (_camera_mode["width"], _camera_mode["height"]):
-                logger.warning(
-                    "camera opened at %dx%d, expected %dx%d for mode %s",
-                    res.width, res.height,
-                    _camera_mode["width"], _camera_mode["height"], _camera_mode["name"],
-                )
-                _camera_mode["width"], _camera_mode["height"] = int(res.width), int(res.height)
-            _reset_isp_auto()
+            info = _cam.get_device_info(name)
+            info = list(info) if isinstance(info, tuple) else info
         except Exception as e:
+            info = f"unreadable: {e}"
+        camera_status["device"] = {"name": name, "info": info}
+
+        errors = []
+        for fmt in CAMERA_FORMATS:
             try:
-                _zed.close()
-            except Exception:
-                pass
-            _camera_failed(f"camera opened but initial setup failed: {e}")
+                first = _start(fmt)
+                break
+            except Exception as e:
+                errors.append(f"{fmt}: {e}")
+                try:
+                    _cam.stop_acquisition(_dev)
+                except Exception:
+                    pass
+        else:
+            _close_camera()
+            _camera_failed("camera opened but would not stream — " + "; ".join(errors))
             return False
+        if errors:
+            logger.info("camera formats skipped: %s", "; ".join(errors))
+        camera_status["format"] = fmt
+        camera_status["frame"] = {"width": int(first.shape[1]), "height": int(first.shape[0])}
+        _apply_controls()
         camera_status["ok"] = True
         camera_status["error"] = None
         logger.info(
-            "camera opened: %s serial=%s fw=%s %dx%d@%d",
-            camera_status["device"]["name"],
-            camera_status["device"]["serial"],
-            camera_status["device"]["firmware"],
-            _camera_mode["width"], _camera_mode["height"], _camera_mode["fps"],
+            "camera opened: %s %s %dx%d fps=%s info=%s",
+            name, fmt, first.shape[1], first.shape[0], CAMERA_FPS or "default", info,
         )
         return True
 
-    def _grab_frame():
-        return _grab_views(False)[0]
-
-    def _grab_views(want_right: bool):
-        """One grab, left view always, right view too when asked. Returns
-        (left, right); right is None unless asked. Both None on failure."""
+    def _grab_raw():
+        """One frame as the SDK delivered it, copied out of the SDK's frame
+        pool, with its pixel format. (None, None) if no frame."""
         with _camera_lock:
             if not camera_status["ok"]:
                 if time.monotonic() - _camera_last_retry < _CAMERA_RETRY_COOLDOWN:
                     return None, None
                 if not _open_camera():
                     return None, None
-            # Two attempts per request — masks transient USB hiccups (idle
-            # autosuspend, brief re-enumeration, single stalled frame). On the
-            # first failure we reopen the camera in-line and try once more so
-            # the client sees a valid frame instead of a 503. grab() blocks for
-            # at most a frame period and reports USB loss as an error code
-            # (CAMERA_NOT_DETECTED / CAMERA_REBOOTING), so no timeout is needed.
+            # Two attempts per request: on the first failure the camera is
+            # reopened in-line and read once more, so a USB hiccup costs the
+            # client a slow frame rather than a 503.
             for attempt in (1, 2):
                 try:
-                    err = _zed.grab(_runtime)
-                    if err == sl.ERROR_CODE.SUCCESS:
-                        _zed.retrieve_image(_left, sl.VIEW.LEFT)
-                        # cvtColor also copies out of the reused sl.Mat buffer.
-                        left = cv2.cvtColor(_left.get_data(), cv2.COLOR_BGRA2BGR)
-                        right = None
-                        if want_right:
-                            _zed.retrieve_image(_right, sl.VIEW.RIGHT)
-                            right = cv2.cvtColor(_right.get_data(), cv2.COLOR_BGRA2BGR)
-                        return left, right
-                    raise RuntimeError(str(err))
+                    frame = _cam.get_frame(_dev, timeout=_FRAME_TIMEOUT, blocking=True)
+                    if isinstance(frame, str):
+                        raise RuntimeError(frame)
+                    # Copied: the SDK delivers frames zero-copy from a pool it
+                    # reuses, so the array must not outlive this read.
+                    return np.array(frame, copy=True), camera_status["format"]
                 except Exception as e:
-                    logger.info("frame grab attempt %d failed: %s", attempt, e)
-                    try:
-                        _zed.close()
-                    except Exception:
-                        pass
+                    logger.info("frame read attempt %d failed: %s", attempt, e)
+                    _close_camera()
                     if attempt == 2:
                         _camera_failed(str(e))
                         return None, None
@@ -1313,58 +590,27 @@ if sys.platform == "linux":
             _open_camera()
         return camera_status
 
-    _ISP_SETTINGS = {
-        "brightness": "BRIGHTNESS",
-        "contrast": "CONTRAST",
-        "saturation": "SATURATION",
-    }
-
-    def set_camera_isp(**values: Optional[int]) -> dict:
-        """Apply ISP values now and keep them across reopens. 0-8, caller validates.
-
-        Accepts any subset of _ISP_SETTINGS; None means "leave alone".
-        """
+    def set_camera_controls(values: dict) -> dict:
+        """Apply controls now and keep them across reopens. Returns the
+        SDK's status string per control. A value the camera rejects is not
+        kept; with the camera down, values are kept and applied on the next
+        open (where a rejection is logged)."""
+        results = {}
         with _camera_lock:
-            for key, value in values.items():
-                if value is None:
-                    continue
-                _isp[key] = value
+            for name, value in _ordered_controls(values):
                 if camera_status["ok"]:
                     try:
-                        _zed.set_camera_settings(
-                            getattr(sl.VIDEO_SETTINGS, _ISP_SETTINGS[key]), value
-                        )
+                        status = _apply_control(name, value)
                     except Exception as e:
-                        logger.warning("failed to set %s=%s: %s", key, value, e)
-                        continue
-                camera_status[key] = value
-        logger.info("camera ISP now %s", _isp)
-        return camera_status
-
-    def set_camera_aec_roi(box) -> dict:
-        """Meter auto-exposure on `box` (x1,y1,x2,y2) or the full frame (None).
-
-        Applied now and kept across self-heal reopens, like the ISP values;
-        a service restart returns to STREAM_API_AEC_ROI.
-        """
-        with _camera_lock:
-            _aec_roi["box"] = list(box) if box else None
-            if camera_status["ok"]:
-                _apply_aec_roi()
-        logger.info("camera AEC ROI now %s", _aec_roi["box"] or "full frame")
-        return camera_status
-
-    def set_camera_mode(name: str) -> dict:
-        """Reopen the ZED in another sensor mode. Caller validates the name."""
-        global _camera_last_retry
-        with _camera_lock:
-            _camera_mode.update(_mode_dict(name))
-            _init.camera_resolution = _SL_RESOLUTION[name]
-            _init.camera_fps = _camera_mode["fps"]
-            _camera_last_retry = 0.0
-            _open_camera()
-        logger.info("camera mode now %s", _camera_mode)
-        return camera_status
+                        status = str(e)
+                    if status == "success":
+                        _controls[name] = value
+                else:
+                    status = "pending: camera not open, applied on the next open"
+                    _controls[name] = value
+                results[name] = status
+        logger.info("camera controls %s -> %s", values, results)
+        return results
 
     @app.on_event("startup")
     def _camera_startup():
@@ -1373,126 +619,73 @@ if sys.platform == "linux":
 
     @app.on_event("shutdown")
     def _camera_shutdown():
-        try:
-            _zed.close()
-        except Exception:
-            pass
+        with _camera_lock:
+            _close_camera()
 
 else:
-    camera_status.update({"ok": True, "error": None, "mode": "stub"})
+    def _stub_frame() -> np.ndarray:
+        """A placeholder at the AR2020's full 4:3 size, or a real capture from
+        STREAM_API_STUB_FRAME so a laptop can serve a genuine frame."""
+        path = os.environ.get("STREAM_API_STUB_FRAME")
+        if path:
+            image = cv2.imread(path)
+            if image is not None:
+                return image
+            logger.warning("STREAM_API_STUB_FRAME=%r could not be read", path)
+        w, h = CAMERA_SIZE or (5120, 3840)
+        image = np.zeros((h, w, 3), dtype=np.uint8)
+        cv2.putText(
+            image,
+            "Falcon-2020CRS not available (stub)",
+            (w // 10, h // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            w / 1000,
+            (255, 255, 255),
+            max(2, w // 500),
+        )
+        return image
+
+    _STUB = _stub_frame()  # built once; read-only from here on
+    camera_status.update({
+        "ok": True,
+        "error": None,
+        "mode": "stub",
+        "device": {"name": "stub", "info": None},
+        "format": "BGR",
+        "frame": {"width": int(_STUB.shape[1]), "height": int(_STUB.shape[0])},
+    })
+
+    def _grab_raw():
+        return _STUB, "BGR"
 
     def restart_camera() -> dict:
         """No-op restart for local dev — returns the stub status."""
         return camera_status
 
-    def set_camera_isp(**values: Optional[int]) -> dict:
-        """Record the requested ISP values so the stub answers like the real thing."""
-        for key, value in values.items():
-            if value is not None:
-                camera_status[key] = value
-        return camera_status
-
-    def set_camera_aec_roi(box) -> dict:
-        """Record the metering box so the stub answers like the real thing."""
-        _aec_roi["box"] = list(box) if box else None
-        return camera_status
-
-    def set_camera_mode(name: str) -> dict:
-        """Record the mode so the stub frame comes back at the right size."""
-        _camera_mode.update(_mode_dict(name))
-        return camera_status
-
-    _STUB_FRAME = None
-    if os.environ.get("STREAM_API_STUB_FRAME"):
-        # Dev only: serve a real capture from disk so crop detection and the
-        # image passes can be exercised on a laptop against a genuine frame.
-        _STUB_FRAME = cv2.imread(os.environ["STREAM_API_STUB_FRAME"])
-        if _STUB_FRAME is None:
-            logger.warning("STREAM_API_STUB_FRAME=%r could not be read", os.environ["STREAM_API_STUB_FRAME"])
-
-    _STUB_FRAME_RIGHT = None
-    if os.environ.get("STREAM_API_STUB_FRAME_RIGHT"):
-        _STUB_FRAME_RIGHT = cv2.imread(os.environ["STREAM_API_STUB_FRAME_RIGHT"])
-
-    def _grab_views(want_right: bool):
-        """Stub pair. A real right frame from STREAM_API_STUB_FRAME_RIGHT if
-        given; otherwise the left rolled 80 px (what a right eye sees of a
-        flat tray) with one extra clipped strip painted on the left only, so
-        the fill path has something to do and the estimator a known answer."""
-        left = _grab_frame()
-        if not want_right:
-            return left, None
-        if _STUB_FRAME_RIGHT is not None:
-            return left, cv2.resize(_STUB_FRAME_RIGHT, (left.shape[1], left.shape[0]), interpolation=cv2.INTER_AREA)
-        right = np.roll(left, -80, axis=1)
-        left = left.copy()
-        x = left.shape[1] * 5 // 12
-        left[:, x:x + 40] = 255
-        return left, right
-
-    def _grab_frame():
-        """Return a placeholder frame when no ZED is available."""
-        if _STUB_FRAME is not None:
-            # Mimic the sensor: the reference frame sits at the centre of a
-            # larger mode at the same pixel pitch, with whatever lies beyond
-            # the 1080p edge unknown (grey) — never stretched.
-            ref = _STUB_FRAME
-            if (ref.shape[1], ref.shape[0]) != (CAPTURE_WIDTH, CAPTURE_HEIGHT):
-                ref = cv2.resize(ref, (CAPTURE_WIDTH, CAPTURE_HEIGHT), interpolation=cv2.INTER_AREA)
-            w, h = _camera_mode["width"], _camera_mode["height"]
-            if (w, h) == (CAPTURE_WIDTH, CAPTURE_HEIGHT):
-                return ref
-            frame = np.full((h, w, 3), 96, dtype=np.uint8)
-            ox, oy = (w - CAPTURE_WIDTH) // 2, (h - CAPTURE_HEIGHT) // 2
-            frame[oy:oy + CAPTURE_HEIGHT, ox:ox + CAPTURE_WIDTH] = ref
-            return frame
-        frame = np.zeros((_camera_mode["height"], _camera_mode["width"], 3), dtype=np.uint8)
-        cv2.putText(
-            frame,
-            "ZED 2i not available (stub)",
-            (300, _camera_mode["height"] // 2),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.5,
-            (255, 255, 255),
-            3,
-        )
-        return frame
+    def set_camera_controls(values: dict) -> dict:
+        """Record the values so the stub answers like the real thing."""
+        _controls.update(values)
+        return {name: "stub" for name in values}
 
 
-def _stereo_filled_frame():
-    """Grab both eyes and return the left with its clipped strips filled from
-    the right, or None if no frame. Records what happened in _stereo["last"]."""
-    left, right = _grab_views(True)
-    if left is None:
+def _grab_frame() -> Optional[np.ndarray]:
+    """The newest frame as a BGR image, or None."""
+    raw, fourcc = _grab_raw()
+    if raw is None:
         return None
-    if right is None:
-        _stereo["last"] = {"ok": False, "reason": "no-right-view"}
-        return left
-    shift = _stereo["shift"]
-    if shift is None:
-        shift = estimate_stereo_shift(left, right, _live_box(_crop_box()))
-        if shift is None:
-            _stereo["last"] = {"ok": False, "reason": "no-shift-estimate"}
-            return left
-    out, clipped, filled = fill_clipped_from_right(left, right, shift)
-    _stereo["last"] = {
-        "ok": True,
-        "shift": round(shift, 1),
-        "clipped": f"{clipped:.2%}",
-        "filled": f"{filled:.2%}",
-    }
-    return out
+    try:
+        return decode_frame(raw, fourcc)
+    except ValueError as e:
+        logger.warning("camera frame dropped: %s", e)
+        return None
 
 
-def get_color_frame(width: int, height: int):
-    """Grab a frame and resize if smaller than capture resolution."""
+def get_color_frame(preset: Optional[str] = None):
+    """Grab a frame, scaled down to fit the preset if one is given."""
     image = _grab_frame()
     if image is None:
         return None
-    if (width, height) != (image.shape[1], image.shape[0]):
-        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
-    return image
-
+    return _fit(image, preset)
 
 # ---------------------------------------------------------------------------
 # Scale — serial port on Linux; stub on other platforms for local dev
@@ -2209,10 +1402,10 @@ else:
 # Generators
 # ---------------------------------------------------------------------------
 
-def generate_mjpeg(width: int, height: int):
+def generate_mjpeg(preset: Optional[str]):
     """Yield MJPEG frames; ends cleanly if the camera goes down."""
     while True:
-        image = get_color_frame(width, height)
+        image = get_color_frame(preset)
         if image is None:
             if not camera_status["ok"]:
                 return
@@ -2408,348 +1601,80 @@ def system_stats():
 # Camera endpoints
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# De-glare — on by default, because the clients that matter cannot ask for it
-# ---------------------------------------------------------------------------
-#
-# The overhead light strips mirror off the polished tray as bright vertical
-# bands. The camera's polarizer does not clear them at this geometry (a
-# polarizer works best at ~50-60 deg off the surface; the camera looks almost
-# straight down), so they arrive in the frame and drag auto-exposure down with
-# them — measured 2026-09-23, the clean tray sat at L median 86 while the worst
-# band sat at 222 with 37% of it above 250.
-#
-# They are recoverable because they are NOT hard-clipped: no pixel reached 255
-# in luminance and only ~20% of the worst band had even one channel maxed, so
-# the grid lines stay readable through the glare. A band is a smooth,
-# low-frequency brightness field laid over the tray, so estimating that field
-# with a large blur and dividing it out removes it while leaving the texture.
-# On that capture the worst band went 222 -> 156 with nothing left above 250,
-# and the clean tray came UP 86 -> 109 — the correction evens the illumination
-# rather than just darkening. Checked for halos around the fish: none at
-# sigma 60, which is well above fish-sized detail. The residual hard specular
-# spots are the genuinely clipped ~20% and no amount of processing returns
-# those; the fix for them is at the lamp, not here.
-#
-# DEFAULT ON, unlike enhance_for_text(). The mobile app sends no query params
-# and the AI pipeline fetches bare /capture, so anything those two need has to
-# be the default — an opt-in flag would simply never be passed. ?deglare=false
-# is there for an A/B, and POST /camera/deglare tunes it live from the Jetson
-# without a restart, same as the brightness endpoint.
-def _keep_chroma(lab: np.ndarray, l_before: np.ndarray) -> None:
-    """Scale a*/b* in place by how much L moved, so saturation survives it.
-
-    Clamped to 0.5-2x so a near-black pixel lifted a long way cannot be pushed
-    into false colour.
-    """
-    k = (lab[:, :, 0].astype(np.float32) + 1.0) / (l_before.astype(np.float32) + 1.0)
-    k = np.clip(k, 0.5, 2.0)[:, :, None]
-    ab = 128.0 + (lab[:, :, 1:].astype(np.float32) - 128.0) * k
-    lab[:, :, 1:] = np.clip(ab, 0, 255).astype(np.uint8)
-
-
-def reduce_glare(
-    image: np.ndarray, sigma: float, strength: float, keep_chroma: bool = False
-) -> np.ndarray:
-    """Flatten the specular bands by dividing out a blurred illumination estimate.
-
-    `strength` is 0.0-1.0 and blends against the original, so a half-measure is
-    possible when a full correction looks too flat. Works on L only; the colour
-    channels are untouched, which is what keeps the fish looking like fish —
-    unless `keep_chroma`, which scales them with L (see _chroma).
-    """
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l_before = lab[:, :, 0].copy()
-    L = l_before.astype(np.float32)
-    illum = cv2.GaussianBlur(L, (0, 0), sigma)
-    # Renormalise to the scene's own median so the frame keeps its overall
-    # brightness instead of drifting with the size of the glare.
-    flat = L / np.maximum(illum, 1.0) * float(np.median(illum))
-    if strength < 1.0:
-        flat = L + strength * (flat - L)
-    lab[:, :, 0] = np.clip(flat, 0, 255).astype(np.uint8)
-    if keep_chroma:
-        _keep_chroma(lab, l_before)
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-
-# enhance_for_text() is opt-in (?enhance=true). It was the default while the
-# D435 was held at a short 80 µs manual exposure to keep the tray's glare bands
-# recoverable — the raw frame was dark on purpose, worst at 4-6am with no
-# ambient light, and the AI client fetches bare /capture. The ZED 2i runs its
-# own auto-exposure behind a polarizer, so the raw frame is now the AI input
-# and this stays as an A/B tool and a rescue for a dark scene. The constants
-# below and their history are kept as-is; nothing about the lift depends on
-# which sensor produced the frame.
-#
-# The shadow lift is ADAPTIVE. A fixed gamma-0.6 lift was right for the client's
-# dark 10-Sep capture (tray median 74 -> 136) but on a brighter 4:40am frame a
-# week later (raw median 117) the same lift pushed the silver fish in the right
-# column up to a washed-out ~160-190 with no gradation left. So after CLAHE the
-# L-channel median of the central 80% of the frame is measured and the gamma is
-# chosen to land it on ENHANCE_TARGET_MEDIAN, clamped to [ENHANCE_GAMMA_MIN,
-# ENHANCE_GAMMA_MAX]: a dark frame gets the full lift, a frame that is already
-# bright enough gets none (gamma 1.0 = CLAHE + unsharp only). The centre crop
-# excludes the tray rim and any hands at the edge of frame so a glove in shot
-# doesn't swing the exposure of the whole picture.
-#
-# Tuned for a "neutral" look on 15-Sep after the client called the first
-# adaptive output (target 130, CLAHE clip 3.0, unsharp 1.5) dark: heavy CLAHE
-# gives a gritty, high-contrast frame that reads as dark even at the same
-# median. Softer local contrast (clip 1.5), a lighter unsharp (1.3) and a
-# higher target look natural without pushing the silver fish to white.
-# Raising the sensor exposure is NOT the lever for this: the raw already sits
-# at median ~120-135 and more exposure only widens the saturated glare bands.
-#
-# Target lowered 155 -> 140 on 17-Sep: the client preferred the raw frame
-# (tray median 135) over the lifted one (146) and asked for "a little bit
-# dark". At 140 a normally lit frame gets almost no lift (135 -> 131) while a
-# dark 4-6am frame like the 10-Sep original (77) is still rescued to 123.
-# (Raw-by-default was rejected at the time for exactly that frame; it became
-# the default only once the ZED's auto-exposure removed the dark raw frame.)
-ENHANCE_TARGET_MEDIAN = 140
-ENHANCE_GAMMA_MIN = 0.6   # strongest lift — the original fixed value
-ENHANCE_GAMMA_MAX = 1.0   # no lift
-ENHANCE_CLAHE_CLIP = 1.5  # was 3.0 — lower = smoother, less grain on the steel
-ENHANCE_UNSHARP = 1.3     # was 1.5 — output = UNSHARP*img - (UNSHARP-1)*blur
-_ENHANCE_GAMMA_STEP = 0.02  # LUTs are cached per quantised gamma
-
-
-@functools.lru_cache(maxsize=32)
-def _gamma_lut(gamma: float) -> np.ndarray:
-    return np.array(
-        [((i / 255.0) ** gamma) * 255.0 for i in range(256)], dtype=np.uint8
-    )
-
-
-def _choose_lift_gamma(l: np.ndarray) -> tuple[float, int]:
-    """Pick the gamma that lands the centre-crop median on the target. Returns (gamma, median)."""
-    h, w = l.shape[:2]
-    centre = l[int(h * 0.1):int(h * 0.9), int(w * 0.1):int(w * 0.9)]
-    median = int(np.median(centre)) if centre.size else 0
-    if median <= 0:
-        return ENHANCE_GAMMA_MIN, median
-    if median >= ENHANCE_TARGET_MEDIAN:
-        return ENHANCE_GAMMA_MAX, median
-    gamma = math.log(ENHANCE_TARGET_MEDIAN / 255.0) / math.log(median / 255.0)
-    gamma = min(max(gamma, ENHANCE_GAMMA_MIN), ENHANCE_GAMMA_MAX)
-    gamma = round(gamma / _ENHANCE_GAMMA_STEP) * _ENHANCE_GAMMA_STEP
-    return round(gamma, 2), median
-
-
-def enhance_for_text(
-    image: np.ndarray, stats: dict | None = None, keep_chroma: bool = False
-) -> np.ndarray:
-    """LAB CLAHE + adaptive shadow gamma lift + unsharp — default /capture post-processing.
-
-    If `stats` is given it is filled with the chosen `gamma` and the measured
-    `median` so /capture can report them in response headers. `keep_chroma`
-    scales a*/b* with the lightness CLAHE and the lift add (see _chroma).
-    """
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    l_before = l
-    # Local contrast — recovers detail in near-saturated bright bands (where a
-    # low-exposure capture leaves headroom to work with). Kept gentle: see
-    # ENHANCE_CLAHE_CLIP.
-    l = cv2.createCLAHE(clipLimit=ENHANCE_CLAHE_CLIP, tileGridSize=(8, 8)).apply(l)
-    # Shadow lift, only as much as this frame needs (see ENHANCE_* above).
-    gamma, median = _choose_lift_gamma(l)
-    if stats is not None:
-        stats["gamma"] = gamma
-        stats["median"] = median
-    if gamma < ENHANCE_GAMMA_MAX:
-        l = cv2.LUT(l, _gamma_lut(gamma))
-    lab = cv2.merge((l, a, b))
-    if keep_chroma:
-        _keep_chroma(lab, l_before)
-    out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    blurred = cv2.GaussianBlur(out, (0, 0), sigmaX=1.5)
-    return cv2.addWeighted(out, ENHANCE_UNSHARP, blurred, -(ENHANCE_UNSHARP - 1.0), 0)
-
-
 @app.get("/stream", summary="Live MJPEG color stream")
 def stream(preset: Preset = "fhd"):
-    width, height = RESOLUTIONS[preset]
+    """
+    The full camera view, scaled down to fit the preset (aspect kept). A 20 MP
+    frame is decoded and re-encoded per frame here, so the frame rate depends
+    on the camera format and the Jetson's CPU; /capture is the full-quality path.
+    """
     # Probe once to trigger a lazy camera reopen if the camera has dropped.
-    if get_color_frame(width, height) is None:
+    if get_color_frame(preset) is None:
         return JSONResponse(
             content={"error": "camera not available", "detail": camera_status["error"]},
             status_code=503,
         )
     return StreamingResponse(
-        generate_mjpeg(width, height),
+        generate_mjpeg(preset),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
+def _is_whole_jpeg(raw: np.ndarray) -> bool:
+    """SOI at the start and EOI at the end — a frame cut short by USB
+    bandwidth fails this, and is retried as a 503 rather than served torn."""
+    b = raw.reshape(-1)
+    return b.size > 4 and b[0] == 0xFF and b[1] == 0xD8 and b[-2] == 0xFF and b[-1] == 0xD9
+
+
 @app.get("/capture", summary="Capture a single JPEG image")
-def capture(
-    preset: Optional[Preset] = None,
-    enhance: Optional[bool] = None,
-    crop: bool = True,
-    deglare: bool = True,
-    fish: Optional[bool] = None,
-    chroma: Optional[bool] = None,
-):
+def capture(preset: Optional[Preset] = None):
     """
-    chroma:   scale the colour with the lightness de-glare and enhance add,
-              so a fish they brighten keeps its saturation instead of going
-              grey. Unset follows the server default (POST /camera/chroma,
-              STREAM_API_KEEP_CHROMA), which ships OFF until it is A/B'd on
-              site. Reported in X-Keep-Chroma when either pass ran.
-    enhance:  CLAHE + adaptive gamma lift + unsharp. Unset follows the server
-              default (POST /camera/enhance, STREAM_API_ENHANCE), which ships
-              ON because the de-glare pass evens out the illumination and so
-              flattens the frame. Pass ?enhance=false for a single flat A/B
-              frame. The lift chosen is reported in X-Enhance-Gamma /
-              X-Enhance-Median.
-    deglare:  default true — flatten the specular bands the overhead lights
-              throw across the tray. On by default because the mobile app and
-              the AI pipeline send no query params, so the default is the only
-              image they can get. Tune or disable it live with
-              POST /camera/deglare; pass ?deglare=false for a single raw A/B
-              frame. Reported in X-Deglare.
-    crop:     default true — cut to the inspection tray's rim, if a box is
-              set (POST /camera/crop or STREAM_API_CROP; reported in the
-              X-Crop header and in /health). Everything outside the tray is
-              clutter for the AI client, which fetches bare /capture. Pass
-              ?crop=false for the full frame, which is what you want when
-              re-aiming the camera or checking the box. An optional inset
-              (POST /camera/crop?inset=auto, off by default) cuts further
-              in to the floor edge, dropping the walls; X-Crop-Inset says
-              what was applied.
-    fish:     cut the cropped tray down to the box around the fish on it,
-              plus a margin. Unset follows the server default (POST
-              /camera/crop?fish=, STREAM_API_CROP_FISH), which ships OFF
-              (2026-11-05): the default image is the whole tray up to its
-              edges. Pass ?fish=true to cut to the fish on a single
-              request; a bare tray, or one where nothing is found, still
-              gets the plain tray crop. X-Crop-Fish carries
-              the fish count and the box, or "none"; X-Crop is always the
-              box actually served. Needs crop on.
-    preset:   unset, the frame comes back at the sensor's native size for the
-              mode in force (1920x1080, or 2208x1242 after POST
-              /camera/resolution?value=2k — a wider view at the same pixel
-              pitch, so a cropped capture is the same image in both modes)
-              and is never resampled. Uncropped,
-              a preset resizes to its exact dimensions, as it always has.
-              Cropped, it is applied as a scale factor against the 1920 px
-              reference width so the tray keeps its aspect ratio and the
-              same preset gives the same image in either sensor mode. Reported in
-              X-Resolution.
+    The camera's frame, unprocessed: no crop, no de-glare, no enhance. The
+    picture is whatever the camera's own ISP produces under the controls in
+    force (POST /camera/controls).
+
+    preset: unset, the frame comes back at the camera's native size. When the
+            camera streams MJPEG this is the camera's own JPEG, byte for byte,
+            neither decoded nor re-encoded. Set, the frame is scaled down to
+            fit the preset's box with its aspect kept (the AR2020 is 4:3, so
+            fhd is 1440x1080).
+
+    Headers: X-Resolution (the size returned), X-Pixel-Format (what the
+    camera streamed).
+
+    Query params from the ZED branches (crop, deglare, enhance, fish, chroma)
+    are no longer read; a client still sending them gets the plain frame.
     """
-    native = (_camera_mode["width"], _camera_mode["height"])
-    full = None
-    fish_box = None
-    if _stereo["enabled"]:
-        full = _stereo_filled_frame()
-    box = None
-    if crop and _crop["mode"] != "off":
-        # Crop from the full-resolution frame, then scale — cropping a frame
-        # that was already downscaled to the preset would throw away the
-        # resolution the crop exists to preserve. Auto mode needs the full
-        # frame anyway: the tray is found on this very frame.
-        image = full if full is not None else get_color_frame(*native)
-        if image is not None and (_crop["mode"] == "auto" or _crop["inset"]["mode"] == "auto"):
-            _auto_crop(image)
-        box = _live_box(_crop_box())
-        if image is not None and box and (_crop["fish"]["enabled"] if fish is None else fish):
-            # Found on the full frame now, cut at the very end — see _fish_crop.
-            fish_box = _live_box(_fish_crop(image, _crop_box()))
-    elif full is not None:
-        image = cv2.resize(full, RESOLUTIONS[preset], interpolation=cv2.INTER_AREA) if preset else full
-    else:
-        image = get_color_frame(*(RESOLUTIONS[preset] if preset else native))
-    if image is None:
+    raw, fourcc = _grab_raw()
+    if raw is None:
         return JSONResponse(
             content={"error": "camera not available", "detail": camera_status["error"]},
             status_code=503,
         )
-    headers: dict[str, str] = {}
-    if _stereo["enabled"] and _stereo["last"]:
-        headers["X-Stereo-Fill"] = ";".join(f"{k}={v}" for k, v in _stereo["last"].items())
-    if _aec_roi["box"]:
-        # The frame itself was exposed differently — worth knowing when the
-        # saved A/B captures are compared later.
-        headers["X-Aec-Roi"] = ",".join(str(v) for v in _aec_roi["box"])
-    if box:
-        x1, y1, x2, y2 = box
-        image = image[y1:y2, x1:x2]
-        headers["X-Crop-Source"] = str(_crop["source"])
-        ins = _crop["inset"]
-        headers["X-Crop-Inset"] = (
-            "off" if ins["mode"] == "off" or not ins["px"]
-            else f"{ins['source']};" + ",".join(str(v) for v in ins["px"])
-        )
-        # Against the reference width, not the live one, so ?preset=sd of a
-        # cropped tray is the same image whichever mode the sensor is in.
-        scale = RESOLUTIONS[preset][0] / CAPTURE_WIDTH if preset else 1.0
-        crop_scale = scale
-        if scale != 1.0:
-            image = cv2.resize(
-                image,
-                (max(1, round(image.shape[1] * scale)), max(1, round(image.shape[0] * scale))),
-                interpolation=cv2.INTER_AREA,
+    headers = {"X-Pixel-Format": fourcc}
+    if preset is None and fourcc == "MJPG":
+        if not _is_whole_jpeg(raw):
+            return JSONResponse(
+                content={"error": "camera not available", "detail": "the camera delivered a truncated JPEG frame"},
+                status_code=503,
             )
-    # Reference pixels per output pixel — the one ratio the de-glare radius
-    # and the mm-per-pixel header both need. A live pixel is a reference
-    # pixel in every mode, so the crop box and the native width are already
-    # in reference units; only presets and crop scaling move it off 1.0.
-    ref_per_out = ((box[2] - box[0]) if box else native[0]) / image.shape[1]
-    keep_chroma = _chroma["keep"] if chroma is None else chroma
-    do_enhance = _enhance["default"] if enhance is None else enhance
-    if (deglare and _deglare["strength"] > 0) or do_enhance:
-        headers["X-Keep-Chroma"] = "1" if keep_chroma else "0"
-    if deglare and _deglare["strength"] > 0:
-        # After the geometry, so sigma scales with the preset and the correction
-        # looks the same whatever size was asked for. Before enhance, so the
-        # adaptive lift measures an already-even frame rather than one whose
-        # median is being dragged around by the glare.
-        # sigma is in reference pixels; one reference pixel is one live pixel
-        # in every mode, so only the preset scaling changes it.
-        sigma = _deglare["sigma"] / ref_per_out
-        image = reduce_glare(
-            image, max(2.0, sigma), _deglare["strength"] / 100.0, keep_chroma
+        frame = camera_status["frame"] or {}
+        headers["X-Resolution"] = f"{frame.get('width')}x{frame.get('height')}"
+        return Response(content=raw.tobytes(), media_type="image/jpeg", headers=headers)
+    try:
+        image = _fit(decode_frame(raw, fourcc), preset)
+    except ValueError as e:
+        return JSONResponse(
+            content={"error": "camera not available", "detail": str(e)},
+            status_code=503,
         )
-        headers["X-Deglare"] = f"{_deglare['strength']},{_deglare['sigma']}"
-    if do_enhance:
-        stats: dict = {}
-        image = enhance_for_text(image, stats, keep_chroma)
-        # Surface what the adaptive lift did so an on-site A/B needs no guesswork.
-        headers["X-Enhance-Gamma"] = str(stats["gamma"])
-        headers["X-Enhance-Median"] = str(stats["median"])
-    # Physical scale of THIS image: the reference-frame value corrected by how
-    # many output pixels each reference pixel became (crop scaling, presets).
-    # 2K changes nothing here — same pixel pitch — so a bare 2K capture
-    # carries the same number as a bare 1080p one.
-    headers["X-Mm-Per-Px"] = f"{_scale['mm_per_px'] * ref_per_out:.4f}"
-    if box:
-        if fish_box is not None:
-            # Last, on the de-glared and enhanced tray crop. A cut only, never
-            # a resample, so X-Mm-Per-Px above holds for the fish image too.
-            det = _crop["fish"]["detected"] or {}
-            # "none" when the whole tray is served (the hold can keep a fish
-            # box through a miss, and can serve the tray through a find).
-            headers["X-Crop-Fish"] = (
-                f"{det.get('fish', 0)};" + ",".join(str(v) for v in fish_box)
-                if det.get("served") != list(_crop_box() or ()) else "none"
-            )
-            headers["X-Crop-Fish-Hold"] = det.get("hold", "fresh")
-            h, w = image.shape[:2]
-            cx1 = min(w - 1, max(0, round((fish_box[0] - box[0]) * crop_scale)))
-            cy1 = min(h - 1, max(0, round((fish_box[1] - box[1]) * crop_scale)))
-            cx2 = min(w, max(cx1 + 1, round((fish_box[2] - box[0]) * crop_scale)))
-            cy2 = min(h, max(cy1 + 1, round((fish_box[3] - box[1]) * crop_scale)))
-            image = image[cy1:cy2, cx1:cx2]
-            box = fish_box
-        headers["X-Crop"] = ",".join(str(v) for v in box)
     headers["X-Resolution"] = f"{image.shape[1]}x{image.shape[0]}"
     _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 100])
     return Response(content=jpeg.tobytes(), media_type="image/jpeg", headers=headers)
 
 
-@app.post("/camera/restart", summary="Force a ZED camera close+reopen")
+@app.post("/camera/restart", summary="Force a camera close+reopen")
 def camera_restart():
     status = restart_camera()
     return JSONResponse(
@@ -2758,358 +1683,65 @@ def camera_restart():
     )
 
 
-@app.post("/camera/resolution", summary="Switch the sensor mode live (fhd 1080p@30 / 2k @15)")
-def camera_resolution(value: CameraMode = Query(...)):
-    """
-    value: fhd — 1920x1080 at 30 fps.
-           2k  — 2208x1242 at 15 fps, the default since 2026-10-18. Same
-                 pixel pitch and focal length, so
-                 the same pixels per fish: it is a 15% wider view, not a
-                 sharper one, at half the frame rate. /health camera.device
-                 reports fx and the field of view for the mode in force.
-
-    Closes and reopens the camera (~2 s); /stream clients drop and reconnect.
-    A bare /capture returns the native size of the mode in force. Crop and
-    AEC boxes are kept in 1080p coordinates and offset to the live frame, so
-    nothing measured needs re-entering and a cropped capture is the same
-    image in either mode.
-
-    Survives a self-heal reopen but NOT a service restart, which returns to
-    STREAM_API_CAMERA_MODE.
-    """
-    status = set_camera_mode(value)
-    return JSONResponse(
-        content={"camera": status},
-        status_code=200 if status["ok"] else 503,
-    )
-
-
-@app.post("/camera/enhance", summary="Flip the /capture enhance default live")
-def camera_enhance(value: bool = Query(...)):
-    """
-    Sets what a param-less /capture returns — which is the only thing the
-    mobile app and the AI pipeline can receive, since neither sends query
-    params. ?enhance= on a single request still overrides it either way.
-
-    Resets to STREAM_API_ENHANCE on service restart.
-    """
-    _enhance["default"] = value
-    logger.info("capture enhance default set to %s", value)
-    return {"enhance": dict(_enhance)}
-
-
-@app.post("/camera/chroma", summary="Flip the /capture keep-chroma default live")
-def camera_chroma(value: bool = Query(...)):
-    """
-    Sets whether a param-less /capture scales the colour with the lightness
-    de-glare and enhance add. ?chroma= on a single request still overrides it.
-
-    Resets to STREAM_API_KEEP_CHROMA on service restart.
-    """
-    _chroma["keep"] = value
-    logger.info("capture keep-chroma default set to %s", value)
-    return {"chroma": dict(_chroma)}
-
-
-@app.post("/camera/deglare", summary="Tune the de-glare pass live (on-site A/B)")
-def camera_deglare(
-    strength: Optional[int] = Query(None, ge=0, le=100),
-    sigma: Optional[int] = Query(None, ge=10, le=300),
+@app.post("/camera/controls", summary="Set the camera's own ISP controls (exposure, white balance, colour, HDR, ...)")
+def camera_controls(
+    auto_exposure: Optional[int] = Query(None, description="1 auto (the default), 0 manual"),
+    exposure: Optional[int] = Query(None, description="Manual exposure in ms; needs auto_exposure=0"),
+    gain: Optional[int] = Query(None, description="Analogue gain"),
+    roi_exposure: Optional[str] = Query(
+        None,
+        description="mode,x,y,size: meter auto-exposure on a window instead of the whole frame "
+        "(mode 0 = full frame; x, y on a 0-255 grid)",
+    ),
+    brightness: Optional[int] = Query(None),
+    auto_white_balance: Optional[int] = Query(None, description="1 auto (the default), 0 manual"),
+    white_balance: Optional[int] = Query(None, description="Manual white balance; needs auto_white_balance=0"),
+    contrast: Optional[int] = Query(None),
+    saturation: Optional[int] = Query(None),
+    hue: Optional[int] = Query(None),
+    gamma: Optional[int] = Query(None),
+    sharpness: Optional[int] = Query(None),
+    black_level: Optional[int] = Query(None),
+    denoise: Optional[int] = Query(None, description="0-15"),
+    hdr: Optional[int] = Query(None, description="1 off, 2 auto"),
+    tone_control: Optional[int] = Query(None),
+    color_mode: Optional[int] = Query(None),
+    scene_mode: Optional[int] = Query(None),
+    flicker: Optional[int] = Query(None, description="0 auto, 1 50 Hz, 2 60 Hz"),
+    flip: Optional[int] = Query(None, description="0 none, 1 horizontal, 2 vertical, 3 both"),
 ):
     """
-    strength: 0-100. 0 disables de-glare for every client; 100 is a full
-              correction. Lower it if the flattened tray looks too even.
-    sigma:    radius of the illumination estimate, in full-frame pixels.
-              Larger = gentler and only touches the broadest bands; smaller =
-              stronger, but below ~40 it starts to see the fish themselves and
-              can leave halos. 60 is the measured default.
+    The camera's built-in controls, applied in the camera. Send any subset;
+    omitted controls are left alone. The camera validates each value, and a
+    rejection comes back in `results` with the SDK's message, which names the
+    valid range (400 if any was rejected).
 
-    Omitted values are left alone. Survives nothing but the process — a service
-    restart returns to STREAM_API_DEGLARE_STRENGTH / _SIGMA, so set those in
-    the unit to keep a value.
+    Values survive a self-heal reopen but NOT a service restart, which
+    returns to the STREAM_API_CAMERA_<NAME> environment (auto exposure and
+    auto white balance on, everything else at the camera's default). Set the
+    env var in the unit to make a value permanent. They change the sensor, so
+    /stream moves with them, not only /capture.
     """
-    if strength is not None:
-        _deglare["strength"] = strength
-    if sigma is not None:
-        _deglare["sigma"] = sigma
-    logger.info("deglare set to strength=%(strength)s sigma=%(sigma)s", _deglare)
-    return {"deglare": dict(_deglare)}
-
-
-@app.post("/camera/brightness", summary="Set the ZED ISP brightness/contrast/saturation (on-site A/B)")
-def camera_brightness(
-    value: Optional[int] = Query(None, ge=0, le=8),
-    contrast: Optional[int] = Query(None, ge=0, le=8),
-    saturation: Optional[int] = Query(None, ge=0, le=8),
-):
-    """
-    value:      ISP output brightness, 0-8 (SDK default 4).
-    contrast:   ISP contrast, 0-8 (SDK default 4). Raising this is the in-camera
-                answer to the flatness the de-glare pass leaves behind — it adds
-                punch before the software correction rather than after it.
-    saturation: ISP colour saturation, 0-8 (SDK default 4, service default
-                6). The fish on the steel tray come out almost grey at 4
-                (saturation ~10/255 against ~17 on the client's phone); 6
-                brings the red and orange species back without touching
-                exposure. Try one step at a time and judge on the silver
-                fish — they must stay silver.
-
-    Neither is manual exposure; auto-exposure and auto-WB keep running. Omitted
-    values are left alone.
-
-    For tuning without a redeploy: POST a value, GET /capture, compare. Values
-    survive a self-heal reopen but NOT a service restart, which returns to
-    STREAM_API_CAMERA_BRIGHTNESS / _CONTRAST. Set those in the unit to keep one.
-
-    Brightness cannot recover blown highlights — specular glare saturates at
-    the sensor, so lowering it dims the whole frame without bringing the bands
-    back. See ZED_MIGRATION.md.
-    """
-    status = set_camera_isp(brightness=value, contrast=contrast, saturation=saturation)
-    return JSONResponse(
-        content={"camera": status},
-        status_code=200 if status["ok"] else 503,
-    )
-
-
-@app.post("/camera/aec-roi", summary="Meter auto-exposure on the tray only (on-site A/B)")
-def camera_aec_roi(
-    value: bool = Query(...),
-    box: Optional[str] = Query(None),
-):
-    """
-    value: true  — auto-exposure meters only the tray (the /capture crop box,
-                   or ?box= if given) and ignores everything outside it.
-           false — back to full-frame metering, the camera's default.
-    box:   optional x1,y1,x2,y2 in full-frame (1920x1080) pixels, to meter a
-           region other than the crop box — e.g. just where the fish sit.
-
-    This is the ZED's built-in lever for the glare bands dragging the exposure
-    down: with the bands out of the metering region the fish come up. It is
-    not free — brighter fish means more of the bands hard-clip, and that is
-    the part de-glare cannot recover. So: POST true, GET /capture, POST false,
-    GET /capture again, and keep whichever the fish look better in. The
-    X-Aec-Roi header on each capture says which one you are looking at.
-
-    Not manual exposure — AEC/AGC keeps running, it just looks at less of the
-    frame. It changes the sensor, so /stream shifts too, not only /capture.
-
-    Survives a self-heal reopen but NOT a service restart, which returns to
-    STREAM_API_AEC_ROI ("" = off, "tray" = crop box, or x1,y1,x2,y2).
-    """
-    roi = None
-    if value:
-        roi = _parse_crop(box, "box") if box is not None else _crop_box()
+    values = {k: v for k, v in locals().items() if v is not None}
+    if not values:
+        return JSONResponse(
+            content={"error": "no control given", "detail": "pass one or more of: " + ", ".join(CAMERA_CONTROLS)},
+            status_code=400,
+        )
+    if "roi_exposure" in values:
+        roi = _parse_roi_exposure(values["roi_exposure"])
         if roi is None:
             return JSONResponse(
-                content={
-                    "error": "no metering box",
-                    "detail": "?box= is not a valid x1,y1,x2,y2"
-                    if box is not None
-                    else "the crop box is disabled (STREAM_API_CROP is empty) — pass ?box=x1,y1,x2,y2",
-                },
+                content={"error": "bad roi_exposure", "detail": "roi_exposure must be mode,x,y,size"},
                 status_code=400,
             )
-    status = set_camera_aec_roi(roi)
-    return JSONResponse(
-        content={"camera": status},
-        status_code=200 if status["ok"] else 503,
-    )
-
-
-@app.post("/camera/crop", summary="Set the /capture crop: auto-detect, a fixed box, or off")
-def camera_crop(
-    value: Optional[str] = Query(None),
-    box: Optional[str] = Query(None),
-    inset: Optional[str] = Query(None),
-    fish: Optional[bool] = Query(None),
-    fish_margin: Optional[int] = Query(None, ge=0, le=400),
-):
-    """
-    value: auto  — find the tray on every cropped capture (detect_tray) and
-                   follow it when the camera or table is moved. The current
-                   box, or ?box= if given, is the fallback until the first
-                   detection. This is the shipped default.
-           true  — pin a fixed box: ?box= required the first time, omitted
-                   afterwards keeps the current one.
-           false — full frame for everyone.
-    inset: how far in from the rim box the served box sits, so the sloped
-           walls are left out and the AI gets the floor only.
-           auto    — find the floor edge inside the rim on every cropped
-                     capture (detect_floor); the inset in force is the
-                     fallback until the first detection.
-           l,t,r,b — pin it, in 1920x1080 pixels per side; a single number
-                     applies to all four.
-           off     — serve the rim box, tray edges included. The shipped
-                     default: the floor-only capture was rejected on sight.
-    fish:  true/false — the server default for cutting a cropped capture
-           down to the box around the fish (detect_fish). A bare tray or a
-           miss serves the tray crop either way.
-    fish_margin: reference px kept around the fish, 0-400 (default 40).
-           Raise it if a silver fish ever comes back with a clipped end.
-           Any of these parameters may be sent alone; the rest are left as
-           they are.
-    box:   x1,y1,x2,y2 in 1920x1080 pixels, read off a ?crop=false capture
-           at fhd. In 2K mode the frame is 144 px wider on each side and
-           81 px taller top and bottom at the same pixel pitch, so subtract
-           that offset if you measure on a 2K frame; the service adds it back.
-
-    Pure software, nothing is sent to the camera, so it applies to the next
-    capture immediately. ?crop=false on a single request still overrides it.
-    Survives anything but a service restart, which returns to STREAM_API_CROP.
-    /health camera.crop shows mode, source and the last detection; every
-    cropped capture carries X-Crop and X-Crop-Source (auto/manual/fallback).
-    """
-    if value is None and inset is None and fish is None and fish_margin is None:
-        return JSONResponse(
-            content={"error": "bad value", "detail": "pass ?value=, ?inset=, ?fish= and/or ?fish_margin="},
-            status_code=400,
-        )
-    if fish is not None:
-        _crop["fish"]["enabled"] = fish
-    if fish_margin is not None:
-        _crop["fish"]["margin"] = fish_margin
-    if inset is not None:
-        mode, px = _parse_inset(inset, "inset")
-        if mode == "off" and inset.strip().lower() not in _INSET_OFF_WORDS:
-            return JSONResponse(
-                content={"error": "bad inset", "detail": "inset must be auto, off, n or l,t,r,b"},
-                status_code=400,
-            )
-        ins = _crop["inset"]
-        if mode == "auto":
-            if ins["mode"] != "auto":
-                # Whatever was in force stays as the fallback until the first detection.
-                ins["source"] = "fallback" if ins["px"] else None
-            ins["mode"] = "auto"
-        elif mode == "fixed":
-            ins.update({"mode": "fixed", "px": px, "source": "fixed"})
-        else:
-            # px is kept so a later ?inset=auto has a fallback.
-            ins.update({"mode": "off", "source": None})
-    v = (value or "").strip().lower()
-    if value is None:
-        pass
-    elif v == "auto":
-        if box is not None:
-            seed = _parse_crop(box, "box")
-            if seed is None:
-                return JSONResponse(
-                    content={"error": "no crop box", "detail": "?box= is not a valid x1,y1,x2,y2"},
-                    status_code=400,
-                )
-            _crop["box"] = list(seed)
-            _crop["source"] = "fallback"
-        elif _crop["source"] != "auto":
-            _crop["source"] = "fallback" if _crop["box"] else None
-        _crop["mode"] = "auto"
-    elif v in ("true", "1", "on", "yes"):
-        new = _parse_crop(box, "box") if box is not None else _crop["box"]
-        if new is None:
-            return JSONResponse(
-                content={
-                    "error": "no crop box",
-                    "detail": "?box= is not a valid x1,y1,x2,y2"
-                    if box is not None
-                    else "no box is set — pass ?box=x1,y1,x2,y2",
-                },
-                status_code=400,
-            )
-        _crop.update({"box": list(new), "mode": "manual", "source": "manual"})
-    elif v in ("false", "0", "off", "no"):
-        _crop.update({"box": None, "mode": "off", "source": None})
-    else:
-        return JSONResponse(
-            content={"error": "bad value", "detail": "value must be auto, true or false"},
-            status_code=400,
-        )
-    logger.info(
-        "capture crop now mode=%s box=%s inset=%s/%s fish=%s/%d",
-        _crop["mode"], _crop["box"], _crop["inset"]["mode"], _crop["inset"]["px"],
-        _crop["fish"]["enabled"], _crop["fish"]["margin"],
-    )
-    return {"crop": dict(_crop)}
-
-
-@app.get("/capture/stereo", summary="Debug: raw left/right pair as one side-by-side JPEG")
-def capture_stereo(eye: Literal["both", "left", "right"] = "both"):
-    """
-    Raw full frames straight off the sensor, no crop and no processing. `both`
-    returns left|right side by side (3840x1080 at fhd); `left` or `right` one
-    eye. This is what the right-eye glare-fill experiment is tuned against:
-    save a pair under the real lights and compare where the strips fall.
-    """
-    left, right = _grab_views(True)
-    if left is None or right is None:
-        return JSONResponse(
-            content={"error": "camera not available", "detail": camera_status["error"]},
-            status_code=503,
-        )
-    image = {"both": lambda: np.hstack([left, right]), "left": lambda: left, "right": lambda: right}[eye]()
-    _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 100])
-    return Response(content=jpeg.tobytes(), media_type="image/jpeg",
-                    headers={"X-Resolution": f"{image.shape[1]}x{image.shape[0]}"})
-
-
-@app.post("/camera/stereo", summary="Experiment: fill clipped strips from the right eye")
-def camera_stereo(
-    value: bool = Query(...),
-    shift: Optional[str] = Query(None),
-):
-    """
-    value: true  — the default since 2026-10-18. Every /capture grabs both
-                   eyes and fills the left image's
-                   clipped pixels (any channel >= 250) from the right view,
-                   aligned on the tray plane. Then crop, de-glare, enhance
-                   as usual. X-Stereo-Fill on each capture reports the shift
-                   used and how much was clipped / filled.
-           false — left eye only, as before.
-    shift: tray-plane disparity in full-frame pixels, or `auto` (default) to
-           estimate it on each capture by phase correlation of the tray
-           region. Pin it once the estimate is known to be stable.
-
-    Survives anything but a service restart, which returns to
-    STREAM_API_STEREO_FILL / STREAM_API_STEREO_SHIFT.
-    """
-    if shift is not None:
-        s = shift.strip().lower()
-        if s == "auto":
-            _stereo["shift"] = None
-        else:
-            try:
-                v = float(s)
-            except ValueError:
-                return JSONResponse(content={"error": "bad shift", "detail": "shift must be a number or auto"}, status_code=400)
-            if not _STEREO_SHIFT_RANGE[0] <= v <= _STEREO_SHIFT_RANGE[1]:
-                return JSONResponse(content={"error": "bad shift", "detail": f"shift must be {_STEREO_SHIFT_RANGE[0]:.0f}-{_STEREO_SHIFT_RANGE[1]:.0f} px"}, status_code=400)
-            _stereo["shift"] = v
-    _stereo["enabled"] = value
-    logger.info("stereo fill %s shift=%s", "on" if value else "off", _stereo["shift"] or "auto")
-    return {"stereo": dict(_stereo)}
-
-
-@app.post("/camera/scale", summary="Set the pixel-to-millimetre calibration live")
-def camera_scale(
-    grid_px: Optional[float] = Query(None, ge=5, le=500),
-    grid_mm: Optional[float] = Query(None, ge=1, le=100),
-):
-    """
-    grid_px: pitch of one grid square in full-frame (1920x1080) pixels at the
-             current mount height. Measure it on a ?crop=false capture.
-    grid_mm: real size of one grid square in millimetres.
-
-    mm per pixel = grid_mm / grid_px. Every /capture then carries X-Mm-Per-Px
-    for the image it returns, already corrected for crop scaling, presets and
-    the 2K mode. Omitted values are left alone. Survives anything but a service
-    restart, which returns to STREAM_API_GRID_PX / STREAM_API_GRID_MM.
-    """
-    if grid_px is not None:
-        _scale["grid_px"] = grid_px
-    if grid_mm is not None:
-        _scale["grid_mm"] = grid_mm
-    _scale["mm_per_px"] = round(_scale["grid_mm"] / _scale["grid_px"], 5)
-    logger.info("scale now %s", _scale)
-    return {"scale": dict(_scale)}
+        values["roi_exposure"] = roi
+    results = set_camera_controls(values)
+    failed = [k for k, s in results.items() if s not in ("success", "stub") and not s.startswith("pending")]
+    code = 200 if not failed else 400
+    if not camera_status["ok"]:
+        code = 503
+    return JSONResponse(content={"results": results, "camera": camera_status}, status_code=code)
 
 
 # ---------------------------------------------------------------------------

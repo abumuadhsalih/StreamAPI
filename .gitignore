@@ -21,3 +21,7 @@ KT.*
 CLAUDE.md
 DEPLOYMENT.md
 SCALE_ISSUE.md
+
+# Vadzo camera SDK pack (wheel, udev script, firmware tool, PDF): vendor-
+# confidential, copied to the Jetson by hand — see DEPLOYMENT.md Step 2.
+Falcon-2020CRS/

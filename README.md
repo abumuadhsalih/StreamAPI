@@ -1,13 +1,14 @@
-# ZED Stream API
+# Stream API
 
-A FastAPI server that exposes a Stereolabs ZED 2i camera (RGB), a USB serial scale and the battery BMS over HTTP — enabling web and mobile clients on the same LAN to stream live video, capture images and read weight and battery state without needing GUI access.
+A FastAPI server that exposes a Vadzo Falcon-2020CRS camera (onsemi AR2020, 20 MP colour, USB 3), a USB serial scale and the battery BMS over HTTP — enabling web and mobile clients on the same LAN to stream live video, capture images and read weight and battery state without needing GUI access.
 
 ## Endpoints
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/stream` | Live MJPEG color stream |
-| GET | `/capture` | Capture and return a single JPEG image — cropped to the tray, de-glared and enhanced (`?crop=false`, `?deglare=false`, `?enhance=false`) |
+| GET | `/stream` | Live MJPEG color stream (full view, scaled to `?preset=sd\|hd\|fhd`, default `fhd`) |
+| GET | `/capture` | A single JPEG, **unprocessed** — the camera's own picture at its native size (`?preset=` to scale it down). No crop, de-glare or enhance |
+| POST | `/camera/controls` | The camera's built-in ISP controls: exposure, gain, white balance, colour, HDR, denoise, flicker, flip, ... |
 | GET | `/scale/stream` | Live weight stream (SSE) — see `SCALE_API.md` |
 | GET | `/scale/capture` | Read current weight — see `SCALE_API.md` |
 | GET | `/battery/capture` | Read current battery state from the BMS |
@@ -20,7 +21,7 @@ See `/docs` for the full list, including the `POST` recovery and system-control 
 
 ## Setup on Jetson
 
-> **Note:** The camera SDK (`pyzed`) is not on PyPI and needs CUDA, so it comes from the ZED SDK installer rather than `uv sync`. The Jetson must run JetPack natively (CUDA at `/usr/local/cuda`); the SDK will not start without a GPU, even for RGB-only capture.
+> **Note:** The camera SDK (`vispa`, Vadzo's VISPA Falcon SDK) is not on PyPI. Vadzo ships it as one wheel per Python version and CPU architecture; the pack in `Falcon-2020CRS/` holds the **Python 3.13 / aarch64** wheel, which is why this project runs on Python 3.13. The Jetson must be on **JetPack 6 or newer** (Ubuntu 22.04+): the wheel needs glibc ≥ 2.28 and Vadzo's firmware tool ≥ 2.34. No CUDA or GPU is needed for the camera.
 
 ### 1. Install system dependencies
 
@@ -29,32 +30,28 @@ sudo apt update
 sudo apt install -y git libssl-dev libusb-1.0-0-dev libgtk-3-dev python3-dev pkg-config
 ```
 
-### 2. Install the ZED SDK (matches the Jetson's JetPack / L4T release)
+### 2. Check the platform
 
 ```bash
-# Confirm the L4T release and that CUDA is present — the SDK build must match L4T
-cat /etc/nv_tegra_release
-ls /usr/local/cuda
-
-# Download the "ZED SDK for JetPack <your version>" installer from
-# https://www.stereolabs.com/developers/release and run it
-chmod +x ZED_SDK_Tegra_L4T*.run
-./ZED_SDK_Tegra_L4T*.run
+cat /etc/nv_tegra_release   # JetPack 6 = L4T R36
+ldd --version | head -1     # glibc 2.35 on JetPack 6; must be >= 2.28
+uname -m                    # aarch64
 ```
-
-The installer lands in `/usr/local/zed/` (tools in `/usr/local/zed/tools/`, udev rule at `/etc/udev/rules.d/99-slabs.rules`). Accept the default when it asks about the Python API, or install it into the venv in step 7 — either works, but the venv route is what step 7 shows.
-
-On first `open()` the SDK downloads the camera's factory calibration file into `/usr/local/zed/settings/SN<serial>.conf`. That needs internet **once**; on a LAN-only Jetson run `/usr/local/zed/tools/ZED_Diagnostic` while online, or copy the file in by hand.
 
 ### 3. Camera permissions
 
-The SDK's udev rule opens the camera to all users, so no group is needed for the ZED itself. The scale's serial adapter still needs `plugdev` (or `dialout` — see `JETSON_SETUP.md`):
+The `Falcon-2020CRS/` vendor pack is git-ignored (Vadzo marks it confidential), so a fresh clone does not have it: copy it into the checkout first (`scp -r Falcon-2020CRS <jetson-user>@<jetson-ip>:~/StreamAPI/`).
+
+
+Vadzo's `vadzo_env.sh` installs a udev rule (`/etc/udev/rules.d/99-vadzo.rules`) that opens the camera's USB and HID control interface (vendor `eba1`, product `3e00`) to all users. Without it the SDK cannot see or control the camera. The `/dev/video*` nodes need `video`, and the scale's serial adapter still needs `plugdev` (or `dialout`, see `JETSON_SETUP.md`):
 
 ```bash
-sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo bash Falcon-2020CRS/vadzo_env.sh
 sudo usermod -aG plugdev,video $USER
 # Log out and back in, then replug the camera
 ```
+
+Vadzo's firmware tool (`Falcon-2020CRS/vadzo-dfu_1.2.0_arm64.deb`) is **not** needed to run the service. The firmware image bundled in it is named `FALCON-2020BRS.img`, not CRS, so do not flash it without confirming with Vadzo first.
 
 ### 4. Enable Bluetooth for the battery BMS
 
@@ -95,24 +92,28 @@ git clone https://github.com/abumuadhsalih/StreamAPI.git
 cd StreamAPI
 ```
 
-### 7. Create venv with system site-packages and sync
+### 7. Create the venv on Python 3.13 and install the camera SDK
 
-The `pyzed` wheel is built against the system CUDA and NumPy, so the venv uses the system interpreter and sees system packages:
+`uv` installs its own Python 3.13 (from `.python-version`); the system Python is not used and no system site-packages are needed:
 
 ```bash
-uv venv --python /usr/bin/python3 --system-site-packages
+uv venv --python 3.13
 uv sync
-# Install the Python API into the venv (downloads the wheel matching CUDA/L4T/Python)
-uv run python /usr/local/zed/get_python_api.py
+# The camera SDK is not on PyPI: install Vadzo's wheel into the venv.
+# --inexact on later syncs keeps uv from removing it again.
+uv pip install Falcon-2020CRS/vispa-1.11-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl
 ```
 
-### 8. Verify the ZED camera is detected
+After this, use `uv sync --inexact` (plain `uv sync` removes packages not listed in `pyproject.toml`, and `vispa` deliberately is not).
+
+### 8. Verify the camera is detected
 
 ```bash
-uv run python -c "import pyzed.sl as sl; d = sl.Camera.get_device_list(); print(f'Devices found: {len(d)}', [str(x.camera_state) for x in d])"
+uv run python -c "import vispa; print('SDK', vispa.version())"
+uv run python -c "from VISPA_Falcon import FalconCamera; print(FalconCamera().falcon_controller().get_devices())"
 ```
 
-You should see `Devices found: 1 ['AVAILABLE']`. `0` means USB/udev; `NOT_AVAILABLE` means another process (e.g. `ZED_Explorer`) holds the camera — a ZED accepts one client at a time.
+You should see the camera's name in the list. An empty list means USB or permissions (step 3). Stop the service first if it is running: the camera accepts one client at a time.
 
 ### 9. Run the server
 
@@ -123,7 +124,7 @@ uv run stream-api
 The API will be accessible from any device on the same LAN:
 
 - Stream: `http://<jetson-ip>:8000/stream`
-- Capture: `http://<jetson-ip>:8000/capture` (full frame: `?crop=false`; enhanced: `?enhance=true`)
+- Capture: `http://<jetson-ip>:8000/capture` (native size; `?preset=fhd` for a smaller image)
 - Docs: `http://<jetson-ip>:8000/docs`
 
 > To find the Jetson's IP: `hostname -I | awk '{print $1}'`
@@ -138,28 +139,19 @@ For production hosting — service starts on Jetson boot, restarts on failure, l
 
 ## Troubleshooting
 
-**`No module named 'pyzed'`**
-The Python API was not installed into this venv. Run `uv run python /usr/local/zed/get_python_api.py` (step 7). If the venv was created without `--system-site-packages` / the system interpreter, recreate it:
-```bash
-rm -rf .venv
-uv venv --python /usr/bin/python3 --system-site-packages
-uv sync
-uv run python /usr/local/zed/get_python_api.py
-```
+**`/health` says "the VISPA camera SDK is not installed in this venv"**
+The `vispa` wheel is missing from the venv, usually because a plain `uv sync` removed it. Reinstall it (step 7) and use `uv sync --inexact` from then on. `is not a supported wheel on this platform` means the venv is not Python 3.13 or the machine is not aarch64: `uv run python --version`, `uname -m`.
 
-**`Devices found: 0`**
-- Check the USB cable and that the camera is on a USB 3.0 port (`lsusb -t` shows `5000M`; the vendor id is `2b03`)
-- Re-run `sudo udevadm control --reload-rules && sudo udevadm trigger` and replug the device
-- Run `/usr/local/zed/tools/ZED_Diagnostic` to confirm the SDK sees the camera — then close it before starting the service
+**`/health` says "no Falcon camera found"**
+- Check the USB cable and that the camera is on a USB 3 port (`lsusb -t` shows `5000M`; `lsusb` lists vendor `eba1`)
+- Run `sudo bash Falcon-2020CRS/vadzo_env.sh` if it was never run, then replug the camera
+- Confirm the service user is in `video` (`id`)
 
-**`/health` says the camera is held by another process**
-Close `ZED_Explorer` / `ZED_Diagnostic` (or any other SDK client); the ZED accepts one at a time. The service reconnects on its own.
+**`/health` says the camera is busy**
+Another process holds it (a vendor viewer, a probe script, a second copy of the service); the camera accepts one client at a time. Close it, and the service reconnects on the next request.
 
-**`camera open refused ... CALIBRATION_FILE_NOT_AVAILABLE`**
-The Jetson had no internet the first time the camera was opened. Connect it once and `POST /camera/restart`, or copy `SN<serial>.conf` into `/usr/local/zed/settings/`.
-
-**`camera open refused ... NO_GPU_COMPATIBLE` / CUDA errors**
-The SDK build does not match the installed JetPack, or CUDA is missing. Compare `cat /etc/nv_tegra_release` with the SDK version you downloaded.
+**`/health` says "camera opened but would not stream"**
+None of the pixel formats tried (MJPG, UYVY, YUYV, BA81) produced a frame; the error lists the SDK's message for each. Usually USB bandwidth (use a USB 3 port and a short certified cable), or a size or frame rate the camera cannot do: unset `STREAM_API_CAMERA_SIZE` / `STREAM_API_CAMERA_FPS` and retry.
 
 **Port 8000 already in use**
 ```bash

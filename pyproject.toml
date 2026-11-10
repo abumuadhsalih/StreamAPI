@@ -1,9 +1,9 @@
 [project]
 name = "stream-api"
 version = "0.1.0"
-description = "ZED 2i camera streaming and capture API"
+description = "Vadzo Falcon-2020CRS camera, scale and battery API"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 dependencies = [
     # Linux-only because the BLE path is stubbed elsewhere: macOS/CoreBluetooth
     # addresses devices by an opaque per-host UUID and can never resolve a MAC.
@@ -18,10 +18,12 @@ dependencies = [
     "fastapi[standard]>=0.136.0",
     "opencv-python-headless>=4.13.0.92",
     "psutil>=7.2.2",
-    # The camera SDK (pyzed) is deliberately NOT listed: it is not on PyPI and
-    # needs CUDA. The ZED SDK installer's get_python_api.py drops a wheel built
-    # for the Jetson's CUDA/L4T/Python into whichever interpreter runs it — run
-    # it with the venv active (see README). On non-Linux the camera is stubbed.
+    # The camera SDK (vispa, Vadzo VISPA Falcon) is deliberately NOT listed:
+    # it is not on PyPI, Vadzo ships it as a per-Python, per-arch wheel
+    # (Falcon-2020CRS/vispa-*-cp313-*_aarch64.whl), and deployment installs
+    # this service from its own built wheel, where a path dependency would
+    # not resolve. It is installed into the venv by hand (see DEPLOYMENT.md);
+    # off the Jetson the camera is stubbed.
     "pyserial>=3.5",
 ]
 
