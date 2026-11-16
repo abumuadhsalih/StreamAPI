@@ -1805,6 +1805,34 @@ def battery_capture():
     return data
 
 
+def _tls_settings() -> dict[str, str]:
+    """uvicorn TLS kwargs from STREAM_API_TLS_CERT / STREAM_API_TLS_KEY.
+
+    The service serves HTTPS with a certificate from scripts/jetson-tls.sh, and the
+    FishAI app trusts only that private CA. Over plain HTTP anything on the same Wi-Fi
+    could pose as this Jetson (feeding fake capture images and scale weights) or read
+    the admin token off the wire. So it fails closed: no certificate means no start,
+    unless STREAM_API_INSECURE_HTTP=1 is set on purpose (local debugging only — the
+    app will not connect to a plain-HTTP Jetson).
+    """
+    cert = os.environ.get("STREAM_API_TLS_CERT", "").strip()
+    key = os.environ.get("STREAM_API_TLS_KEY", "").strip()
+    if cert and key:
+        for label, path in (("STREAM_API_TLS_CERT", cert), ("STREAM_API_TLS_KEY", key)):
+            if not os.path.isfile(path):
+                raise SystemExit(f"{label}={path}: file not found")
+        return {"ssl_certfile": cert, "ssl_keyfile": key}
+    if cert or key:
+        raise SystemExit("set both STREAM_API_TLS_CERT and STREAM_API_TLS_KEY, or neither")
+    if os.environ.get("STREAM_API_INSECURE_HTTP") == "1":
+        logger.warning("STREAM_API_INSECURE_HTTP=1: serving plain HTTP — the FishAI app will refuse it")
+        return {}
+    raise SystemExit(
+        "TLS not configured: set STREAM_API_TLS_CERT and STREAM_API_TLS_KEY "
+        "(see scripts/jetson-tls.sh), or STREAM_API_INSECURE_HTTP=1 for local debugging"
+    )
+
+
 def run():
     """Entry point for the `stream-api` console script."""
     import uvicorn
@@ -1813,4 +1841,5 @@ def run():
         "stream_api.main:app",
         host=os.environ.get("STREAM_API_HOST", "0.0.0.0"),
         port=int(os.environ.get("STREAM_API_PORT", "8000")),
+        **_tls_settings(),
     )

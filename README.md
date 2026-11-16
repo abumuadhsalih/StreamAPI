@@ -117,15 +117,30 @@ You should see the camera's name in the list. An empty list means USB or permiss
 
 ### 9. Run the server
 
+The service serves **HTTPS only**. Each Jetson needs a certificate signed by the FishAI Jetson CA (the only CA the FishAI app trusts) — make one on the machine that holds the CA key, never on the Jetson:
+
 ```bash
+scripts/jetson-tls.sh ca             # once, ever — keep certs/ca.key offline
+scripts/jetson-tls.sh leaf jetson-01 # per Jetson → certs/jetson-01.key + certs/jetson-01.chain.pem
+```
+
+Copy `jetson-01.key` and `jetson-01.chain.pem` to the Jetson (e.g. `/opt/stream-api/tls/`, readable only by the service user), then:
+
+```bash
+STREAM_API_TLS_CERT=/opt/stream-api/tls/jetson-01.chain.pem \
+STREAM_API_TLS_KEY=/opt/stream-api/tls/jetson-01.key \
 uv run stream-api
 ```
 
+Without both variables it refuses to start. `STREAM_API_INSECURE_HTTP=1` forces plain HTTP for local debugging only — the app will not connect to it. (`uv run fastapi dev` is plain HTTP on localhost, for development.)
+
 The API will be accessible from any device on the same LAN:
 
-- Stream: `http://<jetson-ip>:8000/stream`
-- Capture: `http://<jetson-ip>:8000/capture` (native size; `?preset=fhd` for a smaller image)
-- Docs: `http://<jetson-ip>:8000/docs`
+- Stream: `https://<jetson-ip>:8000/stream`
+- Capture: `https://<jetson-ip>:8000/capture` (native size; `?preset=fhd` for a smaller image)
+- Docs: `https://<jetson-ip>:8000/docs`
+
+The certificate names the role `fishai-jetson`, not an IP (DHCP changes it), so verify with `curl --cacert certs/ca.crt --resolve fishai-jetson:8000:<jetson-ip> https://fishai-jetson:8000/health`. A browser will warn unless it trusts `ca.crt`.
 
 > To find the Jetson's IP: `hostname -I | awk '{print $1}'`
 
