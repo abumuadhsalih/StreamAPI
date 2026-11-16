@@ -8,7 +8,10 @@ A FastAPI server that exposes a Vadzo Falcon-2020CRS camera (onsemi AR2020, 20 M
 |---|---|---|
 | GET | `/stream` | Live MJPEG color stream (full view, scaled to `?preset=sd\|hd\|fhd`, default `fhd`) |
 | GET | `/capture` | A single JPEG, **unprocessed** — the camera's own picture at its native size (`?preset=` to scale it down). No crop, de-glare or enhance |
-| POST | `/camera/controls` | The camera's built-in ISP controls: exposure, gain, white balance, colour, HDR, denoise, flicker, flip, ... |
+| GET | `/camera/settings` | Camera settings in force, whether they are saved, what the camera itself reports (live), and every control with its range |
+| POST | `/camera/controls` | The camera's built-in ISP controls: exposure, gain, white balance, colour, HDR, denoise, JPEG quality, flicker, flip, zoom, ... Saved, survive a restart |
+| POST | `/camera/output` | Pixel format, size, frame rate (`auto` = camera default); reopens the camera, reverts if it will not stream. Saved |
+| POST | `/camera/settings/reset` | Forget all saved camera settings, back to the camera's defaults |
 | GET | `/scale/stream` | Live weight stream (SSE) — see `SCALE_API.md` |
 | GET | `/scale/capture` | Read current weight — see `SCALE_API.md` |
 | GET | `/battery/capture` | Read current battery state from the BMS |

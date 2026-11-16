@@ -235,44 +235,50 @@ def decode_frame(raw: np.ndarray, fourcc: str) -> np.ndarray:
     raise ValueError(f"pixel format {fourcc} is not supported")
 
 
-# The camera's own ISP controls, each a VISPA set_<name>_op(device, int).
-# Applied after every open in THIS order, so an auto switch lands before the
-# manual value it gates. Ranges are the camera's: the SDK rejects an
-# out-of-range value with a message naming the range, and POST
-# /camera/controls hands that message straight back, so nothing here
-# hardcodes a range that could drift from the firmware.
-# roi_exposure is the one control with four values: set_roi_exposure_op(
-# device, mode, x, y, size), meter auto-exposure on a window instead of the
-# whole frame (mode 0 = full frame; x and y on a 0-255 grid).
-CAMERA_CONTROLS = (
-    "auto_exposure",
-    "exposure",
-    "gain",
-    "roi_exposure",
-    "brightness",
-    "auto_white_balance",
-    "white_balance",
-    "contrast",
-    "saturation",
-    "hue",
-    "gamma",
-    "sharpness",
-    "black_level",
-    "denoise",
-    "hdr",
-    "tone_control",
-    "color_mode",
-    "scene_mode",
-    "flicker",
-    "flip",
-)
+# The camera's own ISP controls, each a VISPA set_<name>_op(device, int),
+# with what Vadzo's guide (sections 8 and 10.8) says about the value. Applied
+# after every open in THIS order, so an auto switch lands before the manual
+# value it gates and zoom before the pan/tilt that move within it. Ranges
+# marked "the camera's" are not in the guide: the SDK rejects an out-of-range
+# value with a message naming the range, and POST /camera/controls hands that
+# message straight back, so nothing here hardcodes a range that could drift
+# from the firmware. roi_exposure is the one control with four values:
+# set_roi_exposure_op(device, mode, x, y, size).
+CAMERA_CONTROL_INFO = {
+    "auto_exposure": "1 auto (the default), 0 manual",
+    "exposure": "Manual exposure time in ms, 1-1000; needs auto_exposure=0. A long exposure lowers the frame rate",
+    "gain": "Analogue gain; range is the camera's. Manual only in effect with auto_exposure=0",
+    "roi_exposure": "mode,x,y,size: meter auto-exposure on a window instead of the whole frame. "
+    "mode 1-2 (Vadzo: 0 = full frame, 1 = window at x,y), x and y 0-255, size 1-8",
+    "brightness": "Range is the camera's",
+    "auto_white_balance": "1 auto (the default), 0 manual",
+    "white_balance": "Manual white balance; needs auto_white_balance=0. Range is the camera's",
+    "contrast": "Range is the camera's",
+    "saturation": "Colour saturation. Range is the camera's",
+    "hue": "Range is the camera's",
+    "gamma": "Range is the camera's",
+    "sharpness": "Edge sharpening. Range is the camera's",
+    "black_level": "Black level offset. Range is the camera's",
+    "denoise": "Noise reduction strength, 0-15",
+    "hdr": "High dynamic range: 1 off, 2 auto",
+    "tone_control": "Tone curve. Range is the camera's",
+    "qfactor": "JPEG quality of the camera's own MJPEG encoder (what a bare /capture returns). Range is the camera's",
+    "color_mode": "Colour mode, one of 1, 4, 6, 7, 8, 16",
+    "scene_mode": "Scene mode, 1 or 12",
+    "flicker": "Flicker cancellation: 0 auto, 1 50 Hz mains, 2 60 Hz",
+    "flip": "0 none, 1 horizontal, 2 vertical, 3 both",
+    "zoom": "Zoom level, where the camera supports it",
+    "pan": "Horizontal position within the zoom, where supported",
+    "tilt": "Vertical position within the zoom, where supported",
+    "stream_led": "Streaming LED: 0 off, 1 on",
+}
+CAMERA_CONTROLS = tuple(CAMERA_CONTROL_INFO)
 
 # Auto exposure and auto white balance are asserted on every open, as the ZED
 # path did with AEC_AGC and WHITEBALANCE_AUTO: settings can persist in the
 # camera between opens, and a manual value left behind by a vendor tool would
 # otherwise survive silently. Everything else stays at the camera's default
-# unless STREAM_API_CAMERA_<NAME> sets it, e.g. STREAM_API_CAMERA_FLICKER=1
-# for 50 Hz mains or STREAM_API_CAMERA_ROI_EXPOSURE=1,128,128,4.
+# until it is set (POST /camera/controls, or STREAM_API_CAMERA_<NAME>).
 _CONTROL_DEFAULTS = {"auto_exposure": 1, "auto_white_balance": 1}
 
 
@@ -309,15 +315,163 @@ def _controls_from_env() -> dict:
     return out
 
 
-# The control values in force. POST /camera/controls moves them and every
-# open re-applies them, so a self-heal reopen keeps what was set; a service
-# restart returns to the environment, so nothing poked in while testing leaks
-# into production.
-_controls = _controls_from_env()
-
-
 def _ordered_controls(values: dict) -> list:
     return sorted(values.items(), key=lambda kv: CAMERA_CONTROLS.index(kv[0]))
+
+
+# ---------------------------------------------------------------------------
+# Saved camera settings — everything set over HTTP survives a restart
+# ---------------------------------------------------------------------------
+#
+# Every change made through POST /camera/controls or POST /camera/output is
+# written to this JSON file, and the file is loaded at startup. So the camera
+# is tuned entirely at runtime, from the endpoints, and stays tuned through a
+# service restart or a reboot; nobody edits the systemd unit. Precedence:
+# the saved file, else STREAM_API_CAMERA_* env, else the camera's default.
+# POST /camera/settings/reset deletes the file and returns to env/defaults.
+# The file holds the complete state in force (all controls and the output
+# settings), not a diff, so what GET /camera/settings shows is what a restart
+# brings back. Default path is in the service user's home, which the unit's
+# user can always write; STREAM_API_CAMERA_SETTINGS_FILE moves it.
+
+CAMERA_SETTINGS_FILE = os.path.expanduser(
+    _env("STREAM_API_CAMERA_SETTINGS_FILE") or "~/.config/stream-api/camera.json"
+)
+
+# Pixel formats this file can decode, i.e. what POST /camera/output accepts.
+CAMERA_PIXEL_FORMATS = ("MJPG", "UYVY", "YUYV", "BA81", "RGB3", "BGR3", "GREY")
+
+
+def _check_format(fmt) -> Optional[str]:
+    """None if acceptable, else why not."""
+    if fmt is None or (isinstance(fmt, str) and fmt.upper() in CAMERA_PIXEL_FORMATS):
+        return None
+    return f"format must be one of {', '.join(CAMERA_PIXEL_FORMATS)} or auto"
+
+
+def _check_size(size) -> Optional[str]:
+    if size is None:
+        return None
+    try:
+        w, h = (int(v) for v in size)
+        if 100 <= w <= 5120 and 100 <= h <= 3840:
+            return None
+    except (TypeError, ValueError):
+        pass
+    return "size must be WxH with width 100-5120 and height 100-3840, or auto"
+
+
+def _check_fps(fps) -> Optional[str]:
+    if fps is None or (isinstance(fps, int) and not isinstance(fps, bool) and 1 <= fps <= 120):
+        return None
+    return "fps must be 1-120, or auto"
+
+
+def _check_control(name, value) -> Optional[str]:
+    if name not in CAMERA_CONTROL_INFO:
+        return f"unknown control {name!r}"
+    if name == "roi_exposure":
+        ok = isinstance(value, list) and len(value) == 4 and all(isinstance(v, int) for v in value)
+        return None if ok else "roi_exposure must be [mode, x, y, size]"
+    return None if isinstance(value, int) and not isinstance(value, bool) else f"{name} must be an integer"
+
+
+def _load_settings_file() -> dict:
+    try:
+        with open(CAMERA_SETTINGS_FILE) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        logger.warning("camera settings file %s unreadable, ignored: %s", CAMERA_SETTINGS_FILE, e)
+        return {}
+    if not isinstance(data, dict):
+        logger.warning("camera settings file %s is not a JSON object, ignored", CAMERA_SETTINGS_FILE)
+        return {}
+    return data
+
+
+# The control values in force. Every open re-applies them, so a self-heal
+# reopen keeps what was set, and the settings file carries them across a
+# restart.
+_controls = _controls_from_env()
+_settings_saved = False
+
+_saved = _load_settings_file()
+if _saved:
+    for _name, _value in (_saved.get("controls") or {}).items():
+        _why = _check_control(_name, _value)
+        if _why:
+            logger.warning("camera settings file: %s, ignored", _why)
+        else:
+            _controls[_name] = _value
+    _out = _saved.get("output") or {}
+    if "format" in _out and not _check_format(_out["format"]):
+        CAMERA_FORMATS = (_out["format"].upper(),) if _out["format"] else _CAMERA_FORMATS_DEFAULT
+    if "size" in _out and not _check_size(_out["size"]):
+        CAMERA_SIZE = tuple(_out["size"]) if _out["size"] else None
+    if "fps" in _out and not _check_fps(_out["fps"]):
+        CAMERA_FPS = _out["fps"]
+    _settings_saved = True
+    logger.info("camera settings loaded from %s", CAMERA_SETTINGS_FILE)
+
+
+def _output_settings() -> dict:
+    """The output settings in force, in the settings file's shape."""
+    return {
+        "format": CAMERA_FORMATS[0] if len(CAMERA_FORMATS) == 1 else None,
+        "size": list(CAMERA_SIZE) if CAMERA_SIZE else None,
+        "fps": CAMERA_FPS,
+    }
+
+
+def _save_settings() -> Optional[str]:
+    """Write the state in force to the settings file, atomically (a power
+    cut mid-write leaves the old file, never half a file). Returns None, or
+    the reason it could not be written; the change still holds until the
+    next restart either way."""
+    global _settings_saved
+    data = {"controls": dict(_controls), "output": _output_settings()}
+    tmp = CAMERA_SETTINGS_FILE + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(CAMERA_SETTINGS_FILE), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, CAMERA_SETTINGS_FILE)
+    except OSError as e:
+        logger.warning("camera settings not saved to %s: %s", CAMERA_SETTINGS_FILE, e)
+        return str(e)
+    _settings_saved = True
+    return None
+
+
+def _forget_settings() -> Optional[str]:
+    """Delete the settings file and return controls and output to env or
+    defaults (in place: camera_status holds a reference to _controls)."""
+    global CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS, _settings_saved
+    try:
+        os.remove(CAMERA_SETTINGS_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        return str(e)
+    _settings_saved = False
+    _controls.clear()
+    _controls.update(_controls_from_env())
+    fmt = _env("STREAM_API_CAMERA_FORMAT").upper()
+    CAMERA_FORMATS = (fmt,) if fmt else _CAMERA_FORMATS_DEFAULT
+    CAMERA_SIZE = _parse_size(_env("STREAM_API_CAMERA_SIZE"))
+    CAMERA_FPS = _parse_fps(_env("STREAM_API_CAMERA_FPS"))
+    return None
+
+
+def settings_summary() -> dict:
+    return {
+        "file": CAMERA_SETTINGS_FILE,
+        "saved": _settings_saved,
+        "controls": _controls,
+        "output": _output_settings(),
+    }
 
 # ---------------------------------------------------------------------------
 # Hardware status — surfaced via /health and used to short-circuit endpoints
@@ -335,7 +489,7 @@ camera_status: dict = {
     # frames it delivers — the native size a bare /capture returns.
     "format": None,
     "frame": None,
-    # Frame rate requested (STREAM_API_CAMERA_FPS), null = camera default.
+    # Frame rate requested (POST /camera/output), null = camera default.
     "fps": CAMERA_FPS,
     # ISP control values in force, re-applied on every open.
     "controls": _controls,
@@ -393,6 +547,9 @@ def _battery_failed(error: str) -> None:
 _FRAME_TIMEOUT = 2.0
 _FIRST_FRAME_TIMEOUT = 5.0
 
+# "Not given" for POST /camera/output, distinct from None ("camera default").
+_UNCHANGED = object()
+
 _CAMERA_ERR_NO_SDK = (
     "the VISPA camera SDK is not installed in this venv — install the "
     "vispa-*-cp313-*_aarch64.whl from the Falcon-2020CRS pack (see DEPLOYMENT.md)"
@@ -424,6 +581,8 @@ if sys.platform == "linux":
     # reopened on a self-heal.
     _cam = None
     _dev: Optional[str] = None
+    # Whether a size window was set in this process (see _start).
+    _roi_set = False
 
     # Serialize all camera access: the SDK hands frames over a
     # single-consumer ring, and a lazy reopen from concurrent requests must be
@@ -470,8 +629,18 @@ if sys.platform == "linux":
         """Configure, start and read one frame in `fmt`. Returns it decoded;
         raises with the SDK's message if any step fails."""
         _check(_cam.set_pixel_format(_dev, fmt), "set_pixel_format")
+        global _roi_set
         if CAMERA_SIZE:
             _check(_cam.set_roi(_dev, width=CAMERA_SIZE[0], height=CAMERA_SIZE[1]), "set_roi")
+            _roi_set = True
+        elif _roi_set:
+            # Size went back to auto at runtime: the window set earlier may
+            # stay in the camera, so ask for the whole sensor again.
+            status = _cam.set_roi(_dev, x_offset=0, y_offset=0, width=5120, height=3840)
+            if status == "success":
+                _roi_set = False
+            else:
+                logger.warning("camera size not returned to the full sensor: %s", status)
         # Newest frame first: a request wants "now", not the oldest frame
         # queued since the last one (the same reasoning as the scale reader).
         _check(_cam.set_acquisition_mode(_dev, "continuous", order="lifo"), "set_acquisition_mode")
@@ -590,13 +759,16 @@ if sys.platform == "linux":
             _open_camera()
         return camera_status
 
-    def set_camera_controls(values: dict) -> dict:
-        """Apply controls now and keep them across reopens. Returns the
-        SDK's status string per control. A value the camera rejects is not
-        kept; with the camera down, values are kept and applied on the next
-        open (where a rejection is logged)."""
+    def set_camera_controls(values: dict):
+        """Apply controls now, keep them across reopens and save them across
+        restarts. Returns (the SDK's status string per control, why the
+        settings file could not be written or None). A value the camera
+        rejects is neither kept nor saved; with the camera down, values are
+        kept and applied on the next open (where a rejection is logged)."""
         results = {}
+        save_error = None
         with _camera_lock:
+            kept = False
             for name, value in _ordered_controls(values):
                 if camera_status["ok"]:
                     try:
@@ -605,12 +777,77 @@ if sys.platform == "linux":
                         status = str(e)
                     if status == "success":
                         _controls[name] = value
+                        kept = True
                 else:
                     status = "pending: camera not open, applied on the next open"
                     _controls[name] = value
+                    kept = True
                 results[name] = status
+            if kept:
+                save_error = _save_settings()
         logger.info("camera controls %s -> %s", values, results)
-        return results
+        return results, save_error
+
+    def set_camera_output(fmt, size, fps):
+        """Change pixel format / size / frame rate, each _UNCHANGED, None
+        (camera default) or a validated value. These are fixed when the
+        camera starts, so the camera is reopened with them. If it will not
+        stream with the new settings, the previous ones are put back and the
+        camera reopened on those, so a bad guess never leaves the camera
+        dark. Returns (error or None, save error or None)."""
+        global CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS
+        with _camera_lock:
+            previous = (CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS)
+            if fmt is not _UNCHANGED:
+                CAMERA_FORMATS = (fmt,) if fmt else _CAMERA_FORMATS_DEFAULT
+            if size is not _UNCHANGED:
+                CAMERA_SIZE = size
+            if fps is not _UNCHANGED:
+                CAMERA_FPS = fps
+            camera_status["fps"] = CAMERA_FPS
+            if _open_camera():
+                return None, _save_settings()
+            error = camera_status["error"]
+            CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS = previous
+            camera_status["fps"] = CAMERA_FPS
+            _open_camera()
+            return error, None
+
+    def reset_camera_settings():
+        """Forget everything saved and reopen on env/defaults. Reopening is
+        what returns the camera's own controls to its standard set: starting
+        acquisition re-applies it (guide, section 8). Returns an error or
+        None."""
+        global _camera_last_retry
+        with _camera_lock:
+            error = _forget_settings()
+            camera_status["fps"] = CAMERA_FPS
+            _camera_last_retry = 0.0
+            _open_camera()
+        return error
+
+    def read_camera_values() -> dict:
+        """What the camera itself reports for each control, via
+        get_setting(): the real value in force, including ones never set
+        here (the camera's defaults). The guide documents get_setting for
+        "exposure" and "fps"; other names are tried with the control's own
+        name and whatever the SDK answers is shown, error text included."""
+        out: dict = {}
+        with _camera_lock:
+            if not camera_status["ok"]:
+                return {"error": "camera not open"}
+            for name in ("fps",) + tuple(n for n in CAMERA_CONTROLS if n != "roi_exposure"):
+                try:
+                    value = _cam.get_setting(_dev, name)
+                except Exception as e:
+                    value = f"unreadable: {e}"
+                out[name] = value if isinstance(value, (int, float, str)) else repr(value)
+            try:
+                temp = _cam.get_temperature(_dev)
+                out["temperature_c"] = round(temp, 1) if isinstance(temp, float) else f"unreadable: {temp}"
+            except Exception as e:
+                out["temperature_c"] = f"unreadable: {e}"
+        return out
 
     @app.on_event("startup")
     def _camera_startup():
@@ -662,10 +899,29 @@ else:
         """No-op restart for local dev — returns the stub status."""
         return camera_status
 
-    def set_camera_controls(values: dict) -> dict:
-        """Record the values so the stub answers like the real thing."""
+    def set_camera_controls(values: dict):
+        """Record and save the values so the stub answers like the real thing."""
         _controls.update(values)
-        return {name: "stub" for name in values}
+        return {name: "stub" for name in values}, _save_settings()
+
+    def set_camera_output(fmt, size, fps):
+        global CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS
+        if fmt is not _UNCHANGED:
+            CAMERA_FORMATS = (fmt,) if fmt else _CAMERA_FORMATS_DEFAULT
+        if size is not _UNCHANGED:
+            CAMERA_SIZE = size
+        if fps is not _UNCHANGED:
+            CAMERA_FPS = fps
+        camera_status["fps"] = CAMERA_FPS
+        return None, _save_settings()
+
+    def reset_camera_settings():
+        error = _forget_settings()
+        camera_status["fps"] = CAMERA_FPS
+        return error
+
+    def read_camera_values() -> dict:
+        return {"stub": "no camera; values are read from a real camera only"}
 
 
 def _grab_frame() -> Optional[np.ndarray]:
@@ -1683,44 +1939,75 @@ def camera_restart():
     )
 
 
-@app.post("/camera/controls", summary="Set the camera's own ISP controls (exposure, white balance, colour, HDR, ...)")
+@app.get("/camera/settings", summary="Everything about the camera's settings: what is in force, saved, and what the camera reports")
+def camera_settings():
+    """
+    - `in_force`: the controls and output settings this service applies on
+      every open, and `saved` / `file`: whether they are in the settings
+      file, i.e. survive a restart.
+    - `camera_reports`: what the camera itself says is in force, read live
+      with the SDK's get_setting(): the real values, including the camera's
+      defaults for controls never set here. Values the SDK cannot read show
+      its error text. Empty while the camera is down.
+    - `controls`: every control POST /camera/controls takes, with the value
+      range Vadzo documents.
+    - `camera`: the same status as /health.
+    """
+    summary = settings_summary()
+    return {
+        "in_force": {"controls": summary["controls"], "output": summary["output"]},
+        "saved": summary["saved"],
+        "file": summary["file"],
+        "camera_reports": read_camera_values(),
+        "controls": CAMERA_CONTROL_INFO,
+        "output_options": {
+            "format": list(CAMERA_PIXEL_FORMATS),
+            "size": "WxH, width 100-5120, height 100-3840",
+            "fps": "1-120",
+        },
+        "camera": camera_status,
+    }
+
+
+@app.post("/camera/controls", summary="Set the camera's own ISP controls (exposure, white balance, colour, HDR, ...); saved")
 def camera_controls(
-    auto_exposure: Optional[int] = Query(None, description="1 auto (the default), 0 manual"),
-    exposure: Optional[int] = Query(None, description="Manual exposure in ms; needs auto_exposure=0"),
-    gain: Optional[int] = Query(None, description="Analogue gain"),
-    roi_exposure: Optional[str] = Query(
-        None,
-        description="mode,x,y,size: meter auto-exposure on a window instead of the whole frame "
-        "(mode 0 = full frame; x, y on a 0-255 grid)",
-    ),
-    brightness: Optional[int] = Query(None),
-    auto_white_balance: Optional[int] = Query(None, description="1 auto (the default), 0 manual"),
-    white_balance: Optional[int] = Query(None, description="Manual white balance; needs auto_white_balance=0"),
-    contrast: Optional[int] = Query(None),
-    saturation: Optional[int] = Query(None),
-    hue: Optional[int] = Query(None),
-    gamma: Optional[int] = Query(None),
-    sharpness: Optional[int] = Query(None),
-    black_level: Optional[int] = Query(None),
-    denoise: Optional[int] = Query(None, description="0-15"),
-    hdr: Optional[int] = Query(None, description="1 off, 2 auto"),
-    tone_control: Optional[int] = Query(None),
-    color_mode: Optional[int] = Query(None),
-    scene_mode: Optional[int] = Query(None),
-    flicker: Optional[int] = Query(None, description="0 auto, 1 50 Hz, 2 60 Hz"),
-    flip: Optional[int] = Query(None, description="0 none, 1 horizontal, 2 vertical, 3 both"),
+    auto_exposure: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["auto_exposure"]),
+    exposure: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["exposure"]),
+    gain: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["gain"]),
+    roi_exposure: Optional[str] = Query(None, description=CAMERA_CONTROL_INFO["roi_exposure"]),
+    brightness: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["brightness"]),
+    auto_white_balance: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["auto_white_balance"]),
+    white_balance: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["white_balance"]),
+    contrast: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["contrast"]),
+    saturation: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["saturation"]),
+    hue: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["hue"]),
+    gamma: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["gamma"]),
+    sharpness: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["sharpness"]),
+    black_level: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["black_level"]),
+    denoise: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["denoise"]),
+    hdr: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["hdr"]),
+    tone_control: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["tone_control"]),
+    qfactor: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["qfactor"]),
+    color_mode: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["color_mode"]),
+    scene_mode: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["scene_mode"]),
+    flicker: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["flicker"]),
+    flip: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["flip"]),
+    zoom: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["zoom"]),
+    pan: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["pan"]),
+    tilt: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["tilt"]),
+    stream_led: Optional[int] = Query(None, description=CAMERA_CONTROL_INFO["stream_led"]),
 ):
     """
-    The camera's built-in controls, applied in the camera. Send any subset;
-    omitted controls are left alone. The camera validates each value, and a
-    rejection comes back in `results` with the SDK's message, which names the
-    valid range (400 if any was rejected).
+    The camera's built-in controls, applied in the camera at once. Send any
+    subset; omitted controls are left alone. The camera validates each value,
+    and a rejection comes back in `results` with the SDK's message, which
+    names the valid range (400 if any was rejected).
 
-    Values survive a self-heal reopen but NOT a service restart, which
-    returns to the STREAM_API_CAMERA_<NAME> environment (auto exposure and
-    auto white balance on, everything else at the camera's default). Set the
-    env var in the unit to make a value permanent. They change the sensor, so
-    /stream moves with them, not only /capture.
+    Accepted values are **saved** to the settings file and come back after a
+    service restart or a reboot; no environment variable is needed. To undo
+    one, set it back; to undo everything, POST /camera/settings/reset. They
+    change the sensor, so /stream moves with them, not only /capture.
+    GET /camera/settings shows what is in force and what the camera reports.
     """
     values = {k: v for k, v in locals().items() if v is not None}
     if not values:
@@ -1736,12 +2023,112 @@ def camera_controls(
                 status_code=400,
             )
         values["roi_exposure"] = roi
-    results = set_camera_controls(values)
+    results, save_error = set_camera_controls(values)
     failed = [k for k, s in results.items() if s not in ("success", "stub") and not s.startswith("pending")]
     code = 200 if not failed else 400
     if not camera_status["ok"]:
         code = 503
-    return JSONResponse(content={"results": results, "camera": camera_status}, status_code=code)
+    return JSONResponse(
+        content={"results": results, "saved": save_error is None, "save_error": save_error, "camera": camera_status},
+        status_code=code,
+    )
+
+
+def _parse_output_arg(raw: Optional[str], parse):
+    """None (not given) -> _UNCHANGED, "auto" -> None (camera default),
+    else parse(raw), which returns (value, error)."""
+    if raw is None:
+        return _UNCHANGED, None
+    if raw.strip().lower() in ("auto", "default", ""):
+        return None, None
+    return parse(raw.strip())
+
+
+def _parse_format_arg(raw: str):
+    return raw.upper(), _check_format(raw)
+
+
+def _parse_size_arg(raw: str):
+    try:
+        size = tuple(int(v) for v in raw.lower().split("x"))
+    except ValueError:
+        size = None
+    error = _check_size(size) if size and len(size) == 2 else _check_size("bad")
+    return (size if not error else None), error
+
+
+def _parse_fps_arg(raw: str):
+    try:
+        fps = int(raw)
+    except ValueError:
+        return None, _check_fps("bad")
+    return fps, _check_fps(fps)
+
+
+@app.post("/camera/output", summary="Change the camera's pixel format, size or frame rate; saved")
+def camera_output(
+    format: Optional[str] = Query(
+        None,
+        description="MJPG (default first choice; /capture returns the camera's own JPEG), UYVY or YUYV "
+        "(uncompressed, slower over USB), BA81 (raw Bayer), RGB3, BGR3, GREY; auto = try MJPG, UYVY, YUYV, BA81 in turn",
+    ),
+    size: Optional[str] = Query(
+        None,
+        description="WxH, e.g. 1920x1080; auto = the camera's default. A size below the sensor's is a WINDOW "
+        "cut from the middle of the view, not a downscale. For a smaller picture of the whole scene use "
+        "/capture?preset= instead",
+    ),
+    fps: Optional[str] = Query(None, description="1-120; auto = the camera's default. Long exposures cap it regardless"),
+):
+    """
+    Output settings are fixed when the camera starts, so this reopens the
+    camera (a second or two without frames). If the camera will not stream
+    with the new settings, the previous ones are restored and the response
+    is 400 with the camera's reason, so a wrong value never leaves the
+    camera dark. Accepted settings are **saved** and survive a restart.
+    """
+    parsed = {}
+    for name, raw, parse in (("format", format, _parse_format_arg), ("size", size, _parse_size_arg), ("fps", fps, _parse_fps_arg)):
+        value, error = _parse_output_arg(raw, parse)
+        if error:
+            return JSONResponse(content={"error": f"bad {name}", "detail": error}, status_code=400)
+        parsed[name] = value
+    if all(v is _UNCHANGED for v in parsed.values()):
+        return JSONResponse(
+            content={"error": "nothing to change", "detail": "pass format, size and/or fps (or auto)"},
+            status_code=400,
+        )
+    error, save_error = set_camera_output(parsed["format"], parsed["size"], parsed["fps"])
+    if error:
+        return JSONResponse(
+            content={
+                "error": "camera would not stream with these settings; previous settings restored",
+                "detail": error,
+                "camera": camera_status,
+            },
+            status_code=400,
+        )
+    return JSONResponse(
+        content={"output": settings_summary()["output"], "saved": save_error is None, "save_error": save_error, "camera": camera_status},
+        status_code=200 if camera_status["ok"] else 503,
+    )
+
+
+@app.post("/camera/settings/reset", summary="Forget all saved camera settings and return to the camera's defaults")
+def camera_settings_reset():
+    """
+    Deletes the settings file and reopens the camera: every control returns
+    to the camera's own default (auto exposure and auto white balance on),
+    and format, size and frame rate to automatic.
+    """
+    error = reset_camera_settings()
+    if error:
+        return JSONResponse(content={"error": "settings file could not be deleted", "detail": error}, status_code=500)
+    summary = settings_summary()
+    return JSONResponse(
+        content={"in_force": {"controls": summary["controls"], "output": summary["output"]}, "camera": camera_status},
+        status_code=200 if camera_status["ok"] else 503,
+    )
 
 
 # ---------------------------------------------------------------------------
