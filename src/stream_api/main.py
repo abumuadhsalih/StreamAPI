@@ -18,6 +18,7 @@ from fastapi import FastAPI, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 
+from . import processing
 from .scale import parse_scale_line, resolve_scale_port, split_frames
 
 logger = logging.getLogger("stream_api")
@@ -452,6 +453,10 @@ def _load_settings_file() -> dict:
 _controls = _controls_from_env()
 _settings_saved = False
 
+# Software processing in force (processing.py), on top of the crop. Saved with
+# the camera settings; POST /camera/processing changes it.
+_processing = dict(processing.DEFAULTS)
+
 _saved = _load_settings_file()
 if _saved:
     for _name, _value in (_saved.get("controls") or {}).items():
@@ -469,6 +474,12 @@ if _saved:
         CAMERA_FPS = _out["fps"]
     if "crop" in _saved:
         CAMERA_CROP = _parse_crop(_saved["crop"])
+    _proc = _saved.get("processing") or {}
+    _why = processing.check(_proc) if isinstance(_proc, dict) else "not an object"
+    if _why:
+        logger.warning("camera settings file: processing %s, ignored", _why)
+    else:
+        _processing.update(_proc)
     _settings_saved = True
     logger.info("camera settings loaded from %s", CAMERA_SETTINGS_FILE)
 
@@ -488,7 +499,12 @@ def _save_settings() -> Optional[str]:
     the reason it could not be written; the change still holds until the
     next restart either way."""
     global _settings_saved
-    data = {"controls": dict(_controls), "output": _output_settings(), "crop": CAMERA_CROP}
+    data = {
+        "controls": dict(_controls),
+        "output": _output_settings(),
+        "crop": CAMERA_CROP,
+        "processing": dict(_processing),
+    }
     tmp = CAMERA_SETTINGS_FILE + ".tmp"
     try:
         os.makedirs(os.path.dirname(CAMERA_SETTINGS_FILE), exist_ok=True)
@@ -520,6 +536,8 @@ def _forget_settings() -> Optional[str]:
     CAMERA_SIZE = _parse_size(_env("STREAM_API_CAMERA_SIZE"))
     CAMERA_FPS = _parse_fps(_env("STREAM_API_CAMERA_FPS"))
     CAMERA_CROP = _parse_crop(_env("STREAM_API_CAMERA_CROP"))
+    _processing.clear()
+    _processing.update(processing.DEFAULTS)
     return None
 
 
@@ -530,6 +548,7 @@ def settings_summary() -> dict:
         "controls": _controls,
         "output": _output_settings(),
         "crop": CAMERA_CROP,
+        "processing": dict(_processing),
     }
 
 # ---------------------------------------------------------------------------
@@ -1032,13 +1051,22 @@ def _grab_frame() -> Optional[np.ndarray]:
         return None
 
 
-def get_color_frame(preset: Optional[str] = None, full: bool = False):
-    """Grab a frame, cropped to the tray (unless full) and scaled down to
-    fit the preset if one is given."""
+def _process(image: np.ndarray, raw: bool = False, stats: Optional[dict] = None) -> np.ndarray:
+    """The software processing in force (processing.py), unless raw."""
+    if raw:
+        return image
+    return processing.process(image, _processing, stats)
+
+
+def get_color_frame(preset: Optional[str] = None, full: bool = False, raw: bool = False):
+    """Grab a frame, cropped to the tray (unless full), scaled down to fit
+    the preset if one is given, then processed (unless raw). Processing runs
+    after the resize: it is scale-independent, and a 20 MP pass per stream
+    frame would stall the stream."""
     image = _grab_frame()
     if image is None:
         return None
-    return _fit(_crop(image, full), preset)
+    return _process(_fit(_crop(image, full), preset), raw)
 
 # ---------------------------------------------------------------------------
 # Scale — serial port on Linux; stub on other platforms for local dev
@@ -1755,10 +1783,10 @@ else:
 # Generators
 # ---------------------------------------------------------------------------
 
-def generate_mjpeg(preset: Optional[str], full: bool = False):
+def generate_mjpeg(preset: Optional[str], full: bool = False, raw: bool = False):
     """Yield MJPEG frames; ends cleanly if the camera goes down."""
     while True:
-        image = get_color_frame(preset, full)
+        image = get_color_frame(preset, full, raw)
         if image is None:
             if not camera_status["ok"]:
                 return
@@ -1955,21 +1983,22 @@ def system_stats():
 # ---------------------------------------------------------------------------
 
 @app.get("/stream", summary="Live MJPEG color stream")
-def stream(preset: Preset = "fhd", full: bool = False):
+def stream(preset: Preset = "fhd", full: bool = False, raw: bool = False):
     """
     The camera view cropped to the tray (POST /camera/crop; full=1 shows the
-    whole view), scaled down to fit the preset (aspect kept). A 20 MP
+    whole view), scaled down to fit the preset (aspect kept), processed
+    like /capture (raw=1 skips it). A 20 MP
     frame is decoded and re-encoded per frame here, so the frame rate depends
     on the camera format and the Jetson's CPU; /capture is the full-quality path.
     """
     # Probe once to trigger a lazy camera reopen if the camera has dropped.
-    if get_color_frame(preset, full) is None:
+    if get_color_frame(preset, full, raw) is None:
         return JSONResponse(
             content={"error": "camera not available", "detail": camera_status["error"]},
             status_code=503,
         )
     return StreamingResponse(
-        generate_mjpeg(preset, full),
+        generate_mjpeg(preset, full, raw),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
@@ -1982,50 +2011,58 @@ def _is_whole_jpeg(raw: np.ndarray) -> bool:
 
 
 @app.get("/capture", summary="Capture a single JPEG image")
-def capture(preset: Optional[Preset] = None, full: bool = False):
+def capture(preset: Optional[Preset] = None, full: bool = False, raw: bool = False):
     """
     The camera's frame, cropped to the tray when a crop box is set (POST
-    /camera/crop), otherwise the whole view. No other software step: no
-    de-glare, no enhance; the colours are the camera's own ISP under the
-    controls in force (POST /camera/controls).
+    /camera/crop), then processed to look like a phone photo (POST
+    /camera/processing: white balance, de-glare, shadow lift, saturation).
 
     full:   1 returns the whole view even when a crop box is set (to
             re-measure the box).
+    raw:    1 skips the processing: the camera's own picture (cropped
+            unless full=1), for an A/B.
     preset: unset, the frame comes back at full resolution. With no crop and
             an MJPEG camera this is the camera's own JPEG, byte for byte.
             Set, the frame is scaled down to fit the preset's box with its
             aspect kept.
 
     Headers: X-Resolution (the size returned), X-Pixel-Format (what the
-    camera streamed), X-Crop (the box applied, or "none").
+    camera streamed), X-Crop (the box applied, or "none"), X-Processing
+    (what the processing decided, or "none").
 
     Query params from the ZED branches (crop, deglare, enhance, fish, chroma)
     are no longer read; a client still sending them gets the plain frame.
     """
-    raw, fourcc = _grab_raw()
-    if raw is None:
+    frame_raw, fourcc = _grab_raw()
+    if frame_raw is None:
         return JSONResponse(
             content={"error": "camera not available", "detail": camera_status["error"]},
             status_code=503,
         )
     crop = None if full else CAMERA_CROP
     headers = {"X-Pixel-Format": fourcc, "X-Crop": ",".join(str(v) for v in crop) if crop else "none"}
-    if preset is None and crop is None and fourcc == "MJPG":
-        if not _is_whole_jpeg(raw):
+    if preset is None and crop is None and raw and fourcc == "MJPG":
+        if not _is_whole_jpeg(frame_raw):
             return JSONResponse(
                 content={"error": "camera not available", "detail": "the camera delivered a truncated JPEG frame"},
                 status_code=503,
             )
         frame = camera_status["frame"] or {}
         headers["X-Resolution"] = f"{frame.get('width')}x{frame.get('height')}"
-        return Response(content=raw.tobytes(), media_type="image/jpeg", headers=headers)
+        headers["X-Processing"] = "none"
+        return Response(content=frame_raw.tobytes(), media_type="image/jpeg", headers=headers)
     try:
-        image = _fit(_crop(decode_frame(raw, fourcc), full), preset)
+        image = _crop(decode_frame(frame_raw, fourcc), full)
     except ValueError as e:
         return JSONResponse(
             content={"error": "camera not available", "detail": str(e)},
             status_code=503,
         )
+    # Processed at full resolution, then scaled for the preset: the full
+    # frame is the quality path, and the steps don't depend on size.
+    stats: dict = {}
+    image = _fit(_process(image, raw, stats), preset)
+    headers["X-Processing"] = json.dumps(stats, separators=(",", ":")) if not raw else "none"
     headers["X-Resolution"] = f"{image.shape[1]}x{image.shape[0]}"
     _, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 100])
     return Response(content=jpeg.tobytes(), media_type="image/jpeg", headers=headers)
@@ -2058,7 +2095,12 @@ def camera_settings():
     """
     summary = settings_summary()
     return {
-        "in_force": {"controls": summary["controls"], "output": summary["output"], "crop": summary["crop"]},
+        "in_force": {
+            "controls": summary["controls"],
+            "output": summary["output"],
+            "crop": summary["crop"],
+            "processing": summary["processing"],
+        },
         "saved": summary["saved"],
         "file": summary["file"],
         "camera_reports": read_camera_values(),
@@ -2224,6 +2266,50 @@ def camera_output(
         content=content,
         status_code=200 if camera_status["ok"] else 503,
     )
+
+
+@app.post("/camera/processing", summary="Tune the software processing on /capture and /stream; saved")
+def camera_processing(
+    white_balance: Optional[bool] = Query(None, description="Grey-world white balance on the tray (neutral steel)"),
+    deglare: Optional[bool] = Query(None, description="Flatten the light reflections on the steel"),
+    deglare_strength: Optional[float] = Query(None, description="0-1, how much of the de-glare to apply"),
+    enhance: Optional[bool] = Query(None, description="Local contrast + shadow lift + light sharpening"),
+    target: Optional[int] = Query(None, description="60-220, the brightness enhance lifts a dark frame to (median lightness)"),
+    saturation: Optional[float] = Query(None, description="0-2, colour strength (1 = unchanged)"),
+    keep_chroma: Optional[bool] = Query(None, description="Keep colour strength in areas the processing brightens"),
+):
+    """
+    Changes only what is passed, saves it with the camera settings, and
+    applies from the next frame. Call with nothing to see what is in force.
+    /capture?raw=1 and /stream?raw=1 skip the processing for an A/B;
+    POST /camera/settings/reset returns to the defaults.
+    """
+    changes = {
+        k: v
+        for k, v in {
+            "white_balance": white_balance,
+            "deglare": deglare,
+            "deglare_strength": deglare_strength,
+            "enhance": enhance,
+            "target": target,
+            "saturation": saturation,
+            "keep_chroma": keep_chroma,
+        }.items()
+        if v is not None
+    }
+    why = processing.check(changes)
+    if why:
+        return JSONResponse(content={"error": "invalid value", "detail": why}, status_code=400)
+    save_error = None
+    if changes:
+        _processing.update(changes)
+        save_error = _save_settings()
+    return {
+        "processing": _processing,
+        "defaults": processing.DEFAULTS,
+        "saved": save_error is None,
+        "save_error": save_error,
+    }
 
 
 @app.post("/camera/crop", summary="Crop /capture and /stream to the tray; saved")
