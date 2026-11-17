@@ -21,6 +21,16 @@ from fastapi.responses import StreamingResponse, Response, JSONResponse
 from .scale import parse_scale_line, resolve_scale_port, split_frames
 
 logger = logging.getLogger("stream_api")
+# uvicorn configures only its own loggers, so without a handler here this
+# logger falls back to Python's last-resort handler, which drops everything
+# below WARNING: "camera opened", "camera formats skipped" and the other
+# INFO lines never reached the journal (found on the Jetson, 2026-11-17).
+if not logger.handlers:
+    _log_handler = logging.StreamHandler()
+    _log_handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    logger.addHandler(_log_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 app = FastAPI(title="Stream API")
 
@@ -165,11 +175,15 @@ def _parse_size(spec: str):
     return (w, h)
 
 
-# Output size from the camera, "WxH". Empty = the camera's default mode.
-# Beware the SDK's "virtual resolution": a size smaller than an advertised
-# mode is a WINDOW cut out of the larger mode, not a downscale, so 1920x1080
-# is a narrower view of the tray, not the whole tray at fewer pixels. For a
-# smaller image of the whole scene use ?preset= instead.
+# Output size from the camera, "WxH". Empty = the full 4:3 sensor,
+# CAMERA_FULL_SIZE. Measured on the Jetson (2026-11-17): the camera scales
+# the WHOLE view to whatever size is asked for, it does not cut a window.
+# Its own default is 1920x1080, which squeezes the 4:3 sensor into 16:9 and
+# flattens everything by 25% (fish came out long and flat), so the service
+# never leaves the size to the camera. Any size that is not 4:3 distorts the
+# picture the same way; 2560x1920 is the same view at half the pixels. For a
+# smaller copy of a full frame, /capture?preset= keeps the aspect.
+CAMERA_FULL_SIZE = (5120, 3840)
 CAMERA_SIZE = _parse_size(_env("STREAM_API_CAMERA_SIZE"))
 
 
@@ -617,8 +631,6 @@ if sys.platform == "linux":
     # reopened on a self-heal.
     _cam = None
     _dev: Optional[str] = None
-    # Whether a size window was set in this process (see _start).
-    _roi_set = False
 
     # Serialize all camera access: the SDK hands frames over a
     # single-consumer ring, and a lazy reopen from concurrent requests must be
@@ -665,18 +677,10 @@ if sys.platform == "linux":
         """Configure, start and read one frame in `fmt`. Returns it decoded;
         raises with the SDK's message if any step fails."""
         _check(_cam.set_pixel_format(_dev, fmt), "set_pixel_format")
-        global _roi_set
-        if CAMERA_SIZE:
-            _check(_cam.set_roi(_dev, width=CAMERA_SIZE[0], height=CAMERA_SIZE[1]), "set_roi")
-            _roi_set = True
-        elif _roi_set:
-            # Size went back to auto at runtime: the window set earlier may
-            # stay in the camera, so ask for the whole sensor again.
-            status = _cam.set_roi(_dev, x_offset=0, y_offset=0, width=5120, height=3840)
-            if status == "success":
-                _roi_set = False
-            else:
-                logger.warning("camera size not returned to the full sensor: %s", status)
+        # Always set: unset means the full 4:3 sensor, never the camera's own
+        # 16:9 default (see CAMERA_FULL_SIZE).
+        w, h = CAMERA_SIZE or CAMERA_FULL_SIZE
+        _check(_cam.set_roi(_dev, x_offset=0, y_offset=0, width=w, height=h), "set_roi")
         # Newest frame first: a request wants "now", not the oldest frame
         # queued since the last one (the same reasoning as the scale reader).
         _check(_cam.set_acquisition_mode(_dev, "continuous", order="lifo"), "set_acquisition_mode")
@@ -917,7 +921,7 @@ else:
             if image is not None:
                 return image
             logger.warning("STREAM_API_STUB_FRAME=%r could not be read", path)
-        w, h = CAMERA_SIZE or (5120, 3840)
+        w, h = CAMERA_SIZE or CAMERA_FULL_SIZE
         image = np.zeros((h, w, 3), dtype=np.uint8)
         cv2.putText(
             image,
@@ -1994,8 +1998,7 @@ def camera_settings():
       every open, and `saved` / `file`: whether they are in the settings
       file, i.e. survive a restart.
     - `camera_reports`: what the camera itself says is in force, read live
-      from the SDK's settings dump: size and offsets of the window read from
-      the sensor, pixel format, and the controls the camera can report
+      from the SDK's settings dump: output size, pixel format, and the controls the camera can report
       (brightness, exposure, contrast, sharpness, blacklevel, gamma, focus,
       flip). `set_only` lists the controls the camera applies but cannot
       report (hdr, saturation, flicker, ...): for those, `in_force` is the
@@ -2013,7 +2016,7 @@ def camera_settings():
         "controls": CAMERA_CONTROL_INFO,
         "output_options": {
             "format": list(CAMERA_PIXEL_FORMATS),
-            "size": "WxH, width 100-5120, height 100-3840",
+            "size": "WxH, width 100-5120, height 100-3840, keep 4:3; auto (null) = 5120x3840",
             "fps": "1-120",
         },
         "camera": camera_status,
@@ -2125,8 +2128,9 @@ def camera_output(
     ),
     size: Optional[str] = Query(
         None,
-        description="WxH, e.g. 1920x1080; auto = the camera's default. A size below the sensor's is a WINDOW "
-        "cut from the middle of the view, not a downscale. For a smaller picture of the whole scene use "
+        description="WxH; auto = the full sensor, 5120x3840. The camera scales the whole view to this size, so "
+        "keep it 4:3 (2560x1920, 1920x1440) or the picture is distorted: 1920x1080 flattens it by 25%. "
+        "For a smaller copy of a full frame use "
         "/capture?preset= instead",
     ),
     fps: Optional[str] = Query(None, description="1-120; auto = the camera's default. Long exposures cap it regardless"),
@@ -2159,8 +2163,16 @@ def camera_output(
             },
             status_code=400,
         )
+    content = {"output": settings_summary()["output"], "saved": save_error is None, "save_error": save_error}
+    new_size = parsed["size"]
+    if new_size not in (_UNCHANGED, None) and new_size[0] * 3 != new_size[1] * 4:
+        content["warning"] = (
+            f"{new_size[0]}x{new_size[1]} is not 4:3: the camera squeezes the whole view into it, "
+            "so the picture is distorted. Use 5120x3840, 2560x1920 or 1920x1440."
+        )
+    content["camera"] = camera_status
     return JSONResponse(
-        content={"output": settings_summary()["output"], "saved": save_error is None, "save_error": save_error, "camera": camera_status},
+        content=content,
         status_code=200 if camera_status["ok"] else 503,
     )
 
@@ -2170,7 +2182,7 @@ def camera_settings_reset():
     """
     Deletes the settings file and reopens the camera: every control returns
     to the camera's own default (auto exposure and auto white balance on),
-    and format, size and frame rate to automatic.
+    format and frame rate to automatic, and size to the full 4:3 sensor.
     """
     error = reset_camera_settings()
     if error:
