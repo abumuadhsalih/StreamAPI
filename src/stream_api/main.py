@@ -204,6 +204,46 @@ def _parse_fps(spec: str) -> Optional[int]:
 # mode. Long exposures cap it regardless.
 CAMERA_FPS = _parse_fps(_env("STREAM_API_CAMERA_FPS"))
 
+
+def _parse_crop(spec) -> Optional[list]:
+    """'x0,y0,x1,y1' (or a list of 4) as fractions of the frame -> [x0, y0,
+    x1, y1], or None for empty/off/garbage."""
+    if spec is None or spec == "" or (isinstance(spec, str) and spec.lower() in ("off", "none", "0")):
+        return None
+    try:
+        vals = [float(v) for v in (spec.split(",") if isinstance(spec, str) else spec)]
+    except (TypeError, ValueError):
+        return None
+    if len(vals) != 4:
+        return None
+    x0, y0, x1, y1 = vals
+    if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0) or x1 - x0 < 0.05 or y1 - y0 < 0.05:
+        return None
+    return [round(v, 4) for v in vals]
+
+
+# Crop to the tray — the one software step on the picture, asked for by the
+# user on 2026-11-17 ("crop it up to the four tray edges") after the camera
+# turned out to be mounted too high for its wide lens: the tray fills about
+# a quarter of the frame. The box is fractions of the frame (x0, y0, x1, y1),
+# so it holds at any output size; it is set at runtime with POST /camera/crop
+# and saved with the other settings. None = the whole view. It only cuts
+# pixels away, it adds no detail: at the full 5120x3840 the tray is about
+# 3100x1770. /capture?full=1 and /stream?full=1 bypass it, to re-measure the
+# box after the camera or the tray moves.
+CAMERA_CROP = _parse_crop(_env("STREAM_API_CAMERA_CROP"))
+if _env("STREAM_API_CAMERA_CROP") and CAMERA_CROP is None and _env("STREAM_API_CAMERA_CROP").lower() not in ("off", "none", "0"):
+    logger.warning("STREAM_API_CAMERA_CROP=%r is not x0,y0,x1,y1 fractions, ignored", _env("STREAM_API_CAMERA_CROP"))
+
+
+def _crop(image: np.ndarray, full: bool = False) -> np.ndarray:
+    """The tray part of the frame (CAMERA_CROP), or the whole frame."""
+    if full or CAMERA_CROP is None:
+        return image
+    h, w = image.shape[:2]
+    x0, y0, x1, y1 = CAMERA_CROP
+    return image[round(y0 * h):round(y1 * h), round(x0 * w):round(x1 * w)]
+
 # Only used if the camera streams raw Bayer (BA81). Vadzo's example converts
 # BA81 with COLOR_BayerRG2BGR; if red and blue come out swapped, try BG, GB or
 # GR. This is decoding, not processing: a Bayer frame is not an image until
@@ -427,6 +467,8 @@ if _saved:
         CAMERA_SIZE = tuple(_out["size"]) if _out["size"] else None
     if "fps" in _out and not _check_fps(_out["fps"]):
         CAMERA_FPS = _out["fps"]
+    if "crop" in _saved:
+        CAMERA_CROP = _parse_crop(_saved["crop"])
     _settings_saved = True
     logger.info("camera settings loaded from %s", CAMERA_SETTINGS_FILE)
 
@@ -446,7 +488,7 @@ def _save_settings() -> Optional[str]:
     the reason it could not be written; the change still holds until the
     next restart either way."""
     global _settings_saved
-    data = {"controls": dict(_controls), "output": _output_settings()}
+    data = {"controls": dict(_controls), "output": _output_settings(), "crop": CAMERA_CROP}
     tmp = CAMERA_SETTINGS_FILE + ".tmp"
     try:
         os.makedirs(os.path.dirname(CAMERA_SETTINGS_FILE), exist_ok=True)
@@ -463,7 +505,7 @@ def _save_settings() -> Optional[str]:
 def _forget_settings() -> Optional[str]:
     """Delete the settings file and return controls and output to env or
     defaults (in place: camera_status holds a reference to _controls)."""
-    global CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS, _settings_saved
+    global CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS, CAMERA_CROP, _settings_saved
     try:
         os.remove(CAMERA_SETTINGS_FILE)
     except FileNotFoundError:
@@ -477,6 +519,7 @@ def _forget_settings() -> Optional[str]:
     CAMERA_FORMATS = (fmt,) if fmt else _CAMERA_FORMATS_DEFAULT
     CAMERA_SIZE = _parse_size(_env("STREAM_API_CAMERA_SIZE"))
     CAMERA_FPS = _parse_fps(_env("STREAM_API_CAMERA_FPS"))
+    CAMERA_CROP = _parse_crop(_env("STREAM_API_CAMERA_CROP"))
     return None
 
 
@@ -486,6 +529,7 @@ def settings_summary() -> dict:
         "saved": _settings_saved,
         "controls": _controls,
         "output": _output_settings(),
+        "crop": CAMERA_CROP,
     }
 
 # ---------------------------------------------------------------------------
@@ -988,12 +1032,13 @@ def _grab_frame() -> Optional[np.ndarray]:
         return None
 
 
-def get_color_frame(preset: Optional[str] = None):
-    """Grab a frame, scaled down to fit the preset if one is given."""
+def get_color_frame(preset: Optional[str] = None, full: bool = False):
+    """Grab a frame, cropped to the tray (unless full) and scaled down to
+    fit the preset if one is given."""
     image = _grab_frame()
     if image is None:
         return None
-    return _fit(image, preset)
+    return _fit(_crop(image, full), preset)
 
 # ---------------------------------------------------------------------------
 # Scale — serial port on Linux; stub on other platforms for local dev
@@ -1710,10 +1755,10 @@ else:
 # Generators
 # ---------------------------------------------------------------------------
 
-def generate_mjpeg(preset: Optional[str]):
+def generate_mjpeg(preset: Optional[str], full: bool = False):
     """Yield MJPEG frames; ends cleanly if the camera goes down."""
     while True:
-        image = get_color_frame(preset)
+        image = get_color_frame(preset, full)
         if image is None:
             if not camera_status["ok"]:
                 return
@@ -1910,20 +1955,21 @@ def system_stats():
 # ---------------------------------------------------------------------------
 
 @app.get("/stream", summary="Live MJPEG color stream")
-def stream(preset: Preset = "fhd"):
+def stream(preset: Preset = "fhd", full: bool = False):
     """
-    The full camera view, scaled down to fit the preset (aspect kept). A 20 MP
+    The camera view cropped to the tray (POST /camera/crop; full=1 shows the
+    whole view), scaled down to fit the preset (aspect kept). A 20 MP
     frame is decoded and re-encoded per frame here, so the frame rate depends
     on the camera format and the Jetson's CPU; /capture is the full-quality path.
     """
     # Probe once to trigger a lazy camera reopen if the camera has dropped.
-    if get_color_frame(preset) is None:
+    if get_color_frame(preset, full) is None:
         return JSONResponse(
             content={"error": "camera not available", "detail": camera_status["error"]},
             status_code=503,
         )
     return StreamingResponse(
-        generate_mjpeg(preset),
+        generate_mjpeg(preset, full),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
@@ -1936,20 +1982,22 @@ def _is_whole_jpeg(raw: np.ndarray) -> bool:
 
 
 @app.get("/capture", summary="Capture a single JPEG image")
-def capture(preset: Optional[Preset] = None):
+def capture(preset: Optional[Preset] = None, full: bool = False):
     """
-    The camera's frame, unprocessed: no crop, no de-glare, no enhance. The
-    picture is whatever the camera's own ISP produces under the controls in
-    force (POST /camera/controls).
+    The camera's frame, cropped to the tray when a crop box is set (POST
+    /camera/crop), otherwise the whole view. No other software step: no
+    de-glare, no enhance; the colours are the camera's own ISP under the
+    controls in force (POST /camera/controls).
 
-    preset: unset, the frame comes back at the camera's native size. When the
-            camera streams MJPEG this is the camera's own JPEG, byte for byte,
-            neither decoded nor re-encoded. Set, the frame is scaled down to
-            fit the preset's box with its aspect kept (the AR2020 is 4:3, so
-            fhd is 1440x1080).
+    full:   1 returns the whole view even when a crop box is set (to
+            re-measure the box).
+    preset: unset, the frame comes back at full resolution. With no crop and
+            an MJPEG camera this is the camera's own JPEG, byte for byte.
+            Set, the frame is scaled down to fit the preset's box with its
+            aspect kept.
 
     Headers: X-Resolution (the size returned), X-Pixel-Format (what the
-    camera streamed).
+    camera streamed), X-Crop (the box applied, or "none").
 
     Query params from the ZED branches (crop, deglare, enhance, fish, chroma)
     are no longer read; a client still sending them gets the plain frame.
@@ -1960,8 +2008,9 @@ def capture(preset: Optional[Preset] = None):
             content={"error": "camera not available", "detail": camera_status["error"]},
             status_code=503,
         )
-    headers = {"X-Pixel-Format": fourcc}
-    if preset is None and fourcc == "MJPG":
+    crop = None if full else CAMERA_CROP
+    headers = {"X-Pixel-Format": fourcc, "X-Crop": ",".join(str(v) for v in crop) if crop else "none"}
+    if preset is None and crop is None and fourcc == "MJPG":
         if not _is_whole_jpeg(raw):
             return JSONResponse(
                 content={"error": "camera not available", "detail": "the camera delivered a truncated JPEG frame"},
@@ -1971,7 +2020,7 @@ def capture(preset: Optional[Preset] = None):
         headers["X-Resolution"] = f"{frame.get('width')}x{frame.get('height')}"
         return Response(content=raw.tobytes(), media_type="image/jpeg", headers=headers)
     try:
-        image = _fit(decode_frame(raw, fourcc), preset)
+        image = _fit(_crop(decode_frame(raw, fourcc), full), preset)
     except ValueError as e:
         return JSONResponse(
             content={"error": "camera not available", "detail": str(e)},
@@ -2009,7 +2058,7 @@ def camera_settings():
     """
     summary = settings_summary()
     return {
-        "in_force": {"controls": summary["controls"], "output": summary["output"]},
+        "in_force": {"controls": summary["controls"], "output": summary["output"], "crop": summary["crop"]},
         "saved": summary["saved"],
         "file": summary["file"],
         "camera_reports": read_camera_values(),
@@ -2177,12 +2226,43 @@ def camera_output(
     )
 
 
+@app.post("/camera/crop", summary="Crop /capture and /stream to the tray; saved")
+def camera_crop(
+    box: str = Query(
+        ...,
+        description="x0,y0,x1,y1 as fractions of the whole view (0-1), e.g. 0.174,0.278,0.786,0.740; off = the whole view",
+    ),
+):
+    """
+    Sets the crop box and saves it with the other camera settings. Fractions,
+    so the box holds at any output size. Measure it on /capture?full=1: pixel
+    x / image width, pixel y / image height, for the tray's left, top, right
+    and bottom edges.
+    """
+    global CAMERA_CROP
+    crop = _parse_crop(box)
+    if crop is None and box.strip().lower() not in ("off", "none", "0"):
+        return JSONResponse(
+            content={
+                "error": "invalid box",
+                "detail": "box must be x0,y0,x1,y1 with 0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1, or off",
+            },
+            status_code=400,
+        )
+    CAMERA_CROP = crop
+    save_error = _save_settings()
+    w, h = CAMERA_SIZE or CAMERA_FULL_SIZE
+    size = f"{round((crop[2] - crop[0]) * w)}x{round((crop[3] - crop[1]) * h)}" if crop else f"{w}x{h}"
+    return {"crop": crop, "capture_size": size, "saved": save_error is None, "save_error": save_error}
+
+
 @app.post("/camera/settings/reset", summary="Forget all saved camera settings and return to the camera's defaults")
 def camera_settings_reset():
     """
     Deletes the settings file and reopens the camera: every control returns
     to the camera's own default (auto exposure and auto white balance on),
-    format and frame rate to automatic, and size to the full 4:3 sensor.
+    format and frame rate to automatic, size to the full 4:3 sensor, and
+    the crop off.
     """
     error = reset_camera_settings()
     if error:
