@@ -8,6 +8,7 @@ import asyncio
 import logging
 import threading
 import subprocess
+import tempfile
 from typing import Literal, Optional
 import cv2
 import numpy as np
@@ -547,6 +548,41 @@ def _battery_failed(error: str) -> None:
 _FRAME_TIMEOUT = 2.0
 _FIRST_FRAME_TIMEOUT = 5.0
 
+def _parse_settings_dump(text: str) -> dict:
+    """The SDK's get_settings() YAML (plain "key: value" lines nested by
+    indentation) as a dict. Hand-rolled: PyYAML is not a dependency, and
+    the dump uses no other YAML syntax."""
+    root: dict = {}
+    stack = [(-1, root)]
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
+            continue
+        indent = len(line) - len(line.lstrip())
+        key, _, raw = line.strip().partition(":")
+        raw = raw.strip()
+        while stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1]
+        if not raw:
+            parent[key] = {}
+            stack.append((indent, parent[key]))
+            continue
+        value = raw
+        if raw in ("True", "true"):
+            value = True
+        elif raw in ("False", "false"):
+            value = False
+        else:
+            for cast in (int, float):
+                try:
+                    value = cast(raw)
+                    break
+                except ValueError:
+                    pass
+        parent[key] = value
+    return root
+
+
 # "Not given" for POST /camera/output, distinct from None ("camera default").
 _UNCHANGED = object()
 
@@ -827,27 +863,39 @@ if sys.platform == "linux":
         return error
 
     def read_camera_values() -> dict:
-        """What the camera itself reports for each control, via
-        get_setting(): the real value in force, including ones never set
-        here (the camera's defaults). The guide documents get_setting for
-        "exposure" and "fps"; other names are tried with the control's own
-        name and whatever the SDK answers is shown, error text included."""
-        out: dict = {}
+        """What the camera itself reports, from the SDK's get_settings()
+        dump. Checked on the Jetson (2026-11-17): the camera keeps only its
+        standard set there (size, offsets, pixel format, brightness,
+        exposure, sharpness, contrast, blacklevel, gamma, focus, flip, ...).
+        The other _op controls (hdr, saturation, flicker, white balance, ...)
+        are write-only: the camera applies them but cannot report them, and
+        get_setting() answers "SDK error" for them. get_temperature() returned
+        -69 and -4256 on the same camera, so it is not read."""
+        path = os.path.join(tempfile.gettempdir(), f"stream-api-camera-{os.getpid()}.yml")
         with _camera_lock:
             if not camera_status["ok"]:
                 return {"error": "camera not open"}
-            for name in ("fps",) + tuple(n for n in CAMERA_CONTROLS if n != "roi_exposure"):
-                try:
-                    value = _cam.get_setting(_dev, name)
-                except Exception as e:
-                    value = f"unreadable: {e}"
-                out[name] = value if isinstance(value, (int, float, str)) else repr(value)
             try:
-                temp = _cam.get_temperature(_dev)
-                out["temperature_c"] = round(temp, 1) if isinstance(temp, float) else f"unreadable: {temp}"
+                status = _cam.get_settings(_dev, path)
+                if status != "success":
+                    return {"error": f"get_settings: {status}"}
+                with open(path) as f:
+                    dump = _parse_settings_dump(f.read())
             except Exception as e:
-                out["temperature_c"] = f"unreadable: {e}"
-        return out
+                return {"error": f"get_settings: {e}"}
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        reported = dump.get("camera", {}) if isinstance(dump.get("camera"), dict) else {}
+        keys = {k.replace("_", "") for k in reported}
+        return {
+            "camera": reported,
+            "stream": dump.get("stream"),
+            "processing": dump.get("processing"),
+            "set_only": [n for n in CAMERA_CONTROLS if n.replace("_", "") not in keys],
+        }
 
     @app.on_event("startup")
     def _camera_startup():
@@ -921,7 +969,7 @@ else:
         return error
 
     def read_camera_values() -> dict:
-        return {"stub": "no camera; values are read from a real camera only"}
+        return {"error": "stub: no camera; values are read from a real camera only"}
 
 
 def _grab_frame() -> Optional[np.ndarray]:
@@ -1946,9 +1994,12 @@ def camera_settings():
       every open, and `saved` / `file`: whether they are in the settings
       file, i.e. survive a restart.
     - `camera_reports`: what the camera itself says is in force, read live
-      with the SDK's get_setting(): the real values, including the camera's
-      defaults for controls never set here. Values the SDK cannot read show
-      its error text. Empty while the camera is down.
+      from the SDK's settings dump: size and offsets of the window read from
+      the sensor, pixel format, and the controls the camera can report
+      (brightness, exposure, contrast, sharpness, blacklevel, gamma, focus,
+      flip). `set_only` lists the controls the camera applies but cannot
+      report (hdr, saturation, flicker, ...): for those, `in_force` is the
+      only record. An `error` while the camera is down.
     - `controls`: every control POST /camera/controls takes, with the value
       range Vadzo documents.
     - `camera`: the same status as /health.
