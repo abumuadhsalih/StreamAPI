@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import glob
+import functools
 import hmac
 import asyncio
 import logging
@@ -237,12 +238,67 @@ if _env("STREAM_API_CAMERA_CROP") and CAMERA_CROP is None and _env("STREAM_API_C
     logger.warning("STREAM_API_CAMERA_CROP=%r is not x0,y0,x1,y1 fractions, ignored", _env("STREAM_API_CAMERA_CROP"))
 
 
+def _parse_undistort(spec) -> Optional[float]:
+    """A k1 coefficient (-1..1, 0 = off) from a string or number, else None."""
+    if spec is None or spec == "":
+        return None
+    if isinstance(spec, str) and spec.lower() in ("off", "none"):
+        return 0.0
+    try:
+        k1 = float(spec)
+    except (TypeError, ValueError):
+        return None
+    return round(k1, 4) if -1.0 <= k1 <= 1.0 else None
+
+
+# Lens (barrel) distortion correction, asked for on 2026-11-19: the client saw
+# the tray's straight rims come out curved. The Falcon's wide lens bends every
+# straight line that is away from the centre of the view outward. Measured on
+# full1.jpg (2026-11-18, the whole 5120x3840 view): fitting the tray rims and
+# the floor-tile lines with the one-term radial model (OpenCV's k1, focal
+# length taken as the image width, centre at the middle of the view) gives
+# k1 = -0.275, which straightened the rims from 15-19 px off a line to 4-6 px.
+# A size is a scale of the whole view (see CLAUDE.md), so the same k1 holds at
+# any output size. It runs on the whole view, before the crop: the distortion
+# is centred on the lens, not on the tray. The crop box is measured on the
+# corrected view, so changing k1 means re-measuring the box. 0 turns it off.
+CAMERA_UNDISTORT_DEFAULT = -0.275
+CAMERA_UNDISTORT = _parse_undistort(_env("STREAM_API_CAMERA_UNDISTORT"))
+if CAMERA_UNDISTORT is None:
+    if _env("STREAM_API_CAMERA_UNDISTORT"):
+        logger.warning("STREAM_API_CAMERA_UNDISTORT=%r is not a number in -1..1, ignored", _env("STREAM_API_CAMERA_UNDISTORT"))
+    CAMERA_UNDISTORT = CAMERA_UNDISTORT_DEFAULT
+
+
+@functools.lru_cache(maxsize=4)
+def _undistort_maps(w: int, h: int, k1: float, box: Optional[tuple]):
+    """remap() tables that produce the `box` part (fractions, or None for all)
+    of the corrected w x h view straight from the distorted frame, so only
+    the pixels kept are computed. Same model as cv2.undistort with
+    distCoeffs (k1, 0, 0, 0) and K = [[w, 0, w/2], [0, w, h/2]]."""
+    x0, y0, x1, y1 = box or (0.0, 0.0, 1.0, 1.0)
+    xs = np.arange(round(x0 * w), round(x1 * w), dtype=np.float32)
+    ys = np.arange(round(y0 * h), round(y1 * h), dtype=np.float32)
+    f, cx, cy = float(w), w / 2.0, h / 2.0
+    u = (xs[None, :] - cx) / f
+    v = (ys[:, None] - cy) / f
+    scale = 1.0 + k1 * (u * u + v * v)
+    map_x = (u * scale * f + cx).astype(np.float32)
+    map_y = (v * scale * f + cy).astype(np.float32)
+    return cv2.convertMaps(map_x, map_y, cv2.CV_16SC2)
+
+
 def _crop(image: np.ndarray, full: bool = False) -> np.ndarray:
-    """The tray part of the frame (CAMERA_CROP), or the whole frame."""
-    if full or CAMERA_CROP is None:
-        return image
+    """The frame with the lens distortion corrected (CAMERA_UNDISTORT), cut
+    to the tray (CAMERA_CROP) unless full."""
+    box = None if full or CAMERA_CROP is None else tuple(CAMERA_CROP)
     h, w = image.shape[:2]
-    x0, y0, x1, y1 = CAMERA_CROP
+    if CAMERA_UNDISTORT:
+        m1, m2 = _undistort_maps(w, h, CAMERA_UNDISTORT, box)
+        return cv2.remap(image, m1, m2, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    if box is None:
+        return image
+    x0, y0, x1, y1 = box
     return image[round(y0 * h):round(y1 * h), round(x0 * w):round(x1 * w)]
 
 # Only used if the camera streams raw Bayer (BA81). Vadzo's example converts
@@ -474,6 +530,12 @@ if _saved:
         CAMERA_FPS = _out["fps"]
     if "crop" in _saved:
         CAMERA_CROP = _parse_crop(_saved["crop"])
+    if "undistort" in _saved:
+        _k1 = _parse_undistort(_saved["undistort"])
+        if _k1 is None:
+            logger.warning("camera settings file: undistort %r is not a number in -1..1, ignored", _saved["undistort"])
+        else:
+            CAMERA_UNDISTORT = _k1
     _proc = _saved.get("processing") or {}
     _why = processing.check(_proc) if isinstance(_proc, dict) else "not an object"
     if _why:
@@ -503,6 +565,7 @@ def _save_settings() -> Optional[str]:
         "controls": dict(_controls),
         "output": _output_settings(),
         "crop": CAMERA_CROP,
+        "undistort": CAMERA_UNDISTORT,
         "processing": dict(_processing),
     }
     tmp = CAMERA_SETTINGS_FILE + ".tmp"
@@ -521,7 +584,7 @@ def _save_settings() -> Optional[str]:
 def _forget_settings() -> Optional[str]:
     """Delete the settings file and return controls and output to env or
     defaults (in place: camera_status holds a reference to _controls)."""
-    global CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS, CAMERA_CROP, _settings_saved
+    global CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS, CAMERA_CROP, CAMERA_UNDISTORT, _settings_saved
     try:
         os.remove(CAMERA_SETTINGS_FILE)
     except FileNotFoundError:
@@ -536,6 +599,9 @@ def _forget_settings() -> Optional[str]:
     CAMERA_SIZE = _parse_size(_env("STREAM_API_CAMERA_SIZE"))
     CAMERA_FPS = _parse_fps(_env("STREAM_API_CAMERA_FPS"))
     CAMERA_CROP = _parse_crop(_env("STREAM_API_CAMERA_CROP"))
+    CAMERA_UNDISTORT = _parse_undistort(_env("STREAM_API_CAMERA_UNDISTORT"))
+    if CAMERA_UNDISTORT is None:
+        CAMERA_UNDISTORT = CAMERA_UNDISTORT_DEFAULT
     _processing.clear()
     _processing.update(processing.DEFAULTS)
     return None
@@ -548,6 +614,7 @@ def settings_summary() -> dict:
         "controls": _controls,
         "output": _output_settings(),
         "crop": CAMERA_CROP,
+        "undistort": CAMERA_UNDISTORT,
         "processing": dict(_processing),
     }
 
@@ -2027,7 +2094,8 @@ def capture(preset: Optional[Preset] = None, full: bool = False, raw: bool = Fal
             aspect kept.
 
     Headers: X-Resolution (the size returned), X-Pixel-Format (what the
-    camera streamed), X-Crop (the box applied, or "none"), X-Processing
+    camera streamed), X-Crop (the box applied, or "none"), X-Undistort (the
+    lens correction k1, or "none"), X-Processing
     (what the processing decided, or "none").
 
     Query params from the ZED branches (crop, deglare, enhance, fish, chroma)
@@ -2040,8 +2108,12 @@ def capture(preset: Optional[Preset] = None, full: bool = False, raw: bool = Fal
             status_code=503,
         )
     crop = None if full else CAMERA_CROP
-    headers = {"X-Pixel-Format": fourcc, "X-Crop": ",".join(str(v) for v in crop) if crop else "none"}
-    if preset is None and crop is None and raw and fourcc == "MJPG":
+    headers = {
+        "X-Pixel-Format": fourcc,
+        "X-Crop": ",".join(str(v) for v in crop) if crop else "none",
+        "X-Undistort": str(CAMERA_UNDISTORT) if CAMERA_UNDISTORT else "none",
+    }
+    if preset is None and crop is None and not CAMERA_UNDISTORT and raw and fourcc == "MJPG":
         if not _is_whole_jpeg(frame_raw):
             return JSONResponse(
                 content={"error": "camera not available", "detail": "the camera delivered a truncated JPEG frame"},
@@ -2340,6 +2412,38 @@ def camera_crop(
     w, h = CAMERA_SIZE or CAMERA_FULL_SIZE
     size = f"{round((crop[2] - crop[0]) * w)}x{round((crop[3] - crop[1]) * h)}" if crop else f"{w}x{h}"
     return {"crop": crop, "capture_size": size, "saved": save_error is None, "save_error": save_error}
+
+
+@app.post("/camera/undistort", summary="Straighten the lens's barrel distortion; saved")
+def camera_undistort(
+    k1: str = Query(
+        ...,
+        description=f"radial coefficient, -1..1 (negative straightens barrel distortion); "
+        f"{CAMERA_UNDISTORT_DEFAULT} was measured for this lens; 0 or off = no correction",
+    ),
+):
+    """
+    Sets the lens correction applied to the whole view before the crop, and
+    saves it. The crop box is measured on the corrected view, so after
+    changing k1, re-measure the box on /capture?full=1 and set it again with
+    POST /camera/crop.
+    """
+    global CAMERA_UNDISTORT
+    value = _parse_undistort(k1)
+    if value is None:
+        return JSONResponse(
+            content={"error": "invalid k1", "detail": "k1 must be a number in -1..1, or off"},
+            status_code=400,
+        )
+    CAMERA_UNDISTORT = value
+    save_error = _save_settings()
+    return {
+        "undistort": value,
+        "default": CAMERA_UNDISTORT_DEFAULT,
+        "crop": CAMERA_CROP,
+        "saved": save_error is None,
+        "save_error": save_error,
+    }
 
 
 @app.post("/camera/settings/reset", summary="Forget all saved camera settings and return to the camera's defaults")

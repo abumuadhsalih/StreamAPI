@@ -12,6 +12,7 @@ A FastAPI server that exposes a Vadzo Falcon-2020CRS camera (onsemi AR2020, 20 M
 | POST | `/camera/controls` | The camera's built-in ISP controls: exposure, gain, white balance, colour, HDR, denoise, JPEG quality, flicker, flip, zoom, ... Saved, survive a restart |
 | POST | `/camera/output` | Pixel format, size, frame rate. Size defaults to the full 4:3 sensor (5120×3840); keep any other size 4:3 or the picture is distorted. Reopens the camera, reverts if it will not stream. Saved |
 | POST | `/camera/crop?box=x0,y0,x1,y1` | Crop `/capture` and `/stream` to the tray: fractions of the whole view, `off` for the whole view. `?full=1` on either bypasses it. Saved |
+| POST | `/camera/undistort?k1=-0.275` | Straighten the lens's barrel distortion (curved tray rims) on the whole view, before the crop. `-0.275` is measured for this lens and is the default; `0`/`off` disables it. Re-measure the crop box after changing it. Saved |
 | POST | `/camera/processing` | Software processing on `/capture` and `/stream` so the picture looks like a phone photo: `white_balance`, `deglare`, `deglare_strength`, `enhance`, `target`, `saturation`, `keep_chroma`. All on by default. `?raw=1` on either endpoint skips it. Saved |
 | POST | `/camera/settings/reset` | Forget all saved camera settings, back to the camera's defaults |
 | GET | `/scale/stream` | Live weight stream (SSE) — see `SCALE_API.md` |
