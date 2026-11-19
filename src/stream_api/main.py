@@ -270,31 +270,84 @@ if CAMERA_UNDISTORT is None:
     CAMERA_UNDISTORT = CAMERA_UNDISTORT_DEFAULT
 
 
+def _parse_corners(spec) -> Optional[list]:
+    """'x,y,x,y,x,y,x,y' (or a list of 8): the tray's top-left, top-right,
+    bottom-right and bottom-left corners as fractions of the corrected whole
+    view -> the list, or None for empty/off/garbage (including a quad that
+    is not convex or not in that order)."""
+    if spec is None or spec == "" or (isinstance(spec, str) and spec.lower() in ("off", "none", "0")):
+        return None
+    try:
+        vals = [float(v) for v in (spec.split(",") if isinstance(spec, str) else spec)]
+    except (TypeError, ValueError):
+        return None
+    if len(vals) != 8 or not all(0.0 <= v <= 1.0 for v in vals):
+        return None
+    pts = np.array(vals, dtype=np.float64).reshape(4, 2)
+    # Clockwise on screen (y down) means every cross product is positive.
+    for k in range(4):
+        a, b, c = pts[k], pts[(k + 1) % 4], pts[(k + 2) % 4]
+        if (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]) <= 0:
+            return None
+    return [round(v, 4) for v in vals]
+
+
+# Square the tray up (2026-11-19, after the lens correction): the camera does
+# not point exactly straight down, so the tray comes out slightly rotated and
+# narrower at the bottom (keystone). Its four outer corners, measured on the
+# corrected whole view (/capture?full=1), are warped onto an exact rectangle
+# the size of the tray's longer edges. When set it replaces the crop box;
+# like the box it holds only until the camera or the tray moves.
+CAMERA_CORNERS = _parse_corners(_env("STREAM_API_CAMERA_CORNERS"))
+
+
+def _corners_size(w: int, h: int, corners) -> tuple[int, int]:
+    """Output width x height for a corner quad on a w x h view: the longer of
+    each pair of opposite edges, so no part of the tray is shrunk."""
+    p = np.array(corners, dtype=np.float64).reshape(4, 2) * (w, h)
+    d = lambda a, b: float(np.hypot(*(p[a] - p[b])))
+    return round(max(d(0, 1), d(3, 2))), round(max(d(0, 3), d(1, 2)))
+
+
 @functools.lru_cache(maxsize=4)
-def _undistort_maps(w: int, h: int, k1: float, box: Optional[tuple]):
-    """remap() tables that produce the `box` part (fractions, or None for all)
-    of the corrected w x h view straight from the distorted frame, so only
-    the pixels kept are computed. Same model as cv2.undistort with
+def _geometry_maps(w: int, h: int, k1: float, box: Optional[tuple], corners: Optional[tuple]):
+    """remap() tables that produce the output straight from the distorted
+    w x h frame, so only the pixels kept are computed: the `corners` quad
+    warped to a rectangle, else the `box` part (fractions, None = all), of
+    the lens-corrected view. The lens model is cv2.undistort's with
     distCoeffs (k1, 0, 0, 0) and K = [[w, 0, w/2], [0, w, h/2]]."""
-    x0, y0, x1, y1 = box or (0.0, 0.0, 1.0, 1.0)
-    xs = np.arange(round(x0 * w), round(x1 * w), dtype=np.float32)
-    ys = np.arange(round(y0 * h), round(y1 * h), dtype=np.float32)
-    f, cx, cy = float(w), w / 2.0, h / 2.0
-    u = (xs[None, :] - cx) / f
-    v = (ys[:, None] - cy) / f
-    scale = 1.0 + k1 * (u * u + v * v)
-    map_x = (u * scale * f + cx).astype(np.float32)
-    map_y = (v * scale * f + cy).astype(np.float32)
-    return cv2.convertMaps(map_x, map_y, cv2.CV_16SC2)
+    if corners:
+        ow, oh = _corners_size(w, h, corners)
+        quad = (np.array(corners, dtype=np.float32).reshape(4, 2) * (w, h)).astype(np.float32)
+        rect = np.array([[0, 0], [ow - 1, 0], [ow - 1, oh - 1], [0, oh - 1]], dtype=np.float32)
+        m = cv2.getPerspectiveTransform(rect, quad)
+        gx, gy = np.meshgrid(np.arange(ow, dtype=np.float32), np.arange(oh, dtype=np.float32))
+        den = m[2, 0] * gx + m[2, 1] * gy + m[2, 2]
+        xs = (m[0, 0] * gx + m[0, 1] * gy + m[0, 2]) / den
+        ys = (m[1, 0] * gx + m[1, 1] * gy + m[1, 2]) / den
+    else:
+        x0, y0, x1, y1 = box or (0.0, 0.0, 1.0, 1.0)
+        xs, ys = np.meshgrid(
+            np.arange(round(x0 * w), round(x1 * w), dtype=np.float32),
+            np.arange(round(y0 * h), round(y1 * h), dtype=np.float32),
+        )
+    if k1:
+        f, cx, cy = float(w), w / 2.0, h / 2.0
+        u, v = (xs - cx) / f, (ys - cy) / f
+        scale = 1.0 + k1 * (u * u + v * v)
+        xs, ys = u * scale * f + cx, v * scale * f + cy
+    return cv2.convertMaps(xs.astype(np.float32), ys.astype(np.float32), cv2.CV_16SC2)
 
 
 def _crop(image: np.ndarray, full: bool = False) -> np.ndarray:
-    """The frame with the lens distortion corrected (CAMERA_UNDISTORT), cut
-    to the tray (CAMERA_CROP) unless full."""
-    box = None if full or CAMERA_CROP is None else tuple(CAMERA_CROP)
+    """The frame with the lens distortion corrected (CAMERA_UNDISTORT), then
+    unless full: the tray squared up from its corners (CAMERA_CORNERS), or
+    else cut to the crop box (CAMERA_CROP)."""
+    corners = None if full or CAMERA_CORNERS is None else tuple(CAMERA_CORNERS)
+    box = None if full or corners or CAMERA_CROP is None else tuple(CAMERA_CROP)
     h, w = image.shape[:2]
-    if CAMERA_UNDISTORT:
-        m1, m2 = _undistort_maps(w, h, CAMERA_UNDISTORT, box)
+    if CAMERA_UNDISTORT or corners:
+        m1, m2 = _geometry_maps(w, h, CAMERA_UNDISTORT, box, corners)
         return cv2.remap(image, m1, m2, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
     if box is None:
         return image
@@ -530,6 +583,8 @@ if _saved:
         CAMERA_FPS = _out["fps"]
     if "crop" in _saved:
         CAMERA_CROP = _parse_crop(_saved["crop"])
+    if "corners" in _saved:
+        CAMERA_CORNERS = _parse_corners(_saved["corners"])
     if "undistort" in _saved:
         _k1 = _parse_undistort(_saved["undistort"])
         if _k1 is None:
@@ -565,6 +620,7 @@ def _save_settings() -> Optional[str]:
         "controls": dict(_controls),
         "output": _output_settings(),
         "crop": CAMERA_CROP,
+        "corners": CAMERA_CORNERS,
         "undistort": CAMERA_UNDISTORT,
         "processing": dict(_processing),
     }
@@ -584,7 +640,7 @@ def _save_settings() -> Optional[str]:
 def _forget_settings() -> Optional[str]:
     """Delete the settings file and return controls and output to env or
     defaults (in place: camera_status holds a reference to _controls)."""
-    global CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS, CAMERA_CROP, CAMERA_UNDISTORT, _settings_saved
+    global CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS, CAMERA_CROP, CAMERA_CORNERS, CAMERA_UNDISTORT, _settings_saved
     try:
         os.remove(CAMERA_SETTINGS_FILE)
     except FileNotFoundError:
@@ -599,6 +655,7 @@ def _forget_settings() -> Optional[str]:
     CAMERA_SIZE = _parse_size(_env("STREAM_API_CAMERA_SIZE"))
     CAMERA_FPS = _parse_fps(_env("STREAM_API_CAMERA_FPS"))
     CAMERA_CROP = _parse_crop(_env("STREAM_API_CAMERA_CROP"))
+    CAMERA_CORNERS = _parse_corners(_env("STREAM_API_CAMERA_CORNERS"))
     CAMERA_UNDISTORT = _parse_undistort(_env("STREAM_API_CAMERA_UNDISTORT"))
     if CAMERA_UNDISTORT is None:
         CAMERA_UNDISTORT = CAMERA_UNDISTORT_DEFAULT
@@ -614,6 +671,7 @@ def settings_summary() -> dict:
         "controls": _controls,
         "output": _output_settings(),
         "crop": CAMERA_CROP,
+        "corners": CAMERA_CORNERS,
         "undistort": CAMERA_UNDISTORT,
         "processing": dict(_processing),
     }
@@ -2094,7 +2152,8 @@ def capture(preset: Optional[Preset] = None, full: bool = False, raw: bool = Fal
             aspect kept.
 
     Headers: X-Resolution (the size returned), X-Pixel-Format (what the
-    camera streamed), X-Crop (the box applied, or "none"), X-Undistort (the
+    camera streamed), X-Crop (the box applied, or "none"), X-Corners (the
+    tray corners squared up, or "none"; they replace the box), X-Undistort (the
     lens correction k1, or "none"), X-Processing
     (what the processing decided, or "none").
 
@@ -2107,13 +2166,15 @@ def capture(preset: Optional[Preset] = None, full: bool = False, raw: bool = Fal
             content={"error": "camera not available", "detail": camera_status["error"]},
             status_code=503,
         )
-    crop = None if full else CAMERA_CROP
+    corners = None if full else CAMERA_CORNERS
+    crop = None if full or corners else CAMERA_CROP
     headers = {
         "X-Pixel-Format": fourcc,
         "X-Crop": ",".join(str(v) for v in crop) if crop else "none",
+        "X-Corners": ",".join(str(v) for v in corners) if corners else "none",
         "X-Undistort": str(CAMERA_UNDISTORT) if CAMERA_UNDISTORT else "none",
     }
-    if preset is None and crop is None and not CAMERA_UNDISTORT and raw and fourcc == "MJPG":
+    if preset is None and crop is None and corners is None and not CAMERA_UNDISTORT and raw and fourcc == "MJPG":
         if not _is_whole_jpeg(frame_raw):
             return JSONResponse(
                 content={"error": "camera not available", "detail": "the camera delivered a truncated JPEG frame"},
@@ -2414,6 +2475,39 @@ def camera_crop(
     return {"crop": crop, "capture_size": size, "saved": save_error is None, "save_error": save_error}
 
 
+@app.post("/camera/corners", summary="Square the tray up from its four corners; saved")
+def camera_corners(
+    points: str = Query(
+        ...,
+        description="top-left, top-right, bottom-right, bottom-left corners as x,y fractions of the "
+        "lens-corrected whole view (/capture?full=1), 8 numbers; off = use the crop box",
+    ),
+):
+    """
+    Warps the tray's four outer corners onto an exact rectangle, which takes
+    out the tilt and keystone of a camera that is not pointing exactly
+    straight down. Replaces the crop box while set; saved with the other
+    camera settings. Measure the corners on /capture?full=1 (it is already
+    lens-corrected): pixel x / image width, pixel y / image height.
+    """
+    global CAMERA_CORNERS
+    corners = _parse_corners(points)
+    if corners is None and points.strip().lower() not in ("off", "none", "0"):
+        return JSONResponse(
+            content={
+                "error": "invalid points",
+                "detail": "points must be 8 fractions 0-1: top-left, top-right, bottom-right, bottom-left x,y "
+                "(clockwise, convex), or off",
+            },
+            status_code=400,
+        )
+    CAMERA_CORNERS = corners
+    save_error = _save_settings()
+    w, h = CAMERA_SIZE or CAMERA_FULL_SIZE
+    size = "x".join(map(str, _corners_size(w, h, corners))) if corners else None
+    return {"corners": corners, "capture_size": size, "crop": CAMERA_CROP, "saved": save_error is None, "save_error": save_error}
+
+
 @app.post("/camera/undistort", summary="Straighten the lens's barrel distortion; saved")
 def camera_undistort(
     k1: str = Query(
@@ -2424,9 +2518,9 @@ def camera_undistort(
 ):
     """
     Sets the lens correction applied to the whole view before the crop, and
-    saves it. The crop box is measured on the corrected view, so after
-    changing k1, re-measure the box on /capture?full=1 and set it again with
-    POST /camera/crop.
+    saves it. The crop box and the tray corners are measured on the corrected
+    view, so after changing k1, re-measure them on /capture?full=1 and set
+    them again with POST /camera/crop or POST /camera/corners.
     """
     global CAMERA_UNDISTORT
     value = _parse_undistort(k1)
