@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 import serial
 import psutil
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Body, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 
@@ -565,6 +565,9 @@ _settings_saved = False
 # Software processing in force (processing.py), on top of the crop. Saved with
 # the camera settings; POST /camera/processing changes it.
 _processing = dict(processing.DEFAULTS)
+# reference_stats() of the phone photo the processing's match step copies the
+# look of (POST /camera/processing/reference). None = none uploaded.
+_reference: Optional[dict] = None
 
 _saved = _load_settings_file()
 if _saved:
@@ -597,6 +600,12 @@ if _saved:
         logger.warning("camera settings file: processing %s, ignored", _why)
     else:
         _processing.update(_proc)
+    if _saved.get("reference") is not None:
+        _why = processing.check_reference(_saved["reference"])
+        if _why:
+            logger.warning("camera settings file: %s, ignored", _why)
+        else:
+            _reference = _saved["reference"]
     _settings_saved = True
     logger.info("camera settings loaded from %s", CAMERA_SETTINGS_FILE)
 
@@ -623,6 +632,7 @@ def _save_settings() -> Optional[str]:
         "corners": CAMERA_CORNERS,
         "undistort": CAMERA_UNDISTORT,
         "processing": dict(_processing),
+        "reference": _reference,
     }
     tmp = CAMERA_SETTINGS_FILE + ".tmp"
     try:
@@ -640,7 +650,7 @@ def _save_settings() -> Optional[str]:
 def _forget_settings() -> Optional[str]:
     """Delete the settings file and return controls and output to env or
     defaults (in place: camera_status holds a reference to _controls)."""
-    global CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS, CAMERA_CROP, CAMERA_CORNERS, CAMERA_UNDISTORT, _settings_saved
+    global CAMERA_FORMATS, CAMERA_SIZE, CAMERA_FPS, CAMERA_CROP, CAMERA_CORNERS, CAMERA_UNDISTORT, _reference, _settings_saved
     try:
         os.remove(CAMERA_SETTINGS_FILE)
     except FileNotFoundError:
@@ -661,6 +671,7 @@ def _forget_settings() -> Optional[str]:
         CAMERA_UNDISTORT = CAMERA_UNDISTORT_DEFAULT
     _processing.clear()
     _processing.update(processing.DEFAULTS)
+    _reference = None
     return None
 
 
@@ -674,6 +685,7 @@ def settings_summary() -> dict:
         "corners": CAMERA_CORNERS,
         "undistort": CAMERA_UNDISTORT,
         "processing": dict(_processing),
+        "reference": "set" if _reference else "none",
     }
 
 # ---------------------------------------------------------------------------
@@ -1180,7 +1192,7 @@ def _process(image: np.ndarray, raw: bool = False, stats: Optional[dict] = None)
     """The software processing in force (processing.py), unless raw."""
     if raw:
         return image
-    return processing.process(image, _processing, stats)
+    return processing.process(image, _processing, stats, _reference)
 
 
 def get_color_frame(preset: Optional[str] = None, full: bool = False, raw: bool = False):
@@ -2232,7 +2244,10 @@ def camera_settings():
             "controls": summary["controls"],
             "output": summary["output"],
             "crop": summary["crop"],
+            "corners": summary["corners"],
+            "undistort": summary["undistort"],
             "processing": summary["processing"],
+            "reference": summary["reference"],
         },
         "saved": summary["saved"],
         "file": summary["file"],
@@ -2410,6 +2425,8 @@ def camera_processing(
     target: Optional[int] = Query(None, description="60-220, the brightness enhance lifts a dark frame to (median lightness)"),
     saturation: Optional[float] = Query(None, description="0-2, colour strength (1 = unchanged)"),
     keep_chroma: Optional[bool] = Query(None, description="Keep colour strength in areas the processing brightens"),
+    match: Optional[bool] = Query(None, description="Make the picture look like the reference phone photo (POST /camera/processing/reference first)"),
+    match_strength: Optional[float] = Query(None, description="0-1, how far to go towards the reference's look"),
 ):
     """
     Changes only what is passed, saves it with the camera settings, and
@@ -2427,6 +2444,8 @@ def camera_processing(
             "target": target,
             "saturation": saturation,
             "keep_chroma": keep_chroma,
+            "match": match,
+            "match_strength": match_strength,
         }.items()
         if v is not None
     }
@@ -2440,6 +2459,38 @@ def camera_processing(
     return {
         "processing": _processing,
         "defaults": processing.DEFAULTS,
+        "reference": "set" if _reference else "none",
+        "saved": save_error is None,
+        "save_error": save_error,
+    }
+
+
+@app.post("/camera/processing/reference", summary="Upload the phone photo the match step copies the look of; saved")
+def camera_processing_reference(
+    photo: bytes = Body(..., media_type="image/jpeg", description="a JPEG or PNG phone photo of the tray, cropped to the tray"),
+):
+    """
+    Measures the photo's brightness and colour spread and keeps only those
+    numbers (saved with the camera settings; the photo itself is not
+    stored). Send the raw file as the body, e.g.
+    curl -k -X POST --data-binary @phone.jpg -H "Content-Type: image/jpeg" .../camera/processing/reference
+    Then switch it on with POST /camera/processing?match=true. Crop the photo
+    to the tray first, without annotations: the floor or labels drawn on it
+    would be copied too.
+    """
+    global _reference
+    image = cv2.imdecode(np.frombuffer(photo, dtype=np.uint8), cv2.IMREAD_COLOR) if photo else None
+    if image is None:
+        return JSONResponse(
+            content={"error": "invalid photo", "detail": "the body must be a JPEG or PNG file"},
+            status_code=400,
+        )
+    _reference = processing.reference_stats(image)
+    save_error = _save_settings()
+    return {
+        "reference": "set",
+        "photo_size": f"{image.shape[1]}x{image.shape[0]}",
+        "match": _processing["match"],
         "saved": save_error is None,
         "save_error": save_error,
     }

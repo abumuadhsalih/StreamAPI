@@ -45,6 +45,8 @@ DEFAULTS = {
     "target": 140,  # enhance's median lightness target, 0-255
     "keep_chroma": False,  # scale colour with lightness so lifted fish keep their colour
     "saturation": 0.8,  # colour strength, 0-2; the camera renders the fish more orange than a phone
+    "match": False,  # make the frame look like the reference phone photo (match_reference)
+    "match_strength": 0.7,  # 0-1, blend between the processed frame and the fully matched one
 }
 
 # Deglare's blur, as a fraction of the image width. The ZED used sigma 60 on a
@@ -67,6 +69,9 @@ def check(settings: dict) -> str | None:
         elif k == "deglare_strength":
             if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0.0 <= v <= 1.0:
                 return "deglare_strength must be 0-1"
+        elif k == "match_strength":
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0.0 <= v <= 1.0:
+                return "match_strength must be 0-1"
         elif k == "saturation":
             if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0.0 <= v <= 2.0:
                 return "saturation must be 0-2"
@@ -149,9 +154,59 @@ def _lift_gamma(L: np.ndarray, target: int) -> tuple[float, int]:
     return round(gamma, 2), median
 
 
-def process(image: np.ndarray, settings: dict, stats: dict | None = None) -> np.ndarray:
+# Match to a phone photo (2026-11-20): the species model was trained mostly on
+# phone photos and confuses look-alike species on the Falcon's, so this makes a
+# frame take on the brightness and colour spread of one reference phone photo
+# of the tray. Histogram matching on L*, a* and b*, done on quantiles so a
+# reference is 3 x 33 numbers (it lives in the settings file, not as a file).
+REF_QUANTILES = np.linspace(0.0, 100.0, 33)
+
+
+def reference_stats(image: np.ndarray) -> dict:
+    """The quantiles of L*, a* and b* of a reference photo (BGR), measured on
+    a small copy: a distribution, so detail is irrelevant."""
+    lab = cv2.cvtColor(_small(image, 800), cv2.COLOR_BGR2LAB)
+    return {
+        ch: [round(float(v), 2) for v in np.percentile(lab[:, :, i], REF_QUANTILES)]
+        for i, ch in enumerate(("L", "a", "b"))
+    }
+
+
+def check_reference(ref) -> str | None:
+    if not isinstance(ref, dict):
+        return "reference must be an object"
+    for ch in ("L", "a", "b"):
+        q = ref.get(ch)
+        if not isinstance(q, list) or len(q) != len(REF_QUANTILES) or not all(isinstance(v, (int, float)) for v in q):
+            return f"reference {ch} must be {len(REF_QUANTILES)} numbers"
+    return None
+
+
+def _increasing(q: np.ndarray) -> np.ndarray:
+    """np.interp needs strictly increasing x: nudge ties apart."""
+    return np.maximum.accumulate(q) + np.arange(q.size) * 1e-3
+
+
+def match_reference(image: np.ndarray, ref: dict, strength: float) -> np.ndarray:
+    """Map each of L*, a*, b* so its quantiles land on the reference's, blended
+    by `strength` (0 = unchanged). One 256-entry LUT per channel."""
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    small = cv2.cvtColor(_small(image, 800), cv2.COLOR_BGR2LAB)
+    identity = np.arange(256, dtype=np.float64)
+    for i, ch in enumerate(("L", "a", "b")):
+        src_q = _increasing(np.percentile(small[:, :, i], REF_QUANTILES))
+        mapped = np.interp(identity, src_q, np.asarray(ref[ch], dtype=np.float64))
+        lut = np.clip(identity + strength * (mapped - identity), 0, 255).astype(np.uint8)
+        lab[:, :, i] = cv2.LUT(lab[:, :, i], lut)
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def process(
+    image: np.ndarray, settings: dict, stats: dict | None = None, reference: dict | None = None
+) -> np.ndarray:
     """Run the enabled steps on a BGR image. `stats`, if given, is filled with
-    what each step decided (for the response headers)."""
+    what each step decided (for the response headers). `reference` is
+    reference_stats() of a phone photo, used when settings' match is on."""
     s = {**DEFAULTS, **settings}
     stats = stats if stats is not None else {}
     out = image
@@ -188,4 +243,7 @@ def process(image: np.ndarray, settings: dict, stats: dict | None = None) -> np.
             sigma = max(0.8, 1.5 * out.shape[1] / 1600)
             blurred = cv2.GaussianBlur(out, (0, 0), sigma)
             out = cv2.addWeighted(out, UNSHARP, blurred, -(UNSHARP - 1.0), 0)
+    if s["match"] and reference and s["match_strength"] > 0:
+        out = match_reference(out, reference, float(s["match_strength"]))
+        stats["match"] = s["match_strength"]
     return out
